@@ -1,3 +1,14 @@
+# ⚠️ Streamlit secrets — 永不入 git
+.streamlit/secrets.toml
+
+# 本機開發測試檔
+test_*.py
+local_*.py
+scratch/
+
+# Supabase 本機 dev
+.supabase/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
