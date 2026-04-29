@@ -32,7 +32,6 @@ st.markdown(
 
 from auth import (
     show_login_page,
-    handle_auth_callback,
     check_whitelist,
     sign_out,
     is_logged_in,
@@ -47,10 +46,7 @@ from pages_app import (
 
 
 def main():
-    # 1. 處理 Magic Link 回調（如果 URL 帶 code）
-    handle_auth_callback()
-
-    # 2. 未登入：顯示登入頁
+    # 未登入：顯示登入頁（OTP 驗證碼流程）
     if "session" not in st.session_state or st.session_state.get("session") is None:
         show_login_page()
         return

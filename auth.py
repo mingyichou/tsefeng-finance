@@ -1,5 +1,6 @@
 """
-Supabase Auth Magic Link + 白名單驗證
+Supabase Auth — 6 位數 OTP 驗證碼登入 + 白名單
+（採 OTP 而非 Magic Link，避免 Streamlit 後端看不到 URL hash 的問題）
 """
 
 import streamlit as st
@@ -7,7 +8,7 @@ from db import get_supabase_client
 
 
 def show_login_page():
-    """顯示登入頁面：輸入 Email → 寄 Magic Link"""
+    """登入頁：兩階段 — 先輸入 Email → 再輸入 6 位數 OTP"""
     col1, col2, col3 = st.columns([1, 1.5, 1])
 
     with col2:
@@ -23,77 +24,108 @@ def show_login_page():
         )
         st.markdown("")
 
-        with st.form("magic_link_form"):
-            email = st.text_input(
-                "Email",
-                placeholder="emperorchou@gmail.com",
-                help="輸入授權 Email，系統將寄送一次性登入連結",
-            )
-            submitted = st.form_submit_button(
-                "📧 寄送登入連結", use_container_width=True, type="primary"
-            )
-
-            if submitted:
-                if not email or "@" not in email:
-                    st.warning("請輸入有效的 Email")
-                else:
-                    send_magic_link(email)
+        # 階段判斷：是否已寄出 OTP
+        if "otp_sent_to" not in st.session_state:
+            _show_email_step()
+        else:
+            _show_otp_step()
 
 
-def send_magic_link(email: str):
-    """寄送 Magic Link 到指定 Email"""
+def _show_email_step():
+    """階段 1：輸入 Email 並寄送 OTP"""
+    with st.form("email_form"):
+        email = st.text_input(
+            "Email",
+            placeholder="emperorchou@gmail.com",
+            help="輸入授權 Email，系統將寄送 6 位數驗證碼",
+        )
+        submitted = st.form_submit_button(
+            "📧 寄送驗證碼", use_container_width=True, type="primary"
+        )
+
+        if submitted:
+            if not email or "@" not in email:
+                st.warning("請輸入有效的 Email")
+            else:
+                _send_otp(email.strip().lower())
+
+
+def _send_otp(email: str):
+    """寄送 6 位數 OTP 到指定 Email"""
     try:
         sb = get_supabase_client()
-        site_url = st.secrets["app"]["site_url"]
         sb.auth.sign_in_with_otp(
             {
                 "email": email,
-                "options": {"email_redirect_to": site_url},
+                "options": {
+                    "should_create_user": False,  # 不允許自助註冊（限白名單）
+                },
             }
         )
-        st.success(
-            f"✅ 已寄送登入連結到 **{email}**\n\n"
-            "請打開信箱並點擊連結（5 分鐘內有效）"
-        )
-        st.info("💡 如沒收到，請檢查垃圾信箱")
+        st.session_state.otp_sent_to = email
+        st.rerun()
     except Exception as e:
         st.error(f"寄送失敗：{e}")
 
 
-def handle_auth_callback():
-    """
-    處理 Magic Link 回調：從 URL query params 讀 code → 換 session
-    Magic Link 連結格式：https://your-app.com/?code=xxxxx
-    """
-    code = st.query_params.get("code")
-    if code and "session" not in st.session_state:
-        try:
-            sb = get_supabase_client()
-            response = sb.auth.exchange_code_for_session({"auth_code": code})
-            if response and response.session:
-                st.session_state.session = {
-                    "access_token": response.session.access_token,
-                    "refresh_token": response.session.refresh_token,
-                    "user_id": response.user.id,
-                    "email": response.user.email,
-                }
-                # 清掉 URL 上的 code，避免重複交換
-                st.query_params.clear()
-                st.rerun()
-        except Exception as e:
-            st.error(f"登入驗證失敗：{e}")
-            st.query_params.clear()
+def _show_otp_step():
+    """階段 2：輸入 6 位數 OTP 驗證"""
+    email = st.session_state.otp_sent_to
+    st.success(f"✅ 已寄送驗證碼到 **{email}**")
+    st.caption("請打開信箱並複製 6 位數驗證碼（5 分鐘內有效）。如沒收到請檢查垃圾信箱。")
+
+    with st.form("otp_form"):
+        otp = st.text_input(
+            "6 位數驗證碼",
+            placeholder="123456",
+            max_chars=6,
+            help="從 Email 複製過來貼上",
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button(
+                "🔓 登入", use_container_width=True, type="primary"
+            )
+        with col2:
+            cancel = st.form_submit_button("← 換 Email", use_container_width=True)
+
+        if cancel:
+            del st.session_state.otp_sent_to
+            st.rerun()
+
+        if submitted:
+            if not otp or len(otp) != 6 or not otp.isdigit():
+                st.warning("請輸入 6 位數字")
+            else:
+                _verify_otp(email, otp)
+
+
+def _verify_otp(email: str, otp: str):
+    """驗證 OTP 並建立 session"""
+    try:
+        sb = get_supabase_client()
+        response = sb.auth.verify_otp(
+            {"email": email, "token": otp, "type": "email"}
+        )
+        if response and response.session and response.user:
+            st.session_state.session = {
+                "access_token": response.session.access_token,
+                "refresh_token": response.session.refresh_token,
+                "user_id": response.user.id,
+                "email": response.user.email,
+            }
+            del st.session_state.otp_sent_to
+            st.rerun()
+        else:
+            st.error("驗證失敗，請重試")
+    except Exception as e:
+        st.error(f"驗證失敗：{e}")
 
 
 def check_whitelist(user_id: str) -> dict | None:
-    """
-    檢查使用者是否在 allowed_users 白名單。
-    回傳：{ email, role } 或 None（不在白名單）
-    """
+    """檢查使用者是否在 allowed_users 白名單"""
     try:
         sb = get_supabase_client()
-        # 用 service_role 是不必要的；這裡 RLS 應允許自己讀自己的 record
-        # 但安全起見可在 schema 加 policy: 允許自己讀 allowed_users 自己的 row
         resp = (
             sb.table("allowed_users")
             .select("email, role")
@@ -115,7 +147,7 @@ def sign_out():
         sb.auth.sign_out()
     except Exception:
         pass
-    for key in ["session", "user_role"]:
+    for key in ["session", "user_role", "otp_sent_to"]:
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
