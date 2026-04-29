@@ -36,8 +36,8 @@ from auth import (
     sign_out,
     is_logged_in,
     try_restore_from_cookie,
+    handle_oauth_callback,
 )
-from cookie_session import get_cookie_manager
 from pages_app import (
     page_dashboard,
     page_overview,
@@ -48,10 +48,16 @@ from pages_app import (
 
 
 def main():
-    # try_restore_from_cookie 在 cookie stub 期間是 no-op，保留以便之後重啟
+    # 1. 處理 Google OAuth callback（URL 帶 ?code=xxx 時）
+    code = st.query_params.get("code")
+    if code and "session" not in st.session_state:
+        handle_oauth_callback(code)
+        return
+
+    # 2. cookie 還原（目前是 stub no-op，保留介面）
     try_restore_from_cookie()
 
-    # 未登入：顯示登入頁（OTP 驗證碼流程）
+    # 3. 未登入：顯示登入頁（Google 為主、OTP 為備援）
     if "session" not in st.session_state or st.session_state.get("session") is None:
         show_login_page()
         return

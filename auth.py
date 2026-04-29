@@ -1,6 +1,13 @@
 """
-Supabase Auth — 6 位數 OTP 驗證碼登入 + 白名單
-（採 OTP 而非 Magic Link，避免 Streamlit 後端看不到 URL hash 的問題）
+Supabase Auth — 主要採 Google OAuth，備用 Email OTP
+
+主流程：
+1. 使用者點「用 Google 登入」 → sb.auth.sign_in_with_oauth(google) → redirect 到 Google
+2. Google 認證後 → Supabase callback → redirect 回 site_url?code=xxx
+3. main() 偵測 query_params['code'] → handle_oauth_callback → exchange_code_for_session
+4. 寫入 st.session_state.session
+
+備用：Email OTP（避開 email rate limit 用，但仍受 2/h 限制）
 """
 
 import streamlit as st
@@ -14,7 +21,7 @@ from cookie_session import (
 
 
 def show_login_page():
-    """登入頁：兩階段 — 先輸入 Email → 再輸入 6 位數 OTP"""
+    """登入頁：Google OAuth 為主，Email OTP 為備援"""
     col1, col2, col3 = st.columns([1, 1.5, 1])
 
     with col2:
@@ -29,12 +36,25 @@ def show_login_page():
             unsafe_allow_html=True,
         )
         st.markdown("")
+        st.markdown("")
 
-        # 階段判斷：是否已寄出 OTP
-        if "otp_sent_to" not in st.session_state:
-            _show_email_step()
-        else:
-            _show_otp_step()
+        # 主流程：Google OAuth
+        if st.button(
+            "🔐 使用 Google 帳號登入",
+            type="primary",
+            use_container_width=True,
+            key="btn_google_login",
+        ):
+            _start_google_oauth()
+
+        st.markdown("")
+
+        # 備用：Email OTP
+        with st.expander("使用 Email 驗證碼登入（備用）"):
+            if "otp_sent_to" not in st.session_state:
+                _show_email_step()
+            else:
+                _show_otp_step()
 
 
 def _show_email_step():
@@ -129,6 +149,58 @@ def _verify_otp(email: str, otp: str):
             st.error("驗證失敗，請重試")
     except Exception as e:
         st.error(f"驗證失敗：{e}")
+
+
+def _start_google_oauth():
+    """啟動 Google OAuth：取 redirect URL 並跳轉到 Google 登入頁"""
+    try:
+        sb = get_supabase_client()
+        site_url = st.secrets["app"]["site_url"]
+        response = sb.auth.sign_in_with_oauth(
+            {
+                "provider": "google",
+                "options": {"redirect_to": site_url},
+            }
+        )
+        if response and response.url:
+            # 用 meta refresh 跳轉到 Google OAuth 頁面
+            st.markdown(
+                f'<meta http-equiv="refresh" content="0; url={response.url}">',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'如未自動跳轉，請[點此前往 Google 登入]({response.url})'
+            )
+            st.stop()
+        else:
+            st.error("無法取得 Google 登入連結")
+    except Exception as e:
+        st.error(f"Google 登入啟動失敗：{e}")
+
+
+def handle_oauth_callback(code: str):
+    """處理 Google OAuth 回調：用 code 換 session"""
+    try:
+        sb = get_supabase_client()
+        response = sb.auth.exchange_code_for_session({"auth_code": code})
+        if response and response.session and response.user:
+            session_data = {
+                "access_token": response.session.access_token,
+                "refresh_token": response.session.refresh_token,
+                "user_id": response.user.id,
+                "email": response.user.email,
+            }
+            st.session_state.session = session_data
+            save_session_to_cookie(session_data)  # stub no-op，留介面
+            # 清掉 URL 上的 code，避免重整時重複交換
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.error("Google 登入驗證失敗，請重試")
+            st.query_params.clear()
+    except Exception as e:
+        st.error(f"OAuth 驗證失敗：{e}")
+        st.query_params.clear()
 
 
 def try_restore_from_cookie() -> bool:
