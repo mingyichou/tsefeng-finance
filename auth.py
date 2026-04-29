@@ -38,14 +38,19 @@ def show_login_page():
         st.markdown("")
         st.markdown("")
 
-        # 主流程：Google OAuth
-        if st.button(
-            "🔐 使用 Google 帳號登入",
-            type="primary",
-            use_container_width=True,
-            key="btn_google_login",
-        ):
-            _start_google_oauth()
+        # 主流程：Google OAuth — 開頁時生成 URL，render 成可點 link button
+        if "google_oauth_url" not in st.session_state:
+            _prepare_google_oauth_url()
+
+        if st.session_state.get("google_oauth_url"):
+            st.link_button(
+                "🔐 使用 Google 帳號登入",
+                st.session_state.google_oauth_url,
+                type="primary",
+                use_container_width=True,
+            )
+        else:
+            st.error("Google 登入連結建立失敗，請改用 Email OTP")
 
         st.markdown("")
 
@@ -151,8 +156,8 @@ def _verify_otp(email: str, otp: str):
         st.error(f"驗證失敗：{e}")
 
 
-def _start_google_oauth():
-    """啟動 Google OAuth：取 redirect URL 並跳轉到 Google 登入頁"""
+def _prepare_google_oauth_url():
+    """頁面載入時預先呼叫 sign_in_with_oauth 取得跳轉 URL（含 PKCE state），存到 session_state"""
     try:
         sb = get_supabase_client()
         site_url = st.secrets["app"]["site_url"]
@@ -163,19 +168,12 @@ def _start_google_oauth():
             }
         )
         if response and response.url:
-            # 用 meta refresh 跳轉到 Google OAuth 頁面
-            st.markdown(
-                f'<meta http-equiv="refresh" content="0; url={response.url}">',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'如未自動跳轉，請[點此前往 Google 登入]({response.url})'
-            )
-            st.stop()
+            st.session_state.google_oauth_url = response.url
         else:
-            st.error("無法取得 Google 登入連結")
+            st.session_state.google_oauth_url = None
     except Exception as e:
-        st.error(f"Google 登入啟動失敗：{e}")
+        st.error(f"Google 登入連結準備失敗：{e}")
+        st.session_state.google_oauth_url = None
 
 
 def handle_oauth_callback(code: str):
@@ -270,7 +268,7 @@ def sign_out():
     except Exception:
         pass
     clear_session_cookie()
-    for key in ["session", "user_role", "otp_sent_to"]:
+    for key in ["session", "user_role", "otp_sent_to", "google_oauth_url"]:
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
