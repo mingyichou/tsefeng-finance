@@ -5,6 +5,12 @@ Supabase Auth — 6 位數 OTP 驗證碼登入 + 白名單
 
 import streamlit as st
 from db import get_supabase_client, get_authed_client
+from cookie_session import (
+    save_session_to_cookie,
+    load_session_from_cookie,
+    clear_session_cookie,
+    get_cookie_manager,
+)
 
 
 def show_login_page():
@@ -102,25 +108,68 @@ def _show_otp_step():
 
 
 def _verify_otp(email: str, otp: str):
-    """驗證 OTP 並建立 session"""
+    """驗證 OTP 並建立 session（同時寫加密 cookie，24 小時內免重登）"""
     try:
         sb = get_supabase_client()
         response = sb.auth.verify_otp(
             {"email": email, "token": otp, "type": "email"}
         )
         if response and response.session and response.user:
-            st.session_state.session = {
+            session_data = {
                 "access_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
                 "user_id": response.user.id,
                 "email": response.user.email,
             }
+            st.session_state.session = session_data
+            save_session_to_cookie(session_data)
             del st.session_state.otp_sent_to
             st.rerun()
         else:
             st.error("驗證失敗，請重試")
     except Exception as e:
         st.error(f"驗證失敗：{e}")
+
+
+def try_restore_from_cookie() -> bool:
+    """
+    開頁時 cold start 嘗試從 cookie 還原 session。
+    回傳 True 代表成功還原（後續 main() 直接走已登入分支）。
+    """
+    # 已經有 session 不必還原
+    if "session" in st.session_state and st.session_state.get("session"):
+        return True
+
+    # 從 cookie 讀
+    cookie_data = load_session_from_cookie()
+    if not cookie_data:
+        return False
+
+    # 用 refresh_token 換新 access_token（避免 access_token 早過期）
+    try:
+        sb = get_supabase_client()
+        sb.auth.set_session(
+            cookie_data["access_token"],
+            cookie_data["refresh_token"],
+        )
+        # supabase-py 內部會自動 refresh，取最新 session
+        new_session = sb.auth.get_session()
+        if new_session and new_session.access_token:
+            session_data = {
+                "access_token": new_session.access_token,
+                "refresh_token": new_session.refresh_token,
+                "user_id": cookie_data["user_id"],
+                "email": cookie_data["email"],
+            }
+            st.session_state.session = session_data
+            # 重新寫 cookie 更新 saved_at（sliding window）
+            save_session_to_cookie(session_data)
+            return True
+    except Exception:
+        # refresh 失敗（cookie 過期或 token 失效）→ 清掉
+        clear_session_cookie()
+
+    return False
 
 
 def check_whitelist(user_id: str) -> dict | None:
@@ -142,12 +191,13 @@ def check_whitelist(user_id: str) -> dict | None:
 
 
 def sign_out():
-    """登出"""
+    """登出（同時清 cookie）"""
     try:
         sb = get_supabase_client()
         sb.auth.sign_out()
     except Exception:
         pass
+    clear_session_cookie()
     for key in ["session", "user_role", "otp_sent_to"]:
         if key in st.session_state:
             del st.session_state[key]
