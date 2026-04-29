@@ -11,6 +11,7 @@ Supabase Auth — 主要採 Google OAuth，備用 Email OTP
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 from db import get_supabase_client, get_authed_client
 from cookie_session import (
     save_session_to_cookie,
@@ -43,11 +44,39 @@ def show_login_page():
             _prepare_google_oauth_url()
 
         if st.session_state.get("google_oauth_url"):
-            st.link_button(
-                "🔐 使用 Google 帳號登入",
-                st.session_state.google_oauth_url,
-                type="primary",
-                use_container_width=True,
+            # 用 components.html + target="_top" 強制跳脫 streamlit cloud 的 iframe sandbox
+            # 否則 Google 的 X-Frame-Options DENY 會拒絕在 iframe 中載入 OAuth 頁面
+            oauth_url = st.session_state.google_oauth_url
+            components.html(
+                f"""
+                <style>
+                  .google-signin-btn {{
+                    display: block;
+                    width: 100%;
+                    padding: 0.5rem 0.75rem;
+                    background-color: #6A5ACD;
+                    color: white !important;
+                    text-decoration: none;
+                    text-align: center;
+                    border-radius: 0.5rem;
+                    font-weight: 500;
+                    font-family: "Source Sans Pro", -apple-system, sans-serif;
+                    font-size: 1rem;
+                    line-height: 1.6;
+                    border: 1px solid #6A5ACD;
+                    transition: background-color 0.15s;
+                    box-sizing: border-box;
+                  }}
+                  .google-signin-btn:hover {{
+                    background-color: #5848B6;
+                    border-color: #5848B6;
+                  }}
+                </style>
+                <a href="{oauth_url}" target="_top" class="google-signin-btn">
+                  🔐 使用 Google 帳號登入
+                </a>
+                """,
+                height=55,
             )
         else:
             st.error("Google 登入連結建立失敗，請改用 Email OTP")
