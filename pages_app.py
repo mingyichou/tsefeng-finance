@@ -59,17 +59,148 @@ def page_import():
         return
 
     st.success("✅ 編輯模式啟用中")
-    st.info("🚧 開發中（Phase 2：依檔案類型逐一加入上傳區塊）")
 
-    st.markdown("**將支援 14 種資料來源上傳：**")
+    # ─── 玉山健保戶 CSV ───────────────────────────────
+    _section_esun_health_csv()
+
+    # ─── 其他類型（待實作）───────────────────────────
+    st.divider()
+    st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    1. 銀行對帳：玉山健保戶 CSV、中信進出戶 PDF
-    2. 健保收入：醫療費用付款通知書 HTML（批次）
-    3. 醫師業績：門診統計、看診人數、合理門診量、自費統計
-    4. 診所支出：現金、合約、支票、調貨
-    5. 薪資與商品：薪資表、商品成本售價
-    6. 手 KEY：額外收入、非常規收支
+    - 中信進出戶 PDF（澤豐 / 澤沛）
+    - 醫療費用付款通知書 HTML（批次）
+    - 醫師門診統計報表 / 看診人數+初診 / 合理門診量 / 自費統計
+    - 診所支出：現金、合約、支票、調貨
+    - 薪資表、商品成本售價
+    - 手 KEY：額外收入、非常規收支
     """)
+
+
+def _ensure_esun_health_account(sb, clinic_short_name: str) -> int:
+    """確保玉山健保戶 bank_account 存在，回傳 id（自動建立）"""
+    clinic_resp = (
+        sb.table("clinics")
+        .select("id")
+        .eq("short_name", clinic_short_name)
+        .execute()
+    )
+    if not clinic_resp.data:
+        raise ValueError(f"找不到診所 {clinic_short_name}")
+    clinic_id = clinic_resp.data[0]["id"]
+
+    acc_resp = (
+        sb.table("bank_accounts")
+        .select("id")
+        .eq("clinic_id", clinic_id)
+        .eq("bank", "玉山")
+        .eq("account_type", "健保戶")
+        .execute()
+    )
+    if acc_resp.data:
+        return acc_resp.data[0]["id"]
+
+    insert_resp = (
+        sb.table("bank_accounts")
+        .insert({
+            "clinic_id": clinic_id,
+            "bank": "玉山",
+            "account_type": "健保戶",
+            "account_no_mask": f"{clinic_short_name}-玉山-健保戶",
+        })
+        .execute()
+    )
+    return insert_resp.data[0]["id"]
+
+
+def _section_esun_health_csv():
+    """玉山健保戶 CSV 上傳區"""
+    from data_processor.esun_csv import parse_esun_csv
+
+    st.subheader("🏦 玉山健保戶 CSV")
+    st.caption("健保署撥款入帳、員工薪資轉出、健保費代扣的對帳記錄")
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        clinic_choice = st.radio(
+            "診所",
+            ["澤豐", "澤沛"],
+            key="esun_clinic_choice",
+        )
+    with col2:
+        uploaded_file = st.file_uploader(
+            f"上傳 {clinic_choice} 玉山健保戶 CSV",
+            type=["csv"],
+            key=f"esun_uploader_{clinic_choice}",
+        )
+
+    if uploaded_file is None:
+        return
+
+    try:
+        sb = get_authed_client()
+        account_id = _ensure_esun_health_account(sb, clinic_choice)
+        records = parse_esun_csv(uploaded_file, account_id)
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+
+    if not records:
+        st.warning("CSV 沒有可匯入的交易記錄")
+        return
+
+    st.success(f"✅ 解析完成，共 {len(records)} 筆")
+
+    preview_cols = [
+        "transaction_date", "transaction_time", "summary",
+        "amount", "balance", "memo", "counterparty",
+    ]
+    preview_df = pd.DataFrame(records)[preview_cols]
+    st.dataframe(preview_df, use_container_width=True, height=300)
+
+    if st.button(
+        f"💾 確認匯入 {clinic_choice} 玉山健保戶（{len(records)} 筆）",
+        type="primary",
+        key=f"esun_import_{clinic_choice}",
+    ):
+        _import_bank_records(sb, records)
+
+
+def _import_bank_records(sb, records: list[dict]):
+    """寫入 bank_transactions（用 upsert + ignore_duplicates 防重複）"""
+    inserted = 0
+    skipped = 0
+    errors = []
+    progress = st.progress(0, text="匯入中...")
+    total = len(records)
+
+    BATCH_SIZE = 50
+    for i in range(0, total, BATCH_SIZE):
+        batch = records[i:i + BATCH_SIZE]
+        try:
+            resp = (
+                sb.table("bank_transactions")
+                .upsert(batch, on_conflict="raw_row_hash", ignore_duplicates=True)
+                .execute()
+            )
+            new_count = len(resp.data) if resp.data else 0
+            inserted += new_count
+            skipped += len(batch) - new_count
+        except Exception as e:
+            errors.append(f"批次 {i}-{i+len(batch)}：{e}")
+        progress.progress(min((i + BATCH_SIZE) / total, 1.0))
+
+    progress.empty()
+
+    if errors:
+        st.error("部分匯入失敗：")
+        for err in errors:
+            st.code(err)
+    if inserted:
+        st.success(f"✅ 新增 {inserted} 筆")
+    if skipped:
+        st.info(f"ℹ️ 跳過重複 {skipped} 筆")
+    if inserted and not errors:
+        st.balloons()
 
 
 # ============================================================
