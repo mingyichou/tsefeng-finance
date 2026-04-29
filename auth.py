@@ -44,39 +44,41 @@ def show_login_page():
             _prepare_google_oauth_url()
 
         if st.session_state.get("google_oauth_url"):
-            # 用 components.html + target="_top" 強制跳脫 streamlit cloud 的 iframe sandbox
-            # 否則 Google 的 X-Frame-Options DENY 會拒絕在 iframe 中載入 OAuth 頁面
+            # 用 st.markdown 直接渲染 <a>（在 streamlit 主 frame，無 sandbox 限制）
+            # components.html 的 iframe 有 sandbox 不允許 target=_top 導航
             oauth_url = st.session_state.google_oauth_url
-            components.html(
+            st.markdown(
                 f"""
                 <style>
                   .google-signin-btn {{
                     display: block;
                     width: 100%;
-                    padding: 0.5rem 0.75rem;
+                    padding: 0.6rem 1rem;
                     background-color: #6A5ACD;
                     color: white !important;
-                    text-decoration: none;
+                    text-decoration: none !important;
                     text-align: center;
                     border-radius: 0.5rem;
                     font-weight: 500;
-                    font-family: "Source Sans Pro", -apple-system, sans-serif;
                     font-size: 1rem;
-                    line-height: 1.6;
-                    border: 1px solid #6A5ACD;
-                    transition: background-color 0.15s;
+                    margin: 0.5rem 0;
                     box-sizing: border-box;
+                    transition: background-color 0.15s;
                   }}
                   .google-signin-btn:hover {{
                     background-color: #5848B6;
-                    border-color: #5848B6;
+                    color: white !important;
                   }}
                 </style>
-                <a href="{oauth_url}" target="_top" class="google-signin-btn">
+                <a href="{oauth_url}" target="_self" class="google-signin-btn">
                   🔐 使用 Google 帳號登入
                 </a>
                 """,
-                height=55,
+                unsafe_allow_html=True,
+            )
+            # 備援：純 markdown link（user 可右鍵「在新分頁開啟」）
+            st.caption(
+                f"如按鈕無反應，請[點此手動前往 Google 登入]({oauth_url})"
             )
         else:
             st.error("Google 登入連結建立失敗，請改用 Email OTP")
