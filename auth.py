@@ -51,7 +51,7 @@ def _show_email_step():
 
 
 def _send_otp(email: str):
-    """寄送 6 位數 OTP 到指定 Email"""
+    """寄送 OTP 驗證碼到指定 Email"""
     try:
         sb = get_supabase_client()
         sb.auth.sign_in_with_otp(
@@ -69,16 +69,16 @@ def _send_otp(email: str):
 
 
 def _show_otp_step():
-    """階段 2：輸入 6 位數 OTP 驗證"""
+    """階段 2：輸入 OTP 驗證碼（長度由 Supabase 後台設定，預設 6~8 位）"""
     email = st.session_state.otp_sent_to
     st.success(f"✅ 已寄送驗證碼到 **{email}**")
-    st.caption("請打開信箱並複製 6 位數驗證碼（5 分鐘內有效）。如沒收到請檢查垃圾信箱。")
+    st.caption("請打開信箱並複製驗證碼（5 分鐘內有效）。如沒收到請檢查垃圾信箱。")
 
     with st.form("otp_form"):
         otp = st.text_input(
-            "6 位數驗證碼",
-            placeholder="123456",
-            max_chars=6,
+            "驗證碼",
+            placeholder="例如 81971273",
+            max_chars=10,
             help="從 Email 複製過來貼上",
         )
         col1, col2 = st.columns(2)
@@ -94,10 +94,11 @@ def _show_otp_step():
             st.rerun()
 
         if submitted:
-            if not otp or len(otp) != 6 or not otp.isdigit():
-                st.warning("請輸入 6 位數字")
+            otp_clean = otp.strip() if otp else ""
+            if not otp_clean or not otp_clean.isdigit() or len(otp_clean) < 6:
+                st.warning("請輸入正確的驗證碼（至少 6 位數字）")
             else:
-                _verify_otp(email, otp)
+                _verify_otp(email, otp_clean)
 
 
 def _verify_otp(email: str, otp: str):
