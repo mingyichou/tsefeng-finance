@@ -70,15 +70,14 @@ def show_login_page():
                     color: white !important;
                   }}
                 </style>
-                <a href="{oauth_url}" target="_self" class="google-signin-btn">
+                <a href="{oauth_url}" target="_blank" rel="noopener noreferrer" class="google-signin-btn">
                   🔐 使用 Google 帳號登入
                 </a>
                 """,
                 unsafe_allow_html=True,
             )
-            # 備援：純 markdown link（user 可右鍵「在新分頁開啟」）
             st.caption(
-                f"如按鈕無反應，請[點此手動前往 Google 登入]({oauth_url})"
+                "點上方按鈕後會在**新分頁**開啟 Google 登入頁，完成登入後新分頁會顯示主畫面，您可關閉此分頁。"
             )
         else:
             st.error("Google 登入連結建立失敗，請改用 Email OTP")
