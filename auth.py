@@ -4,7 +4,7 @@ Supabase Auth — 6 位數 OTP 驗證碼登入 + 白名單
 """
 
 import streamlit as st
-from db import get_supabase_client
+from db import get_supabase_client, get_authed_client
 
 
 def show_login_page():
@@ -124,9 +124,9 @@ def _verify_otp(email: str, otp: str):
 
 
 def check_whitelist(user_id: str) -> dict | None:
-    """檢查使用者是否在 allowed_users 白名單"""
+    """檢查使用者是否在 allowed_users 白名單（用帶 session 的 client，RLS 才能識別 auth.uid）"""
     try:
-        sb = get_supabase_client()
+        sb = get_authed_client()
         resp = (
             sb.table("allowed_users")
             .select("email, role")
