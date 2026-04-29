@@ -48,11 +48,7 @@ from pages_app import (
 
 
 def main():
-    # 等 cookie manager ready（首次 page load 必經）
-    if get_cookie_manager() is None:
-        st.stop()
-
-    # 嘗試從 cookie 還原 session（24 小時內免重登）
+    # try_restore_from_cookie 在 cookie stub 期間是 no-op，保留以便之後重啟
     try_restore_from_cookie()
 
     # 未登入：顯示登入頁（OTP 驗證碼流程）
