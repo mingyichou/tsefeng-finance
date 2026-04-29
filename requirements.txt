@@ -7,5 +7,3 @@ beautifulsoup4>=4.12.0
 lxml>=5.0.0
 altair>=5.0.0
 python-dateutil>=2.8.0
-extra-streamlit-components>=0.1.70
-cryptography>=42.0.0
