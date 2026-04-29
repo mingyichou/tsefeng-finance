@@ -152,7 +152,7 @@ def _section_esun_health_csv():
 
     preview_cols = [
         "transaction_date", "transaction_time", "summary",
-        "amount", "balance", "memo", "counterparty",
+        "amount", "balance", "memo_month", "counterparty",
     ]
     preview_df = pd.DataFrame(records)[preview_cols]
     st.dataframe(preview_df, use_container_width=True, height=300)

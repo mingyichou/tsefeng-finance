@@ -131,7 +131,7 @@ def parse_esun_csv(file_obj: IO, account_id: int) -> list[dict]:
             "summary": _normalize_str(row.get("摘要")),
             "amount": amount,
             "balance": _to_int(row.get("餘額")),
-            "memo": _normalize_str(row.get("備註")),
+            "memo_month": _normalize_str(row.get("備註")),
             "counterparty": _normalize_str(row.get("轉出入銀行代號/帳號")),
         }
         rec["raw_row_hash"] = _row_hash(rec)
