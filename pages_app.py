@@ -73,11 +73,16 @@ def page_import():
     # ─── 醫療費用付款通知書 HTML（批次）───────────────
     _section_nhi_notices()
 
+    st.divider()
+
+    # ─── 醫師自費統計（批次）─────────────────────────
+    _section_cash_visits()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    - 門診申報金額統計報表 / 看診人數+初診 / 合理門診量 / 自費統計
+    - 門診申報金額統計報表 / 看診人數+初診 / 合理門診量
     - 澤沛 A91+複針
     - 診所支出：現金、合約、支票、調貨
     - 薪資表、商品成本售價、@科中進貨價目表
@@ -402,6 +407,154 @@ def _import_nhi_records(sb, records: list[dict]):
         st.success(f"✅ 新增 {inserted} 份")
     if skipped:
         st.info(f"ℹ️ 跳過重複 {skipped} 份（依 source_filename）")
+    if inserted and not errors:
+        st.balloons()
+
+
+def _section_cash_visits():
+    """醫師自費統計批次上傳區（Sprint 2.6）— 薪資抽成輸入"""
+    from data_processor.cash_visits import (
+        parse_cash_visits,
+        parse_filename as parse_cash_filename,
+    )
+
+    st.subheader("💰 醫師自費統計（批次）")
+    st.caption(
+        "薪資抽成輸入。檔內姓名/地址/電話不會寫入 DB（隱私）。"
+        "可一次選多份不同醫師的檔案；診所請手動選定，醫師由檔名自動識別。"
+    )
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        clinic_choice = st.radio(
+            "診所",
+            ["澤豐", "澤沛"],
+            key="cash_clinic_choice",
+        )
+    with col2:
+        uploaded_files = st.file_uploader(
+            f"上傳 {clinic_choice} 醫師自費統計（多份 xlsx）",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            key=f"cash_uploader_{clinic_choice}",
+        )
+    if not uploaded_files:
+        return
+
+    sb = get_authed_client()
+
+    clinic_resp = (
+        sb.table("clinics").select("id, short_name").eq("short_name", clinic_choice).execute()
+    )
+    if not clinic_resp.data:
+        st.error(f"找不到診所 {clinic_choice}")
+        return
+    clinic_id = clinic_resp.data[0]["id"]
+
+    doctors_resp = sb.table("doctors").select("id, name").execute()
+    name_to_did = {d["name"]: d["id"] for d in doctors_resp.data}
+
+    all_records: list[dict] = []
+    summaries: list[dict] = []
+    errors: list[str] = []
+
+    for f in uploaded_files:
+        try:
+            meta = parse_cash_filename(f.name)
+            doctor = meta["doctor"]
+            doctor_id = name_to_did.get(doctor)
+            if doctor_id is None:
+                raise ValueError(f"醫師 {doctor} 不在 doctors 表")
+            recs, totals = parse_cash_visits(
+                f, f.name, clinic_id, doctor_id,
+                expected_doctor_name=doctor,
+            )
+            all_records.extend(recs)
+            summaries.append({
+                "檔名": f.name,
+                "醫師": doctor,
+                "服務月": meta["service_month"],
+                "筆數": totals["parsed_count"],
+                "含掛號合計": totals["parsed_total_raw"],
+                "不含掛號合計": totals["parsed_total_excl_reg"],
+                "檔案總計": totals["file_total"],
+                "對帳": "✅" if totals["matches"] else "❌",
+                "對帳模式": totals["registration_handling"],
+            })
+        except Exception as e:
+            errors.append(f"{f.name}：{e}")
+
+    if errors:
+        st.error("部分檔案解析失敗：")
+        for e in errors:
+            st.code(e)
+
+    if not summaries:
+        return
+
+    st.markdown("**檔案彙整：**")
+    st.dataframe(pd.DataFrame(summaries), use_container_width=True, hide_index=True)
+
+    bad = [s for s in summaries if s["對帳"] != "✅"]
+    if bad:
+        st.warning(
+            f"⚠️ 有 {len(bad)} 份檔案的合計與檔案總計列對不上，"
+            "請檢查後再決定是否匯入"
+        )
+
+    st.markdown(f"**全部資料筆數：{len(all_records)} 筆**（不含姓名/地址/電話）")
+    if all_records:
+        # 預覽前 10 筆（去敏感欄）
+        preview_cols = [
+            "visit_date", "chart_no", "diagnosis", "prescription",
+            "registration", "internal_drug", "external_drug", "acupuncture",
+            "trauma", "dislocation", "wellness", "herb_decoction",
+            "consult", "lab", "other", "cash_total",
+        ]
+        preview = pd.DataFrame(all_records)[preview_cols]
+        st.dataframe(preview.head(10), use_container_width=True)
+
+    if st.button(
+        f"💾 確認匯入 {clinic_choice} 自費統計（{len(all_records)} 筆）",
+        type="primary",
+        key=f"cash_import_btn_{clinic_choice}",
+    ):
+        _import_cash_records(sb, all_records)
+
+
+def _import_cash_records(sb, records: list[dict]):
+    """寫入 doctor_cash_visits（依 raw_row_hash UNIQUE 防重複）"""
+    inserted = 0
+    skipped = 0
+    errors = []
+    progress = st.progress(0, text="匯入中...")
+    total = len(records)
+
+    BATCH = 100
+    for i in range(0, total, BATCH):
+        batch = records[i:i + BATCH]
+        try:
+            resp = (
+                sb.table("doctor_cash_visits")
+                .upsert(batch, on_conflict="raw_row_hash", ignore_duplicates=True)
+                .execute()
+            )
+            new = len(resp.data) if resp.data else 0
+            inserted += new
+            skipped += len(batch) - new
+        except Exception as e:
+            errors.append(f"批次 {i}-{i + len(batch)}：{e}")
+        progress.progress(min((i + BATCH) / total, 1.0))
+    progress.empty()
+
+    if errors:
+        st.error("部分批次失敗：")
+        for e in errors:
+            st.code(e)
+    if inserted:
+        st.success(f"✅ 新增 {inserted} 筆")
+    if skipped:
+        st.info(f"ℹ️ 跳過重複 {skipped} 筆（依 raw_row_hash）")
     if inserted and not errors:
         st.balloons()
 
