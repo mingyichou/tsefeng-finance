@@ -746,7 +746,173 @@ def _import_bank_records(sb, records: list[dict]):
 
 
 # ============================================================
-# 4. 院長個人透支（Phase 5）
+# 4. 醫師薪資（Phase 3.5）
+# ============================================================
+def page_salary():
+    st.title("💵 醫師薪資計算")
+
+    from data_processor.salary import (
+        run_salary_calculation,
+        upsert_salary_monthly,
+    )
+
+    sb = get_authed_client()
+
+    # ─── 月份選擇 ───
+    months_resp = (
+        sb.table("doctor_visit_stats")
+        .select("service_month")
+        .order("service_month", desc=True)
+        .execute()
+    )
+    months_set = sorted({r["service_month"] for r in months_resp.data}, reverse=True)
+    if not months_set:
+        st.warning("⚠️ 尚無醫師看診人數資料（doctor_visit_stats 為空），請先到「本月資料匯入」上傳。")
+        return
+
+    col1, col2 = st.columns([2, 5])
+    with col1:
+        service_month = st.selectbox(
+            "服務月份",
+            months_set,
+            format_func=lambda d: f"{d[:7]}",
+            key="salary_month",
+        )
+
+    # ─── 計算 ───
+    with st.spinner("計算中..."):
+        components, payslips = run_salary_calculation(sb, service_month)
+
+    if not components:
+        st.warning("該月份無計算結果（doctor_clinic 表可能為空）")
+        return
+
+    # ─── 主聘月薪結構 ───
+    st.subheader("📋 醫師月薪結構（應付 → 扣除 → 實領）")
+    pay_rows = []
+    for p in sorted(payslips, key=lambda x: (x.main_clinic_name, x.doctor_name)):
+        pay_rows.append({
+            "主聘": p.main_clinic_name,
+            "醫師": p.doctor_name,
+            "主聘應付": p.gross_main,
+            "支援應付": p.gross_support,
+            "支援來自": p.support_clinic_name or "—",
+            "應付合計": p.gross_total,
+            "勞保扣": p.labor_deduction,
+            "健保扣": p.nhi_deduction,
+            "實領": p.take_home,
+        })
+    st.dataframe(
+        pd.DataFrame(pay_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ─── 分診所明細 ───
+    with st.expander("📊 分診所薪資明細（應付組成）"):
+        comp_rows = []
+        for c in sorted(components, key=lambda x: (x.doctor_name, x.clinic_name)):
+            comp_rows.append({
+                "診所": c.clinic_name,
+                "醫師": c.doctor_name,
+                "角色": c.role,
+                "院長津貼": c.director_allowance,
+                "診數": c.sessions_total,
+                "診薪×診數": c.session_pay,
+                "自費抽成": c.commission_total,
+                "業績獎金": c.bonus_total,
+                "平均人次": c.avg_visits_per_session,
+                "業績觸發": "✅" if c.perf_triggered else "—",
+                "應付小計": c.gross,
+                "備註": "; ".join(c.notes) if c.notes else "",
+            })
+        st.dataframe(
+            pd.DataFrame(comp_rows), use_container_width=True, hide_index=True
+        )
+
+    # ─── 跨支援墊付 ───
+    cross = [p for p in payslips if p.support_clinic_id and p.gross_support > 0]
+    if cross:
+        with st.expander("💱 跨支援墊付（豐沛金流項目）"):
+            st.caption(
+                "看診診所還主聘診所；薪資由主聘診所統一發給醫師，"
+                "後續透過豐沛金流結算"
+            )
+            cross_rows = [
+                {
+                    "墊付方（主聘）": p.main_clinic_name,
+                    "應由（看診診所）還": p.support_clinic_name,
+                    "醫師": p.doctor_name,
+                    "金額": p.gross_support,
+                }
+                for p in cross
+            ]
+            st.dataframe(
+                pd.DataFrame(cross_rows), use_container_width=True, hide_index=True
+            )
+
+    # ─── 自費抽成明細 ───
+    with st.expander("💰 自費抽成各項目明細"):
+        rows = []
+        for c in sorted(components, key=lambda x: (x.doctor_name, x.clinic_name)):
+            row = {
+                "診所": c.clinic_name,
+                "醫師": c.doctor_name,
+            }
+            row.update(c.commission_breakdown)
+            row["合計"] = c.commission_total
+            rows.append(row)
+        st.dataframe(
+            pd.DataFrame(rows), use_container_width=True, hide_index=True
+        )
+
+    # ─── 業績獎金明細（觸發者）───
+    triggered = [c for c in components if c.perf_triggered]
+    if triggered:
+        with st.expander("🎯 業績獎金明細（觸發者）"):
+            rows = [
+                {
+                    "診所": c.clinic_name,
+                    "醫師": c.doctor_name,
+                    "平均健保人次": c.avg_visits_per_session,
+                    "內科業績": c.bonus_internal,
+                    "純針純傷業績": c.bonus_pure_acu_trauma,
+                    "內+組合業績": c.bonus_internal_combo,
+                    "業績合計": c.bonus_total,
+                }
+                for c in triggered
+            ]
+            st.dataframe(
+                pd.DataFrame(rows), use_container_width=True, hide_index=True
+            )
+
+    # ─── 寫入 DB ───
+    st.divider()
+    if not st.session_state.get("edit_mode"):
+        st.info(
+            "上方為即時試算結果，未寫入 DB。如需寫入 doctor_salary_monthly，"
+            "請啟用左下「編輯模式」後再回到此頁。"
+        )
+        return
+
+    st.warning(
+        "⚠️ 寫入 DB 會覆蓋同月份既有計算結果（依 clinic+doctor+service_month UNIQUE）"
+    )
+    if st.button(
+        f"💾 寫入 {service_month[:7]} 計算結果到 doctor_salary_monthly",
+        type="primary",
+        key=f"salary_save_{service_month}",
+    ):
+        try:
+            n = upsert_salary_monthly(sb, components, payslips)
+            st.success(f"✅ 寫入 {n} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+# ============================================================
+# 5. 院長個人透支（Phase 5）
 # ============================================================
 def page_personal():
     st.title("💸 院長個人財富分析")
@@ -776,7 +942,9 @@ def page_settings():
 
     sb = get_authed_client()
 
-    tab1, tab2, tab3 = st.tabs(["白名單使用者", "醫師主檔", "系統資訊"])
+    tab1, tab2, tab_ins, tab3 = st.tabs(
+        ["白名單使用者", "醫師主檔", "勞健保扣除額", "系統資訊"]
+    )
 
     with tab1:
         st.subheader("授權使用者列表")
@@ -816,9 +984,165 @@ def page_settings():
         except Exception as e:
             st.error(f"讀取失敗：{e}")
 
+    with tab_ins:
+        _settings_insurance_deductions(sb)
+
     with tab3:
         st.subheader("系統資訊")
         st.text(f"登入者：{st.session_state.session.get('email')}")
         st.text(f"角色：{st.session_state.get('user_role', {}).get('role', 'unknown')}")
         st.text(f"User ID：{st.session_state.session.get('user_id')}")
         st.caption("Supabase URL：" + st.secrets["supabase"]["url"])
+
+
+def _settings_insurance_deductions(sb):
+    """勞健保扣除額管理（在主聘診所×醫師配置；UI CRUD）"""
+    st.subheader("勞健保扣除額")
+    st.caption(
+        "規則：只在主聘診所扣一次，支援診所扣 0。"
+        "目前所有醫師勞保扣 = 0（未加入勞保）。"
+        "投保額異動或新增醫師時在此編輯，下次計算薪資自動套用。"
+    )
+
+    try:
+        rows = sb.table("doctor_insurance_deductions").select(
+            "id, clinic_id, doctor_id, insurance_base, "
+            "labor_deduction, nhi_deduction, effective_from, effective_to, note"
+        ).execute().data
+        clinics = {c["id"]: c["short_name"]
+                   for c in sb.table("clinics").select("id, short_name").execute().data}
+        doctors = {d["id"]: d["name"]
+                   for d in sb.table("doctors").select("id, name").execute().data}
+    except Exception as e:
+        st.error(f"讀取失敗：{e}")
+        return
+
+    if not rows:
+        st.info("尚無資料。請新增。")
+
+    df = pd.DataFrame(rows).copy() if rows else pd.DataFrame()
+    if not df.empty:
+        df["診所"] = df["clinic_id"].map(clinics)
+        df["醫師"] = df["doctor_id"].map(doctors)
+        view = df[[
+            "id", "診所", "醫師", "insurance_base",
+            "labor_deduction", "nhi_deduction",
+            "effective_from", "effective_to", "note",
+        ]].rename(columns={
+            "insurance_base": "投保額",
+            "labor_deduction": "勞保扣",
+            "nhi_deduction": "健保扣",
+            "effective_from": "生效起",
+            "effective_to": "結束",
+            "note": "備註",
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+    # ─── 編輯區（需編輯模式）───
+    if not st.session_state.get("edit_mode"):
+        st.info("⚠️ 唯讀模式。如需新增/修改/刪除，請啟用左下「編輯模式」。")
+        return
+
+    st.divider()
+    st.markdown("**新增 / 修改一筆配置**")
+
+    edit_id = st.selectbox(
+        "選擇要修改的列（或留「新增」建立新列）",
+        options=["（新增）"] + [f"id={r['id']} {clinics.get(r['clinic_id'])}/{doctors.get(r['doctor_id'])}" for r in rows],
+        key="ins_edit_select",
+    )
+    is_edit = edit_id != "（新增）"
+    selected = None
+    if is_edit:
+        sid = int(edit_id.split()[0].split("=")[1])
+        selected = next((r for r in rows if r["id"] == sid), None)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        clinic_id = st.selectbox(
+            "主聘診所",
+            options=list(clinics.keys()),
+            format_func=lambda i: clinics[i],
+            index=list(clinics.keys()).index(selected["clinic_id"]) if selected else 0,
+            key="ins_clinic",
+        )
+        doctor_id = st.selectbox(
+            "醫師",
+            options=list(doctors.keys()),
+            format_func=lambda i: doctors[i],
+            index=list(doctors.keys()).index(selected["doctor_id"]) if selected else 0,
+            key="ins_doctor",
+        )
+        insurance_base = st.number_input(
+            "投保額",
+            min_value=0, step=100,
+            value=int(selected["insurance_base"]) if selected else 0,
+            key="ins_base",
+        )
+    with col_b:
+        labor_deduction = st.number_input(
+            "勞保扣（目前皆 0）",
+            min_value=0, step=10,
+            value=int(selected["labor_deduction"] or 0) if selected else 0,
+            key="ins_labor",
+        )
+        nhi_deduction = st.number_input(
+            "健保扣",
+            min_value=0, step=10,
+            value=int(selected["nhi_deduction"] or 0) if selected else 0,
+            key="ins_nhi",
+        )
+        effective_from = st.date_input(
+            "生效起始月（含）",
+            value=(
+                pd.to_datetime(selected["effective_from"]).date()
+                if selected and selected.get("effective_from") else pd.Timestamp("2026-01-01").date()
+            ),
+            key="ins_from",
+        )
+        effective_to = st.date_input(
+            "結束月（含；留空=至今）",
+            value=(
+                pd.to_datetime(selected["effective_to"]).date()
+                if selected and selected.get("effective_to") else None
+            ),
+            key="ins_to",
+        )
+
+    note = st.text_input(
+        "備註",
+        value=selected["note"] if selected and selected.get("note") else "",
+        key="ins_note",
+    )
+
+    col_save, col_del = st.columns(2)
+    with col_save:
+        if st.button("💾 儲存", type="primary", key="ins_save"):
+            payload = {
+                "clinic_id": clinic_id,
+                "doctor_id": doctor_id,
+                "insurance_base": insurance_base,
+                "labor_deduction": labor_deduction,
+                "nhi_deduction": nhi_deduction,
+                "effective_from": str(effective_from),
+                "effective_to": str(effective_to) if effective_to else None,
+                "note": note or None,
+            }
+            try:
+                if is_edit:
+                    sb.table("doctor_insurance_deductions").update(payload).eq("id", sid).execute()
+                    st.success(f"✅ 已更新 id={sid}")
+                else:
+                    sb.table("doctor_insurance_deductions").insert(payload).execute()
+                    st.success("✅ 已新增")
+                st.rerun()
+            except Exception as e:
+                st.error(f"儲存失敗：{e}")
+    with col_del:
+        if is_edit and st.button("🗑️ 刪除", key="ins_del"):
+            try:
+                sb.table("doctor_insurance_deductions").delete().eq("id", sid).execute()
+                st.success(f"✅ 已刪除 id={sid}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"刪除失敗：{e}")

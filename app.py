@@ -42,6 +42,7 @@ from pages_app import (
     page_dashboard,
     page_overview,
     page_import,
+    page_salary,
     page_personal,
     page_settings,
 )
@@ -95,6 +96,7 @@ def render_main_app():
             "📊 業績與財務儀表板",
             "💰 收支總覽",
             "📥 本月資料匯入區",
+            "💵 醫師薪資",
             "💸 院長個人財富分析",
             "⚙️ 系統設定",
             "🚪 登出",
@@ -124,6 +126,8 @@ def render_main_app():
         page_overview()
     elif choice == "📥 本月資料匯入區":
         page_import()
+    elif choice == "💵 醫師薪資":
+        page_salary()
     elif choice == "💸 院長個人財富分析":
         page_personal()
     elif choice == "⚙️ 系統設定":
