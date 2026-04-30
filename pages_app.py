@@ -68,11 +68,15 @@ def page_import():
     # ─── 中信進出戶 CSV ───────────────────────────────
     _section_ctbc_csv()
 
+    st.divider()
+
+    # ─── 醫療費用付款通知書 HTML（批次）───────────────
+    _section_nhi_notices()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    - 醫療費用付款通知書 HTML（批次）
     - 門診申報金額統計報表 / 看診人數+初診 / 合理門診量 / 自費統計
     - 澤沛 A91+複針
     - 診所支出：現金、合約、支票、調貨
@@ -277,6 +281,129 @@ def _section_ctbc_csv():
         key=f"ctbc_import_{account_choice}",
     ):
         _import_bank_records(sb, records)
+
+
+def _section_nhi_notices():
+    """醫療費用付款通知書 HTML 批次上傳區（Sprint 2.3）"""
+    from data_processor.nhi_notice_html import (
+        parse_filename,
+        parse_nhi_notice_html,
+    )
+
+    st.subheader("📄 醫療費用付款通知書 HTML（批次）")
+    st.caption(
+        "健保署系統下載的 HTML（Big5 編碼）。可一次選多份；機構由檔名自動識別，"
+        "重複檔名會跳過。"
+    )
+
+    uploaded_files = st.file_uploader(
+        "上傳一份或多份 HTML",
+        type=["html", "htm"],
+        accept_multiple_files=True,
+        key="nhi_uploader",
+    )
+    if not uploaded_files:
+        return
+
+    sb = get_authed_client()
+
+    clinics_resp = sb.table("clinics").select("id, code, short_name").execute()
+    code_to_id = {c["code"]: c["id"] for c in clinics_resp.data}
+    id_to_short = {c["id"]: c["short_name"] for c in clinics_resp.data}
+
+    records: list[dict] = []
+    errors: list[str] = []
+    for f in uploaded_files:
+        try:
+            meta = parse_filename(f.name)
+            clinic_id = code_to_id.get(meta["inst_code"])
+            if clinic_id is None:
+                raise ValueError(
+                    f"檔名機構碼 {meta['inst_code']} 不在 clinics 表"
+                )
+            rec = parse_nhi_notice_html(f, f.name, clinic_id)
+            records.append(rec)
+        except Exception as e:
+            errors.append(f"{f.name}：{e}")
+
+    if errors:
+        st.error("部分檔案解析失敗：")
+        for err in errors:
+            st.code(err)
+
+    if not records:
+        return
+
+    st.success(f"✅ 解析成功 {len(records)} 份")
+
+    preview = pd.DataFrame(records).copy()
+    preview["診所"] = preview["clinic_id"].map(id_to_short)
+    preview_cols = [
+        "source_filename", "診所", "service_month",
+        "apply_date", "payment_date",
+        "applied_amount", "interim_ratio_pct", "point_value",
+        "paid_amount", "deduction_amount", "payment_type",
+    ]
+    st.dataframe(
+        preview[preview_cols], use_container_width=True, height=300
+    )
+
+    # 同 (clinic, service_month) 聚合預覽
+    agg = (
+        preview.groupby(["診所", "service_month"], as_index=False)
+        .agg(份數=("source_filename", "count"), 合計實付=("paid_amount", "sum"))
+    )
+    st.markdown("**按 (診所, 服務月份) 聚合：**")
+    st.dataframe(agg, use_container_width=True, hide_index=True)
+
+    if st.button(
+        f"💾 確認匯入 {len(records)} 份健保通知書",
+        type="primary",
+        key="nhi_import_btn",
+    ):
+        _import_nhi_records(sb, records)
+
+
+def _import_nhi_records(sb, records: list[dict]):
+    """寫入 nhi_payment_notices（依 source_filename UNIQUE 防重複）"""
+    inserted = 0
+    skipped = 0
+    errors = []
+    progress = st.progress(0, text="匯入中...")
+    total = len(records)
+
+    BATCH_SIZE = 20
+    for i in range(0, total, BATCH_SIZE):
+        batch = records[i:i + BATCH_SIZE]
+        try:
+            resp = (
+                sb.table("nhi_payment_notices")
+                .upsert(
+                    batch,
+                    on_conflict="source_filename",
+                    ignore_duplicates=True,
+                )
+                .execute()
+            )
+            new_count = len(resp.data) if resp.data else 0
+            inserted += new_count
+            skipped += len(batch) - new_count
+        except Exception as e:
+            errors.append(f"批次 {i}-{i+len(batch)}：{e}")
+        progress.progress(min((i + BATCH_SIZE) / total, 1.0))
+
+    progress.empty()
+
+    if errors:
+        st.error("部分匯入失敗：")
+        for err in errors:
+            st.code(err)
+    if inserted:
+        st.success(f"✅ 新增 {inserted} 份")
+    if skipped:
+        st.info(f"ℹ️ 跳過重複 {skipped} 份（依 source_filename）")
+    if inserted and not errors:
+        st.balloons()
 
 
 def _import_bank_records(sb, records: list[dict]):
