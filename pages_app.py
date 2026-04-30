@@ -78,11 +78,16 @@ def page_import():
     # ─── 醫師自費統計（批次）─────────────────────────
     _section_cash_visits()
 
+    st.divider()
+
+    # ─── 健保人數+初診統計（批次）────────────────────
+    _section_visit_count()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    - 門診申報金額統計報表 / 看診人數+初診 / 合理門診量
+    - 門診申報金額統計報表 / 合理門診量
     - 澤沛 A91+複針
     - 診所支出：現金、合約、支票、調貨
     - 薪資表、商品成本售價、@科中進貨價目表
@@ -520,6 +525,149 @@ def _section_cash_visits():
         key=f"cash_import_btn_{clinic_choice}",
     ):
         _import_cash_records(sb, all_records)
+
+
+def _section_visit_count():
+    """健保人數+初診統計批次上傳區（Sprint 2.5）— 薪資業績獎金 + 診數來源"""
+    from data_processor.visit_count import (
+        parse_filename as parse_vc_filename,
+        parse_visit_count,
+    )
+
+    st.subheader("👥 健保人數+初診統計（批次）")
+    st.caption(
+        "提供薪資計算的「診數」+ 業績獎金「健保人次」。"
+        "可一次選多份不同月份/診所的檔案；診所由檔名自動識別。"
+    )
+
+    uploaded_files = st.file_uploader(
+        "上傳一份或多份 xlsx",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="vc_uploader",
+    )
+    if not uploaded_files:
+        return
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+    cid_to_short = {c["id"]: c["short_name"] for c in clinics_resp.data}
+
+    doctors_resp = sb.table("doctors").select("id, name").execute()
+    name_to_did = {d["name"]: d["id"] for d in doctors_resp.data}
+
+    all_doctor_records: list[dict] = []
+    all_clinic_rates: list[dict] = []
+    summaries: list[dict] = []
+    errors: list[str] = []
+
+    for f in uploaded_files:
+        try:
+            meta = parse_vc_filename(f.name)
+            cid = short_to_cid.get(meta["clinic_short"])
+            if cid is None:
+                raise ValueError(f"檔名診所 {meta['clinic_short']} 不在 clinics 表")
+            doc_recs, clinic_rates = parse_visit_count(
+                f, f.name, cid, name_to_did,
+            )
+            all_doctor_records.extend(doc_recs)
+            if clinic_rates:
+                all_clinic_rates.append(clinic_rates)
+            summaries.append({
+                "檔名": f.name,
+                "診所": meta["clinic_short"],
+                "服務月": meta["service_month"],
+                "醫師數": len(doc_recs),
+                "診所彙總": "✅" if clinic_rates else "—",
+            })
+        except Exception as e:
+            errors.append(f"{f.name}：{e}")
+
+    if errors:
+        st.error("部分檔案解析失敗：")
+        for e in errors:
+            st.code(e)
+
+    if not summaries:
+        return
+
+    st.markdown("**檔案彙整：**")
+    st.dataframe(pd.DataFrame(summaries), use_container_width=True, hide_index=True)
+
+    if all_doctor_records:
+        # 預覽（依檔名解析後加入醫師名顯示）
+        did_to_name = {d["id"]: d["name"] for d in doctors_resp.data}
+        preview = pd.DataFrame(all_doctor_records).copy()
+        preview["診所"] = preview["clinic_id"].map(cid_to_short)
+        preview["醫師"] = preview["doctor_id"].map(did_to_name)
+        cols = [
+            "service_month", "診所", "醫師", "sessions_total",
+            "nhi_internal", "nhi_pure_acu", "nhi_pure_trauma",
+            "nhi_internal_acu", "nhi_internal_trauma", "nhi_visits_total",
+            "cash_visits_internal", "cash_visits_acupuncture", "total_visits",
+        ]
+        st.markdown("**醫師月度資料預覽：**")
+        st.dataframe(preview[cols], use_container_width=True, height=250)
+
+    if all_clinic_rates:
+        st.markdown("**診所月度彙總（初診率/自費率/掛號優免）預覽：**")
+        rates_df = pd.DataFrame(all_clinic_rates).copy()
+        rates_df["診所"] = rates_df["clinic_id"].map(cid_to_short)
+        cols = [
+            "service_month", "診所",
+            "first_visit_count", "first_visit_rate",
+            "revisit_count", "revisit_rate",
+            "cash_visit_count", "cash_visit_rate",
+            "free_reg_count", "free_reg_rate",
+        ]
+        present = [c for c in cols if c in rates_df.columns]
+        st.dataframe(rates_df[present], use_container_width=True, hide_index=True)
+
+    if st.button(
+        f"💾 確認匯入（醫師 {len(all_doctor_records)} 筆 + 診所彙總 {len(all_clinic_rates)} 筆）",
+        type="primary",
+        key="vc_import_btn",
+    ):
+        _import_visit_records(sb, all_doctor_records, all_clinic_rates)
+
+
+def _import_visit_records(
+    sb,
+    doctor_records: list[dict],
+    clinic_rates: list[dict],
+):
+    """寫入 doctor_visit_stats（依 clinic+doctor+month UNIQUE）+ clinic_visit_rates"""
+    errors: list[str] = []
+
+    # 醫師月度
+    if doctor_records:
+        try:
+            sb.table("doctor_visit_stats").upsert(
+                doctor_records,
+                on_conflict="clinic_id,doctor_id,service_month",
+            ).execute()
+            st.success(f"✅ 醫師月度資料寫入 {len(doctor_records)} 筆")
+        except Exception as e:
+            errors.append(f"doctor_visit_stats：{e}")
+
+    # 診所彙總
+    if clinic_rates:
+        try:
+            sb.table("clinic_visit_rates").upsert(
+                clinic_rates,
+                on_conflict="clinic_id,service_month",
+            ).execute()
+            st.success(f"✅ 診所彙總寫入 {len(clinic_rates)} 筆")
+        except Exception as e:
+            errors.append(f"clinic_visit_rates：{e}")
+
+    if errors:
+        st.error("部分批次失敗：")
+        for e in errors:
+            st.code(e)
+    elif doctor_records or clinic_rates:
+        st.balloons()
 
 
 def _import_cash_records(sb, records: list[dict]):
