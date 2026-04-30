@@ -63,15 +63,20 @@ def page_import():
     # ─── 玉山健保戶 CSV ───────────────────────────────
     _section_esun_health_csv()
 
+    st.divider()
+
+    # ─── 中信進出戶 CSV ───────────────────────────────
+    _section_ctbc_csv()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    - 中信進出戶 PDF（澤豐 / 澤沛）
     - 醫療費用付款通知書 HTML（批次）
-    - 醫師門診統計報表 / 看診人數+初診 / 合理門診量 / 自費統計
+    - 門診申報金額統計報表 / 看診人數+初診 / 合理門診量 / 自費統計
+    - 澤沛 A91+複針
     - 診所支出：現金、合約、支票、調貨
-    - 薪資表、商品成本售價
+    - 薪資表、商品成本售價、@科中進貨價目表
     - 手 KEY：額外收入、非常規收支
     """)
 
@@ -161,6 +166,115 @@ def _section_esun_health_csv():
         f"💾 確認匯入 {clinic_choice} 玉山健保戶（{len(records)} 筆）",
         type="primary",
         key=f"esun_import_{clinic_choice}",
+    ):
+        _import_bank_records(sb, records)
+
+
+def _ensure_ctbc_account(sb, account_label: str) -> int:
+    """
+    確保中信進出戶 bank_account 存在，回傳 id
+
+    account_label:
+      "澤沛"     → clinic=澤沛, is_personal_mixed=False
+      "澤豐&個人" → clinic=澤豐, is_personal_mixed=True
+    """
+    if account_label == "澤沛":
+        clinic_short = "澤沛"
+        is_mixed = False
+        no_mask = "澤沛-中信-進出戶"
+    elif account_label == "澤豐&個人":
+        clinic_short = "澤豐"
+        is_mixed = True
+        no_mask = "澤豐-中信-進出戶（與院長個人混戶）"
+    else:
+        raise ValueError(f"未知帳戶 label：{account_label}")
+
+    clinic_resp = (
+        sb.table("clinics")
+        .select("id")
+        .eq("short_name", clinic_short)
+        .execute()
+    )
+    if not clinic_resp.data:
+        raise ValueError(f"找不到診所 {clinic_short}")
+    clinic_id = clinic_resp.data[0]["id"]
+
+    acc_resp = (
+        sb.table("bank_accounts")
+        .select("id")
+        .eq("clinic_id", clinic_id)
+        .eq("bank", "中信")
+        .eq("account_type", "進出戶")
+        .eq("is_personal_mixed", is_mixed)
+        .execute()
+    )
+    if acc_resp.data:
+        return acc_resp.data[0]["id"]
+
+    insert_resp = (
+        sb.table("bank_accounts")
+        .insert({
+            "clinic_id": clinic_id,
+            "bank": "中信",
+            "account_type": "進出戶",
+            "account_no_mask": no_mask,
+            "is_personal_mixed": is_mixed,
+        })
+        .execute()
+    )
+    return insert_resp.data[0]["id"]
+
+
+def _section_ctbc_csv():
+    """中信進出戶 CSV 上傳區（取代加密 PDF）"""
+    from data_processor.ctbc_csv import parse_ctbc_csv
+
+    st.subheader("🏦 中信進出戶 CSV")
+    st.caption("中信網銀「活存明細查詢」下載的 CSV（不需密碼，比 PDF 更可靠）")
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        account_choice = st.radio(
+            "帳戶",
+            ["澤沛", "澤豐&個人"],
+            key="ctbc_account_choice",
+            help="澤豐&個人 是與周院長個人混用的中信戶",
+        )
+    with col2:
+        uploaded_file = st.file_uploader(
+            f"上傳 {account_choice} 中信 CSV",
+            type=["csv"],
+            key=f"ctbc_uploader_{account_choice}",
+        )
+
+    if uploaded_file is None:
+        return
+
+    try:
+        sb = get_authed_client()
+        account_id = _ensure_ctbc_account(sb, account_choice)
+        records = parse_ctbc_csv(uploaded_file, account_id)
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+
+    if not records:
+        st.warning("CSV 沒有可匯入的交易記錄")
+        return
+
+    st.success(f"✅ 解析完成，共 {len(records)} 筆")
+
+    preview_cols = [
+        "transaction_date", "summary", "amount", "balance",
+        "channel", "counterparty", "note",
+    ]
+    preview_df = pd.DataFrame(records)[preview_cols]
+    st.dataframe(preview_df, use_container_width=True, height=300)
+
+    if st.button(
+        f"💾 確認匯入 {account_choice} 中信進出戶（{len(records)} 筆）",
+        type="primary",
+        key=f"ctbc_import_{account_choice}",
     ):
         _import_bank_records(sb, records)
 
