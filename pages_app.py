@@ -83,12 +83,16 @@ def page_import():
     # ─── 健保人數+初診統計（批次）────────────────────
     _section_visit_count()
 
+    st.divider()
+
+    # ─── 門診申報金額統計報表 + A91+複針（批次）──────
+    _section_outpatient_report()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    - 門診申報金額統計報表 / 合理門診量
-    - 澤沛 A91+複針
+    - 合理門診量
     - 診所支出：現金、合約、支票、調貨
     - 薪資表、商品成本售價、@科中進貨價目表
     - 手 KEY：額外收入、非常規收支
@@ -527,6 +531,183 @@ def _section_cash_visits():
         _import_cash_records(sb, all_records)
 
 
+def _section_outpatient_report():
+    """門診申報金額統計報表 + A91+複針補表（Sprint 2.4）"""
+    from data_processor.clinic_report import (
+        detect_format,
+        parse_fz_main, parse_fp_main, parse_fp_a91,
+    )
+
+    st.subheader("📊 門診申報金額統計報表 + A91+複針（批次）")
+    st.caption(
+        "三種版式自動識別：澤豐 48 欄主表 / 澤沛 16 欄主表 / 澤沛 A91+複針 137 欄補表。"
+        "可一次選多份；補表會 partial update 到主表已存在的列。"
+    )
+
+    uploaded_files = st.file_uploader(
+        "上傳一份或多份 xlsx",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="outpatient_uploader",
+    )
+    if not uploaded_files:
+        return
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+    doctors_resp = sb.table("doctors").select("id, name").execute()
+    name_to_did = {d["name"]: d["id"] for d in doctors_resp.data}
+
+    main_records: list[dict] = []
+    a91_records: list[dict] = []
+    summaries: list[dict] = []
+    errors: list[str] = []
+
+    parser_map = {
+        "fz_main": parse_fz_main,
+        "fp_main": parse_fp_main,
+        "fp_a91": parse_fp_a91,
+    }
+    kind_label = {
+        "fz_main": "澤豐 48 欄",
+        "fp_main": "澤沛 16 欄",
+        "fp_a91": "澤沛 A91+複針 137 欄",
+    }
+
+    for f in uploaded_files:
+        try:
+            meta = detect_format(f.name)
+            cid = short_to_cid[meta["clinic_short"]]
+            recs = parser_map[meta["kind"]](f, f.name, cid, name_to_did)
+            if meta["kind"] == "fp_a91":
+                a91_records.extend(recs)
+            else:
+                main_records.extend(recs)
+            summaries.append({
+                "檔名": f.name,
+                "版式": kind_label[meta["kind"]],
+                "服務月": meta["service_month"],
+                "醫師數": len(recs),
+            })
+        except Exception as e:
+            errors.append(f"{f.name}：{e}")
+
+    if errors:
+        st.error("部分檔案解析失敗：")
+        for e in errors:
+            st.code(e)
+    if not summaries:
+        return
+
+    st.markdown("**檔案彙整：**")
+    st.dataframe(pd.DataFrame(summaries), use_container_width=True, hide_index=True)
+
+    cid_to_short = {v: k for k, v in short_to_cid.items()}
+    did_to_name = {d["id"]: d["name"] for d in doctors_resp.data}
+
+    if main_records:
+        st.markdown("**主表預覽：**")
+        df = pd.DataFrame(main_records).copy()
+        df["診所"] = df["clinic_id"].map(cid_to_short)
+        df["醫師"] = df["doctor_id"].map(did_to_name)
+        cols = [
+            "service_month", "診所", "醫師",
+            "nhi_consult_fee", "nhi_drug_fee", "nhi_treatment_fee",
+            "nhi_lab_fee", "nhi_total_points",
+            "cash_internal", "cash_acupuncture", "registration_fee",
+            "acu_complex_mid_count", "acu_complex_high_count", "a91_count",
+        ]
+        present = [c for c in cols if c in df.columns]
+        st.dataframe(df[present], use_container_width=True, hide_index=True)
+
+    if a91_records:
+        st.markdown("**A91+複針 補表預覽（將 partial update 到主表）：**")
+        df = pd.DataFrame(a91_records).copy()
+        df["診所"] = df["clinic_id"].map(cid_to_short)
+        df["醫師"] = df["doctor_id"].map(did_to_name)
+        cols = [
+            "service_month", "診所", "醫師",
+            "acu_complex_mid_count", "acu_complex_high_count", "a91_count",
+        ]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    if st.button(
+        f"💾 確認匯入（主表 {len(main_records)} 筆 / 補表 {len(a91_records)} 筆）",
+        type="primary",
+        key="outpatient_import_btn",
+    ):
+        _import_outpatient_records(sb, main_records, a91_records)
+
+
+def _import_outpatient_records(
+    sb,
+    main_records: list[dict],
+    a91_records: list[dict],
+):
+    """主表整列 upsert + 補表 partial update（只三欄）"""
+    errors: list[str] = []
+
+    if main_records:
+        try:
+            sb.table("doctor_outpatient_summary").upsert(
+                main_records,
+                on_conflict="clinic_id,doctor_id,service_month",
+            ).execute()
+            st.success(f"✅ 主表寫入 {len(main_records)} 筆")
+        except Exception as e:
+            errors.append(f"主表：{e}")
+
+    a91_done = 0
+    for rec in a91_records:
+        try:
+            existing = (
+                sb.table("doctor_outpatient_summary")
+                .select("id")
+                .eq("clinic_id", rec["clinic_id"])
+                .eq("doctor_id", rec["doctor_id"])
+                .eq("service_month", rec["service_month"])
+                .execute()
+            )
+            update_payload = {
+                "acu_complex_mid_count": rec["acu_complex_mid_count"],
+                "acu_complex_high_count": rec["acu_complex_high_count"],
+                "a91_count": rec["a91_count"],
+            }
+            if existing.data:
+                (
+                    sb.table("doctor_outpatient_summary")
+                    .update(update_payload)
+                    .eq("clinic_id", rec["clinic_id"])
+                    .eq("doctor_id", rec["doctor_id"])
+                    .eq("service_month", rec["service_month"])
+                    .execute()
+                )
+            else:
+                payload = {
+                    "clinic_id": rec["clinic_id"],
+                    "doctor_id": rec["doctor_id"],
+                    "service_month": rec["service_month"],
+                    **update_payload,
+                }
+                sb.table("doctor_outpatient_summary").insert(payload).execute()
+            a91_done += 1
+        except Exception as e:
+            errors.append(
+                f"補表 (clinic={rec['clinic_id']}, doctor={rec['doctor_id']}, "
+                f"month={rec['service_month']})：{e}"
+            )
+    if a91_records:
+        st.success(f"✅ A91+複針 補表處理 {a91_done}/{len(a91_records)} 筆")
+
+    if errors:
+        st.error("部分批次失敗：")
+        for e in errors:
+            st.code(e)
+    elif main_records or a91_records:
+        st.balloons()
+
+
 def _section_visit_count():
     """健保人數+初診統計批次上傳區（Sprint 2.5）— 薪資業績獎金 + 診數來源"""
     from data_processor.visit_count import (
@@ -821,6 +1002,8 @@ def page_salary():
                 "診薪×診數": c.session_pay,
                 "自費抽成": c.commission_total,
                 "業績獎金": c.bonus_total,
+                "複針獎金": c.acu_complex_bonus,
+                "A91獎金": c.a91_bonus,
                 "平均人次": c.avg_visits_per_session,
                 "業績觸發": "✅" if c.perf_triggered else "—",
                 "應付小計": c.gross,
@@ -829,6 +1012,33 @@ def page_salary():
         st.dataframe(
             pd.DataFrame(comp_rows), use_container_width=True, hide_index=True
         )
+
+    # ─── 複針/A91 獎金細項（4月起）───
+    has_acu = any(c.acu_complex_bonus or c.a91_bonus for c in components)
+    if has_acu:
+        with st.expander("💉 複針/A91 獎金細項（115/04 起新制）"):
+            rows = []
+            for c in sorted(components, key=lambda x: (x.doctor_name, x.clinic_name)):
+                if not (c.acu_complex_bonus or c.a91_bonus
+                        or c.acu_complex_mid_count or c.a91_count):
+                    continue
+                rows.append({
+                    "診所": c.clinic_name,
+                    "醫師": c.doctor_name,
+                    "中複針人數": c.acu_complex_mid_count,
+                    "高複針人數": c.acu_complex_high_count,
+                    "複針獎金": c.acu_complex_bonus,
+                    "A91人數": c.a91_count,
+                    "A91獎金": c.a91_bonus,
+                    "合計": c.acu_complex_bonus + c.a91_bonus,
+                })
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows), use_container_width=True, hide_index=True
+                )
+                st.caption(
+                    "公式：中複針 ×20 + 高複針 ×40 + A91 ×14（115/04 起套用）"
+                )
 
     # ─── 跨支援墊付 ───
     cross = [p for p in payslips if p.support_clinic_id and p.gross_support > 0]

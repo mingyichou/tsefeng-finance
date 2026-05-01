@@ -35,6 +35,13 @@ PERF_COMBO_RATE = 110
 PERF_TRIGGER_AVG_FALLBACK = 15.1   # 若 bonus_rules 表查不到時的備援
 
 
+# ─── A91+複針 獎金（115/04 新制起算）────────────────────
+ACU_COMPLEX_MID_RATE = 20    # 中度複針 × 20 元/人
+ACU_COMPLEX_HIGH_RATE = 40   # 高度複針 × 40 元/人
+A91_RATE = 14                # A91 整合醫療 × 14 元/人
+ACU_A91_EFFECTIVE_FROM = "2026-04-01"   # 4月起套用
+
+
 # ─── 抽成欄位對應 ────────────────────────────────────────
 # DB 欄位名 → doctor_cash_monthly view 欄位名
 COMMISSION_FIELDS = [
@@ -65,6 +72,12 @@ class SalaryComponent:
     bonus_total: int = 0
     perf_triggered: bool = False
     visit_count_nhi: int = 0
+    # 4月起新制
+    acu_complex_mid_count: int = 0
+    acu_complex_high_count: int = 0
+    acu_complex_bonus: int = 0
+    a91_count: int = 0
+    a91_bonus: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -78,6 +91,8 @@ class SalaryComponent:
             + self.session_pay
             + self.commission_total
             + self.bonus_total
+            + self.acu_complex_bonus
+            + self.a91_bonus
         )
 
     def to_db_row(self) -> dict:
@@ -96,7 +111,12 @@ class SalaryComponent:
             "bonus_pure_acu_trauma": self.bonus_pure_acu_trauma,
             "bonus_internal_combo": self.bonus_internal_combo,
             "bonus_total": self.bonus_total,
-            "labor_deduction": 0,    # 此列扣除 — 主聘列才填，非主聘 0
+            "acu_complex_mid_count": self.acu_complex_mid_count,
+            "acu_complex_high_count": self.acu_complex_high_count,
+            "acu_complex_bonus": self.acu_complex_bonus,
+            "a91_count": self.a91_count,
+            "a91_bonus": self.a91_bonus,
+            "labor_deduction": 0,    # 主聘列才填，非主聘 0
             "nhi_deduction": 0,
         }
 
@@ -164,6 +184,13 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
         .eq("service_month", service_month)
         .execute().data
     )
+    outpatient = (
+        sb.table("doctor_outpatient_summary")
+        .select("clinic_id, doctor_id, service_month, "
+                "acu_complex_mid_count, acu_complex_high_count, a91_count")
+        .eq("service_month", service_month)
+        .execute().data
+    )
 
     commission_rules = sb.table("doctor_commission_rules").select(
         "item_field, item_label, default_rate"
@@ -195,6 +222,9 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
         },
         "cash_monthly": {
             (v["clinic_id"], v["doctor_id"]): v for v in cash_monthly
+        },
+        "outpatient": {
+            (v["clinic_id"], v["doctor_id"]): v for v in outpatient
         },
         "commission_rules": {r["item_field"]: float(r["default_rate"]) for r in commission_rules},
         "commission_overrides": {
@@ -283,6 +313,7 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
 
         visit_row = inputs["visit_stats"].get((clinic_id, doctor_id))
         cash_row = inputs["cash_monthly"].get((clinic_id, doctor_id))
+        outpatient_row = inputs["outpatient"].get((clinic_id, doctor_id))
 
         sessions = (visit_row or {}).get("sessions_total", 0) or 0
         # session_fee 為 NUMERIC(7,1)（如 3230.8），先乘診數最後再 round
@@ -292,6 +323,17 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
         triggered, avg, b_int, b_pure, b_combo = _calc_perf_bonus(
             visit_row, sessions, threshold
         )
+
+        # 4月起新制：A91+複針獎金
+        acu_mid = (outpatient_row or {}).get("acu_complex_mid_count", 0) or 0
+        acu_high = (outpatient_row or {}).get("acu_complex_high_count", 0) or 0
+        a91_cnt = (outpatient_row or {}).get("a91_count", 0) or 0
+        if service_month >= ACU_A91_EFFECTIVE_FROM:
+            acu_bonus = acu_mid * ACU_COMPLEX_MID_RATE + acu_high * ACU_COMPLEX_HIGH_RATE
+            a91_b = a91_cnt * A91_RATE
+        else:
+            acu_bonus = 0
+            a91_b = 0
 
         sc = SalaryComponent(
             clinic_id=clinic_id,
@@ -312,6 +354,11 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
             bonus_total=b_int + b_pure + b_combo,
             perf_triggered=triggered,
             visit_count_nhi=(visit_row or {}).get("nhi_visits_total", 0) or 0,
+            acu_complex_mid_count=acu_mid,
+            acu_complex_high_count=acu_high,
+            acu_complex_bonus=acu_bonus,
+            a91_count=a91_cnt,
+            a91_bonus=a91_b,
         )
 
         if not visit_row:
