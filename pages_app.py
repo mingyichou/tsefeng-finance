@@ -1736,7 +1736,7 @@ def _import_bank_records(sb, records: list[dict]):
 # 4. 醫師薪資（Phase 3.5）
 # ============================================================
 def page_salary():
-    st.title("💵 醫師薪資單")
+    st.title("💵 醫師薪資計算")
 
     from data_processor.salary import (
         run_salary_calculation,
@@ -1767,7 +1767,6 @@ def page_salary():
 
     with st.spinner("計算中..."):
         components, payslips = run_salary_calculation(sb, service_month)
-        # 取 cash_monthly 原始金額用於業績母數顯示
         inputs = fetch_salary_inputs(sb, service_month)
         cash_lookup = inputs["cash_monthly"]
 
@@ -1775,46 +1774,191 @@ def page_salary():
         st.warning("該月份無計算結果")
         return
 
-    # ─── 對每位醫師渲染薪資單 ───
-    # group by doctor
+    # ════════════════════════════════════════════════════════
+    # PART 1：彙總比較表（網頁儀表板模式）
+    # ════════════════════════════════════════════════════════
+
+    st.subheader("📋 醫師月薪結構（應付 → 扣除 → 實領）")
+    pay_rows = []
+    for p in sorted(payslips, key=lambda x: (x.main_clinic_name, x.doctor_name)):
+        pay_rows.append({
+            "主聘": p.main_clinic_name,
+            "醫師": p.doctor_name,
+            "主聘應付": p.gross_main,
+            "支援應付": p.gross_support,
+            "支援來自": p.support_clinic_name or "—",
+            "應付合計": p.gross_total,
+            "勞保扣": p.labor_deduction,
+            "健保扣": p.nhi_deduction,
+            "實領": p.take_home,
+        })
+    st.dataframe(
+        pd.DataFrame(pay_rows), use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("📊 分診所薪資明細（應付組成）"):
+        comp_rows = []
+        for c in sorted(components, key=lambda x: (x.doctor_name, x.clinic_name)):
+            comp_rows.append({
+                "診所": c.clinic_name,
+                "醫師": c.doctor_name,
+                "角色": c.role,
+                "院長津貼": c.director_allowance,
+                "診數": c.sessions_total,
+                "診薪×診數": c.session_pay,
+                "自費抽成": c.commission_total,
+                "業績獎金": c.bonus_total,
+                "複針獎金": c.acu_complex_bonus,
+                "A91獎金": c.a91_bonus,
+                "平均人次": c.avg_visits_per_session,
+                "業績觸發": "✅" if c.perf_triggered else "—",
+                "應付小計": c.gross,
+                "備註": "; ".join(c.notes) if c.notes else "",
+            })
+        st.dataframe(
+            pd.DataFrame(comp_rows), use_container_width=True, hide_index=True
+        )
+
+    cross = [p for p in payslips if p.support_clinic_id and p.gross_support > 0]
+    if cross:
+        with st.expander("💱 跨支援墊付（豐沛金流項目）"):
+            cross_rows = [
+                {
+                    "墊付方（主聘）": p.main_clinic_name,
+                    "應由（看診診所）還": p.support_clinic_name,
+                    "醫師": p.doctor_name,
+                    "金額": p.gross_support,
+                }
+                for p in cross
+            ]
+            st.dataframe(
+                pd.DataFrame(cross_rows), use_container_width=True, hide_index=True
+            )
+
+    with st.expander("💰 自費抽成各項目明細"):
+        rows = []
+        for c in sorted(components, key=lambda x: (x.doctor_name, x.clinic_name)):
+            row = {"診所": c.clinic_name, "醫師": c.doctor_name}
+            row.update(c.commission_breakdown)
+            row["合計"] = c.commission_total
+            rows.append(row)
+        st.dataframe(
+            pd.DataFrame(rows), use_container_width=True, hide_index=True
+        )
+
+    triggered = [c for c in components if c.perf_triggered]
+    if triggered:
+        with st.expander("🎯 業績獎金明細（觸發者）"):
+            rows = [
+                {
+                    "診所": c.clinic_name, "醫師": c.doctor_name,
+                    "平均健保人次": c.avg_visits_per_session,
+                    "內科業績": c.bonus_internal,
+                    "純針純傷業績": c.bonus_pure_acu_trauma,
+                    "內+組合業績": c.bonus_internal_combo,
+                    "業績合計": c.bonus_total,
+                }
+                for c in triggered
+            ]
+            st.dataframe(
+                pd.DataFrame(rows), use_container_width=True, hide_index=True
+            )
+
+    has_acu = any(c.acu_complex_bonus or c.a91_bonus for c in components)
+    if has_acu:
+        with st.expander("💉 複針/A91 獎金細項（115/04 起新制）"):
+            rows = []
+            for c in sorted(components, key=lambda x: (x.doctor_name, x.clinic_name)):
+                if not (c.acu_complex_bonus or c.a91_bonus
+                        or c.acu_complex_mid_count or c.a91_count):
+                    continue
+                rows.append({
+                    "診所": c.clinic_name, "醫師": c.doctor_name,
+                    "中複針人數": c.acu_complex_mid_count,
+                    "高複針人數": c.acu_complex_high_count,
+                    "複針獎金": c.acu_complex_bonus,
+                    "A91人數": c.a91_count,
+                    "A91獎金": c.a91_bonus,
+                    "合計": c.acu_complex_bonus + c.a91_bonus,
+                })
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows), use_container_width=True, hide_index=True
+                )
+
+    # ════════════════════════════════════════════════════════
+    # PART 2：列印薪資單（給醫師看的卡片格式）
+    # ════════════════════════════════════════════════════════
+
+    st.divider()
+    st.subheader("🖨️ 列印薪資單（給醫師閱覽用）")
+    st.caption("選一位醫師顯示完整薪資單，可直接 Ctrl+P 列印或截圖。")
+
     by_doctor: dict[int, list] = {}
     for c in components:
         by_doctor.setdefault(c.doctor_id, []).append(c)
 
-    role_label = {"director": "負責醫", "regular": "執業醫", "support": "支援醫"}
+    doctor_options = sorted(
+        by_doctor.keys(),
+        key=lambda did: by_doctor[did][0].doctor_name,
+    )
+    did_to_name = {did: by_doctor[did][0].doctor_name for did in doctor_options}
 
-    for doctor_id, comps in sorted(by_doctor.items(), key=lambda x: x[1][0].doctor_name):
-        doctor_name = comps[0].doctor_name
-        # 找此醫師的 payslip（彙總勞健保扣）
+    selected_doctor = st.selectbox(
+        "選擇醫師",
+        options=["（不顯示）"] + doctor_options,
+        format_func=lambda x: "（不顯示）" if x == "（不顯示）" else did_to_name[x],
+        key="payslip_doctor_select",
+    )
+
+    if selected_doctor != "（不顯示）":
+        doctor_id = selected_doctor
+        comps = by_doctor[doctor_id]
         ps = next((p for p in payslips if p.doctor_id == doctor_id), None)
+        doctor_name = comps[0].doctor_name
 
-        st.divider()
+        role_label = {
+            "director": "負責醫", "regular": "執業醫", "support": "支援醫",
+        }
+
+        st.markdown("---")
         st.markdown(f"## 🩺 {doctor_name}　薪資單　{service_month[:7]}")
 
-        # 多診所並列；單診所就一欄
         if len(comps) > 1:
             comps_sorted = sorted(comps, key=lambda c: 0 if c.role != "support" else 1)
-            cols = st.columns(len(comps_sorted))
+            cols_layout = st.columns(len(comps_sorted))
             for i, c in enumerate(comps_sorted):
-                with cols[i]:
+                with cols_layout[i]:
                     _render_payslip_block(c, cash_lookup, role_label)
         else:
             _render_payslip_block(comps[0], cash_lookup, role_label)
 
-        # 跨診所總和（僅多診所時）
         if ps and ps.support_clinic_id:
+            st.markdown("---")
             st.markdown(
-                f"### 📊 兩診所合計："
-                f" {ps.main_clinic_name} 應付 ${ps.gross_main:,}"
-                f" ＋ {ps.support_clinic_name} 應付 ${ps.gross_support:,}"
-                f" ＝ **${ps.gross_total:,}**"
+                f"### 📊 兩診所合計"
+                f"\n\n"
+                f"{ps.main_clinic_name} 應付 ${ps.gross_main:,}　＋　"
+                f"{ps.support_clinic_name} 應付 ${ps.gross_support:,}　＝　"
+                f"**${ps.gross_total:,}**"
             )
             st.markdown(
-                f"勞保扣 ${ps.labor_deduction:,}　|　健保扣 ${ps.nhi_deduction:,}"
-                f"　|　**實領總額：${ps.take_home:,}**"
+                f"勞保扣 ${ps.labor_deduction:,}　|　"
+                f"健保扣 ${ps.nhi_deduction:,}　|　"
+                f"**實領總額：${ps.take_home:,}**"
+            )
+        elif ps:
+            st.markdown(
+                f"應付 ${ps.gross_total:,}　|　"
+                f"勞保扣 ${ps.labor_deduction:,}　|　"
+                f"健保扣 ${ps.nhi_deduction:,}　|　"
+                f"**實領：${ps.take_home:,}**"
             )
 
-    # ─── 寫入 DB ───
+    # ════════════════════════════════════════════════════════
+    # PART 3：寫入 DB
+    # ════════════════════════════════════════════════════════
+
     st.divider()
     if not st.session_state.get("edit_mode"):
         st.info("以上為即時試算。如需寫入 doctor_salary_monthly，啟用編輯模式後再回此頁。")
