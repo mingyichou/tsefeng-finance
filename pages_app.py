@@ -1904,56 +1904,113 @@ def page_salary():
     )
     did_to_name = {did: by_doctor[did][0].doctor_name for did in doctor_options}
 
+    SHOW_NONE = "__none__"
+    SHOW_ALL = "__all__"
+
+    def _fmt(x):
+        if x == SHOW_NONE:
+            return "（不顯示）"
+        if x == SHOW_ALL:
+            return "🖨️ 全部展開（一頁可 Ctrl+P 列印）"
+        return did_to_name[x]
+
     selected_doctor = st.selectbox(
         "選擇醫師",
-        options=["（不顯示）"] + doctor_options,
-        format_func=lambda x: "（不顯示）" if x == "（不顯示）" else did_to_name[x],
+        options=[SHOW_NONE, SHOW_ALL] + list(doctor_options),
+        format_func=_fmt,
         key="payslip_doctor_select",
     )
 
-    if selected_doctor != "（不顯示）":
-        doctor_id = selected_doctor
+    role_label = {"director": "負責醫", "regular": "執業醫", "support": "支援醫"}
+
+    def _render_one_doctor(doctor_id):
         comps = by_doctor[doctor_id]
         ps = next((p for p in payslips if p.doctor_id == doctor_id), None)
         doctor_name = comps[0].doctor_name
 
-        role_label = {
-            "director": "負責醫", "regular": "執業醫", "support": "支援醫",
-        }
-
-        st.markdown("---")
         st.markdown(f"## 🩺 {doctor_name}　薪資單　{service_month[:7]}")
 
         if len(comps) > 1:
-            comps_sorted = sorted(comps, key=lambda c: 0 if c.role != "support" else 1)
+            comps_sorted = sorted(
+                comps, key=lambda c: 0 if c.role != "support" else 1
+            )
             cols_layout = st.columns(len(comps_sorted))
             for i, c in enumerate(comps_sorted):
                 with cols_layout[i]:
-                    _render_payslip_block(c, cash_lookup, role_label)
+                    if c.role != "support" and ps:
+                        _render_payslip_block(
+                            c, cash_lookup, role_label,
+                            ps.labor_deduction, ps.nhi_deduction,
+                        )
+                    else:
+                        _render_payslip_block(c, cash_lookup, role_label)
         else:
-            _render_payslip_block(comps[0], cash_lookup, role_label)
+            c = comps[0]
+            if c.role != "support" and ps:
+                _render_payslip_block(
+                    c, cash_lookup, role_label,
+                    ps.labor_deduction, ps.nhi_deduction,
+                )
+            else:
+                _render_payslip_block(c, cash_lookup, role_label)
 
         if ps and ps.support_clinic_id:
+            main_take = ps.gross_main - ps.labor_deduction - ps.nhi_deduction
             st.markdown("---")
             st.markdown(
-                f"### 📊 兩診所合計"
-                f"\n\n"
-                f"{ps.main_clinic_name} 應付 ${ps.gross_main:,}　＋　"
-                f"{ps.support_clinic_name} 應付 ${ps.gross_support:,}　＝　"
-                f"**${ps.gross_total:,}**"
+                f"### 📊 兩診所合計（主聘已扣勞健保，支援未扣）\n\n"
+                f"{ps.main_clinic_name} 實領 NT {main_take:,} 元　＋　"
+                f"{ps.support_clinic_name} 應付 NT {ps.gross_support:,} 元"
             )
-            st.markdown(
-                f"勞保扣 ${ps.labor_deduction:,}　|　"
-                f"健保扣 ${ps.nhi_deduction:,}　|　"
-                f"**實領總額：${ps.take_home:,}**"
+            st.markdown(f"## **實領總額：NT {ps.take_home:,} 元**")
+
+    if selected_doctor == SHOW_ALL:
+        st.info(
+            "📄 一頁顯示所有醫師薪資單。瀏覽器 Ctrl+P 可印出整頁，"
+            "或下載下方的 markdown 檔自行匯入 Word/Google Doc。"
+        )
+        for i, did in enumerate(doctor_options):
+            if i > 0:
+                st.markdown("---\n\n")
+            _render_one_doctor(did)
+        # 提供下載：把所有醫師合併成一份 markdown
+        all_md_lines: list[str] = [f"# 醫師薪資單　{service_month[:7]}", ""]
+        for did in doctor_options:
+            comps = by_doctor[did]
+            ps = next((p for p in payslips if p.doctor_id == did), None)
+            all_md_lines.append(f"\n\n## 🩺 {comps[0].doctor_name}　薪資單　{service_month[:7]}\n")
+            comps_sorted = sorted(
+                comps, key=lambda c: 0 if c.role != "support" else 1
             )
-        elif ps:
-            st.markdown(
-                f"應付 ${ps.gross_total:,}　|　"
-                f"勞保扣 ${ps.labor_deduction:,}　|　"
-                f"健保扣 ${ps.nhi_deduction:,}　|　"
-                f"**實領：${ps.take_home:,}**"
-            )
+            for c in comps_sorted:
+                if c.role != "support" and ps:
+                    block = _payslip_lines(
+                        c, cash_lookup, role_label,
+                        ps.labor_deduction, ps.nhi_deduction,
+                    )
+                else:
+                    block = _payslip_lines(c, cash_lookup, role_label)
+                all_md_lines.extend(block)
+                all_md_lines.append("")
+            if ps and ps.support_clinic_id:
+                main_take = ps.gross_main - ps.labor_deduction - ps.nhi_deduction
+                all_md_lines.append(
+                    f"\n**📊 兩診所合計**：{ps.main_clinic_name} 實領 NT "
+                    f"{main_take:,} 元 ＋ {ps.support_clinic_name} 應付 NT "
+                    f"{ps.gross_support:,} 元"
+                )
+                all_md_lines.append(f"## 實領總額：NT {ps.take_home:,} 元")
+            all_md_lines.append("\n---\n")
+        st.download_button(
+            "📥 下載所有醫師薪資單 (.md)",
+            data="\n".join(all_md_lines).encode("utf-8"),
+            file_name=f"薪資單_{service_month[:7]}.md",
+            mime="text/markdown",
+            key="dl_all_md",
+        )
+    elif selected_doctor != SHOW_NONE:
+        st.markdown("---")
+        _render_one_doctor(selected_doctor)
 
     # ════════════════════════════════════════════════════════
     # PART 3：寫入 DB
@@ -1977,64 +2034,65 @@ def page_salary():
             st.error(f"寫入失敗：{e}")
 
 
-def _render_payslip_block(c, cash_lookup: dict, role_label: dict):
-    """渲染單一(診所×醫師)薪資單區塊。空項目自動省略。"""
+def _payslip_lines(c, cash_lookup: dict, role_label: dict,
+                   labor_ded: int = 0, nhi_ded: int = 0) -> list[str]:
+    """
+    產生(診所×醫師)薪資單 markdown 行 list。
+    避開 $ 符號（streamlit markdown 會啟動 LaTeX 公式渲染導致顯示亂掉）—
+    改用「[a × b% = c] 元」格式。
+
+    若主聘那欄傳入 labor_ded/nhi_ded 則顯示扣除 + 實領；支援欄不傳。
+    """
     role = role_label.get(c.role, c.role)
     cash_row = cash_lookup.get((c.clinic_id, c.doctor_id), {}) or {}
+    L: list[str] = []
 
-    # ─── 標頭 ───
-    st.markdown(f"### {c.clinic_name}　{role}")
+    L.append(f"### {c.clinic_name}　{role}")
 
-    # ─── 看診摘要 ───
     if c.sessions_total or c.visit_count_nhi:
-        st.markdown(
+        L.append(
             f"**看診**：診數 {c.sessions_total}　|　"
             f"健保人次 {c.visit_count_nhi:,}　|　"
             f"平均 {c.avg_visits_per_session}/診"
         )
 
-    # ─── 診薪 ───
     if c.session_pay:
-        st.markdown(f"**診薪**：總額 NT$ **{c.session_pay:,}**")
+        L.append(f"**診薪**：總額 **NT {c.session_pay:,} 元**")
 
-    # ─── 院長津貼 ───
     if c.director_allowance:
-        st.markdown(f"**負責醫津貼**：NT$ **{c.director_allowance:,}**")
+        L.append(f"**負責醫津貼**：**NT {c.director_allowance:,} 元**")
 
-    # ─── 業績獎金（人次 + 獎金 雙顯示）───
+    # 業績獎金
     perf_lines = []
     perf_active = c.perf_triggered
-    # 內科：bonus_internal 對應健保「內科」人次
-    visit_internal = (
-        cash_row  # 從 cash 取不到，要從 visit_stats — 這在 component 沒帶
-    )
-    # 為簡單，從 inputs 取 visit_stats 已經 round-trip 太麻煩，這裡只顯示 component 已有的
     if c.bonus_internal or perf_active:
         perf_lines.append(
-            f"- 內科業績：人次 {_visit_field(c, 'nhi_internal')} → "
-            f"獎金 NT$ **{c.bonus_internal:,}**"
+            f"- 內科業績：人次 {c.visit_internal} → "
+            f"獎金 **NT {c.bonus_internal:,} 元**"
         )
     if c.bonus_internal_combo or perf_active:
-        n = _visit_field(c, 'nhi_internal_acu') + _visit_field(c, 'nhi_internal_trauma')
+        combo_n = c.visit_internal_acu + c.visit_internal_trauma
         perf_lines.append(
-            f"- 內針業績：人次 {n} → 獎金 NT$ **{c.bonus_internal_combo:,}**"
+            f"- 內針業績：人次 {combo_n}（內+針 {c.visit_internal_acu} + "
+            f"內+傷 {c.visit_internal_trauma}）→ "
+            f"獎金 **NT {c.bonus_internal_combo:,} 元**"
         )
     if c.bonus_pure_acu_trauma or perf_active:
-        n = _visit_field(c, 'nhi_pure_acu') + _visit_field(c, 'nhi_pure_trauma')
+        pure_n = c.visit_pure_acu + c.visit_pure_trauma
         perf_lines.append(
-            f"- 針灸業績：人次 {n} → 獎金 NT$ **{c.bonus_pure_acu_trauma:,}**"
+            f"- 針灸業績：人次 {pure_n}（純針 {c.visit_pure_acu} + "
+            f"純傷 {c.visit_pure_trauma}）→ "
+            f"獎金 **NT {c.bonus_pure_acu_trauma:,} 元**"
         )
     if perf_lines:
-        if not perf_active:
-            st.markdown(
-                "**業績獎金**（平均人次 < 15.1，未觸發）"
-            )
-        else:
-            st.markdown("**業績獎金** ✅")
-        for line in perf_lines:
-            st.markdown(line)
+        header = (
+            "**業績獎金** ✅" if perf_active
+            else "**業績獎金**（平均人次 < 15.1，未觸發）"
+        )
+        L.append(header)
+        L.extend(perf_lines)
 
-    # ─── 自費業績（金額源 → 抽成）───
+    # 自費抽成 — 用 [銷售 × 比例 = 獎金] 格式
     bd = c.commission_breakdown or {}
     sales_revenue = sum(
         cash_row.get(k, 0) or 0 for k in
@@ -2056,56 +2114,66 @@ def _render_payslip_block(c, cash_lookup: dict, role_label: dict):
     cash_lines = []
     if sales_revenue:
         cash_lines.append(
-            f"- 自費銷售業績（含減重）：${sales_revenue:,} × 20% = "
-            f"NT$ **{sales_commission:,}**"
+            f"- 自費銷售業績（含減重）：[{sales_revenue:,} × 20% = "
+            f"**{sales_commission:,}**] 元"
         )
     if treatment_revenue:
         cash_lines.append(
-            f"- 自費療程業績：${treatment_revenue:,} × 40% = "
-            f"NT$ **{treatment_commission:,}**"
+            f"- 自費療程業績：[{treatment_revenue:,} × 40% = "
+            f"**{treatment_commission:,}**] 元"
         )
     if consult_revenue:
-        rate = "50%" if consult_commission else "0%"
+        rate_pct = "50%" if consult_commission else "0%"
         cash_lines.append(
-            f"- 自費診察費：${consult_revenue:,} × {rate} = "
-            f"NT$ **{consult_commission:,}**"
+            f"- 自費診察費：[{consult_revenue:,} × {rate_pct} = "
+            f"**{consult_commission:,}**] 元"
         )
     if other_revenue:
         cash_lines.append(
-            f"- 診斷證明（其它）：${other_revenue:,} × 50% = "
-            f"NT$ **{other_commission:,}**"
+            f"- 診斷證明（其它）：[{other_revenue:,} × 50% = "
+            f"**{other_commission:,}**] 元"
         )
     if lab_revenue:
         cash_lines.append(
-            f"- 三伏(九)貼（檢驗）：${lab_revenue:,} × 10% = "
-            f"NT$ **{lab_commission:,}**"
+            f"- 三伏(九)貼（檢驗）：[{lab_revenue:,} × 10% = "
+            f"**{lab_commission:,}**] 元"
         )
     if cash_lines:
-        st.markdown(f"**自費抽成**（合計 NT$ **{c.commission_total:,}**）")
-        for line in cash_lines:
-            st.markdown(line)
+        L.append(f"**自費抽成**（合計 **NT {c.commission_total:,} 元**）")
+        L.extend(cash_lines)
 
-    # ─── A91+複針 (4月起) ───
     if c.acu_complex_bonus or c.a91_bonus:
-        st.markdown(
-            f"**A91+複針獎金**（115/04 起新制）"
-        )
+        L.append("**A91+複針獎金**（115/04 起新制）")
         if c.acu_complex_mid_count or c.acu_complex_high_count:
-            st.markdown(
-                f"- 複針：中 {c.acu_complex_mid_count} ×20 + 高 "
+            L.append(
+                f"- 複針：[中 {c.acu_complex_mid_count} ×20 + 高 "
                 f"{c.acu_complex_high_count} ×40 = "
-                f"NT$ **{c.acu_complex_bonus:,}**"
+                f"**{c.acu_complex_bonus:,}**] 元"
             )
         if c.a91_count:
-            st.markdown(
-                f"- A91 整合醫療：{c.a91_count} 人 ×14 = "
-                f"NT$ **{c.a91_bonus:,}**"
+            L.append(
+                f"- A91 整合醫療：[{c.a91_count} 人 ×14 = "
+                f"**{c.a91_bonus:,}**] 元"
             )
 
-    # ─── 該診所應付小計 ───
-    st.markdown(f"**▶ 此診所應付：NT$ {c.gross:,}**")
+    L.append("---")
+    L.append(f"**▶ 此診所應付：NT {c.gross:,} 元**")
+    if labor_ded or nhi_ded:
+        take = c.gross - labor_ded - nhi_ded
+        L.append(f"勞保扣 NT {labor_ded:,}　|　健保扣 NT {nhi_ded:,}")
+        L.append(f"**▶ 此診所實領：NT {take:,} 元**")
+
     if c.notes:
-        st.caption("⚠️ " + "；".join(c.notes))
+        L.append(f"⚠️ {chr(65307).join(c.notes) if False else '；'.join(c.notes)}")
+
+    return L
+
+
+def _render_payslip_block(c, cash_lookup, role_label,
+                          labor_ded: int = 0, nhi_ded: int = 0):
+    """渲染薪資單到 streamlit"""
+    for line in _payslip_lines(c, cash_lookup, role_label, labor_ded, nhi_ded):
+        st.markdown(line)
 
 
 def _visit_field(component, field_name: str) -> int:
