@@ -88,12 +88,22 @@ def page_import():
     # ─── 門診申報金額統計報表 + A91+複針（批次）──────
     _section_outpatient_report()
 
+    st.divider()
+
+    # ─── 現金支出 ────────────────────────────────────
+    _section_cash_expense()
+
+    st.divider()
+
+    # ─── 合約支出 ────────────────────────────────────
+    _section_contract_expense()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
     - 合理門診量
-    - 診所支出：現金、合約、支票、調貨
+    - 支票支出、調貨整理
     - 薪資表、商品成本售價、@科中進貨價目表
     - 手 KEY：額外收入、非常規收支
     """)
@@ -529,6 +539,163 @@ def _section_cash_visits():
         key=f"cash_import_btn_{clinic_choice}",
     ):
         _import_cash_records(sb, all_records)
+
+
+def _section_cash_expense():
+    """現金支出（Sprint 2.7a）— 年度累積檔，非按月"""
+    from data_processor.expenses import parse_cash_expense
+
+    st.subheader("💵 現金支出（年度累積檔）")
+    st.caption(
+        "檔名範例：『澤豐中醫診所現金支出.xlsx』、『澤沛中醫診所現金支出.xlsx』。"
+        "檔內每列是一筆支出（月/日/描述/金額/備註）。"
+    )
+
+    col1, col2, col3 = st.columns([1, 1, 3])
+    with col1:
+        clinic_choice = st.radio("診所", ["澤豐", "澤沛"], key="cash_exp_clinic")
+    with col2:
+        roc_year = st.number_input(
+            "民國年", min_value=110, max_value=130, value=115, step=1,
+            key="cash_exp_year",
+            help="檔內 C0 是月份，年份要由此指定（檔名沒帶年）",
+        )
+    with col3:
+        uploaded = st.file_uploader(
+            f"上傳 {clinic_choice} 現金支出 xlsx",
+            type=["xlsx"],
+            key=f"cash_exp_uploader_{clinic_choice}",
+        )
+    if not uploaded:
+        return
+
+    sb = get_authed_client()
+    clinic_resp = (
+        sb.table("clinics").select("id").eq("short_name", clinic_choice).execute()
+    )
+    if not clinic_resp.data:
+        st.error(f"找不到診所 {clinic_choice}")
+        return
+    clinic_id = clinic_resp.data[0]["id"]
+
+    try:
+        records = parse_cash_expense(uploaded, uploaded.name, clinic_id, roc_year=int(roc_year))
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+
+    if not records:
+        st.warning("無可匯入的資料")
+        return
+
+    df = pd.DataFrame(records)
+    st.success(f"✅ 解析 {len(records)} 筆")
+
+    # 月份分組摘要
+    df_sum = df.copy()
+    df_sum["月份"] = df_sum["expense_date"].str[:7]
+    summary = df_sum.groupby("月份", as_index=False).agg(
+        筆數=("amount", "count"), 合計=("amount", "sum"),
+    )
+    st.markdown("**按月份彙總：**")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    st.markdown("**逐筆預覽：**")
+    cols = ["expense_date", "description", "amount", "note"]
+    st.dataframe(df[cols], use_container_width=True, height=300, hide_index=True)
+
+    if st.button(
+        f"💾 確認匯入 {clinic_choice} 現金支出（{len(records)} 筆）",
+        type="primary",
+        key=f"cash_exp_save_{clinic_choice}",
+    ):
+        try:
+            sb.table("cash_expense").upsert(
+                records, on_conflict="raw_row_hash", ignore_duplicates=True
+            ).execute()
+            st.success(f"✅ 寫入 {len(records)} 筆（重複 hash 自動跳過）")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+def _section_contract_expense():
+    """合約支出（Sprint 2.7a）— 橫向月度表自動轉長表"""
+    from data_processor.expenses import parse_contract_expense
+
+    st.subheader("📜 合約支出（年度檔，橫向月度表）")
+    st.caption(
+        "檔名範例：『澤豐/澤沛中醫診所合約支出.xlsx』。系統把橫表轉成"
+        "(月份 × 廠商) 的長表逐筆寫入 contract_expense。"
+    )
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        clinic_choice = st.radio("診所", ["澤豐", "澤沛"], key="contract_exp_clinic")
+    with col2:
+        uploaded = st.file_uploader(
+            f"上傳 {clinic_choice} 合約支出 xlsx",
+            type=["xlsx"],
+            key=f"contract_exp_uploader_{clinic_choice}",
+        )
+    if not uploaded:
+        return
+
+    sb = get_authed_client()
+    clinic_resp = (
+        sb.table("clinics").select("id").eq("short_name", clinic_choice).execute()
+    )
+    if not clinic_resp.data:
+        st.error(f"找不到診所 {clinic_choice}")
+        return
+    clinic_id = clinic_resp.data[0]["id"]
+
+    try:
+        records = parse_contract_expense(uploaded, uploaded.name, clinic_id)
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+
+    if not records:
+        st.warning("無可匯入的資料")
+        return
+
+    df = pd.DataFrame(records)
+    st.success(f"✅ 解析 {len(records)} 筆")
+
+    # 月份彙總
+    summary = df.groupby("service_month", as_index=False).agg(
+        筆數=("amount", "count"), 合計=("amount", "sum"),
+    )
+    st.markdown("**按月份彙總：**")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    # 廠商彙總
+    by_vendor = df.groupby("vendor", as_index=False).agg(
+        筆數=("amount", "count"), 合計=("amount", "sum"),
+    ).sort_values("合計", ascending=False)
+    st.markdown("**按廠商彙總：**")
+    st.dataframe(by_vendor, use_container_width=True, hide_index=True)
+
+    st.markdown("**逐筆預覽：**")
+    st.dataframe(
+        df[["service_month", "vendor", "amount"]],
+        use_container_width=True, height=300, hide_index=True,
+    )
+
+    if st.button(
+        f"💾 確認匯入 {clinic_choice} 合約支出（{len(records)} 筆）",
+        type="primary",
+        key=f"contract_exp_save_{clinic_choice}",
+    ):
+        try:
+            sb.table("contract_expense").upsert(
+                records, on_conflict="clinic_id,service_month,vendor",
+            ).execute()
+            st.success(f"✅ 寫入 {len(records)} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
 
 
 def _section_outpatient_report():
