@@ -285,7 +285,9 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
         cash_row = inputs["cash_monthly"].get((clinic_id, doctor_id))
 
         sessions = (visit_row or {}).get("sessions_total", 0) or 0
-        session_fee = doctor.get("session_fee", 0) or 0
+        # session_fee 為 NUMERIC(7,1)（如 3230.8），先乘診數最後再 round
+        session_fee = float(doctor.get("session_fee") or 0)
+        session_pay = round(sessions * session_fee)
         commission_total, breakdown = _calc_commission(inputs, doctor_id, cash_row)
         triggered, avg, b_int, b_pure, b_combo = _calc_perf_bonus(
             visit_row, sessions, threshold
@@ -300,7 +302,7 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
             role=role,
             director_allowance=director_allowance,
             sessions_total=sessions,
-            session_pay=sessions * session_fee,
+            session_pay=session_pay,
             commission_total=commission_total,
             commission_breakdown=breakdown,
             avg_visits_per_session=avg,
