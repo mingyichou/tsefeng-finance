@@ -226,6 +226,53 @@ def parse_self_pay_powder(
                 "note": note,
             })
 
+    # ─── 第三段：vendor 區塊（如水藥包/駿賀/上賀/卡媚迪斯…）───
+    # 結構：vendor 標題列（C0 有值 + 下一列 C1='單價'）→ 品項列（C0=品項, C1=單價）
+    in_block = False
+    current_block_vendor: str | None = None
+    for r in range(1, df.shape[0]):
+        c0 = _norm_str(df.iloc[r, 0])
+        c1_raw = df.iloc[r, 1] if df.shape[1] > 1 else None
+        c1 = _norm_str(c1_raw)
+        c2 = _norm_str(df.iloc[r, 2]) if df.shape[1] > 2 else None
+
+        # 偵測 vendor 標題列：C0 有值 + C1-C2 空 + 下一列 C1='單價'
+        next_c1 = (
+            _norm_str(df.iloc[r + 1, 1])
+            if r + 1 < df.shape[0] and df.shape[1] > 1
+            else None
+        )
+        if c0 and not c1 and not c2 and next_c1 == "單價":
+            current_block_vendor = c0
+            in_block = False
+            continue
+
+        # 表頭列 C1='單價'（C0 空）
+        if c1 == "單價" and not c0:
+            in_block = True
+            continue
+
+        # 區塊內品項列
+        if in_block and current_block_vendor and c0:
+            sale = _to_float(c1_raw)
+            if sale is None:
+                # 遇到無價格資料的列（如備註）— 忽略不終止 block
+                continue
+            note = c2
+            key = (current_block_vendor, c0)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append({
+                "effective_month": effective_month,
+                "vendor": current_block_vendor,
+                "product_name": c0,
+                "cost_price": None,
+                "sale_price": round(sale, 2),
+                "unit": None,
+                "note": note,
+            })
+
     return records
 
 
