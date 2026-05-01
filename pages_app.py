@@ -334,13 +334,28 @@ def page_import():
     # ─── 調貨整理 ────────────────────────────────────
     _section_inventory_transfer()
 
+    st.divider()
+
+    # ─── 自費商品成本&售價 ─────────────────────────
+    _section_self_pay_pricing()
+
+    st.divider()
+
+    # ─── 手 KEY 額外收入 ─────────────────────────────
+    _section_manual_extra_income()
+
+    st.divider()
+
+    # ─── 手 KEY 一般收支 ─────────────────────────────
+    _section_manual_entry()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
     - 合理門診量
-    - 薪資表、商品成本售價、@科中進貨價目表
-    - 手 KEY：額外收入、非常規收支
+    - 員工薪資表、@科中進貨價目表
+    - 自費商品其他 sheets（自費藥粉、金流計算表）
     """)
 
 
@@ -931,6 +946,229 @@ def _section_contract_expense():
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
+
+
+def _section_self_pay_pricing():
+    """自費商品成本&售價（Sprint 2.8a 部分）— 解析「膠囊&OTC」sheet 寫 product_pricing"""
+    from data_processor.pricing import parse_self_pay_otc
+
+    st.subheader("🛒 自費商品成本&售價（膠囊&OTC sheet）")
+    st.caption(
+        "目前解析 sheet「膠囊&OTC」的 進價/售價/廠商 對照表。"
+        "其他 sheet（自費藥粉、金流計算）下個 sprint 補。"
+        "生效月由下方指定，自費商品調貨金額計算依此查詢。"
+    )
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        roc_y = st.number_input("民國年", 110, 130, 115, 1, key="pricing_y")
+        roc_m = st.number_input("月份", 1, 12, 4, 1, key="pricing_m")
+    with col2:
+        uploaded = st.file_uploader(
+            "上傳自費商品成本&售價 xlsx",
+            type=["xlsx"],
+            key="pricing_uploader",
+        )
+
+    effective_month = f"{int(roc_y) + 1911:04d}-{int(roc_m):02d}-01"
+    if not uploaded:
+        return
+
+    sb = get_authed_client()
+    try:
+        records = parse_self_pay_otc(uploaded, uploaded.name, effective_month)
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+    if not records:
+        st.warning("無可匯入的資料")
+        return
+
+    df = pd.DataFrame(records)
+    st.success(f"✅ 解析 {len(records)} 筆，生效月 {effective_month[:7]}")
+
+    by_vendor = df.groupby("vendor", as_index=False).agg(
+        筆數=("product_name", "count"),
+        平均進價=("cost_price", "mean"),
+        平均售價=("sale_price", "mean"),
+    )
+    st.markdown("**按廠商彙總：**")
+    st.dataframe(by_vendor, use_container_width=True, hide_index=True)
+
+    st.markdown("**逐筆預覽：**")
+    st.dataframe(
+        df[["vendor", "product_name", "unit", "cost_price", "sale_price", "note"]],
+        use_container_width=True, height=300, hide_index=True,
+    )
+
+    if st.button(
+        f"💾 確認匯入（{len(records)} 筆，生效月 {effective_month[:7]}）",
+        type="primary",
+        key=f"pricing_save_{effective_month}",
+    ):
+        try:
+            sb.table("product_pricing").upsert(
+                records, on_conflict="effective_month,vendor,product_name",
+            ).execute()
+            st.success(f"✅ 寫入 {len(records)} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+def _section_manual_extra_income():
+    """手 KEY 額外收入（Phase 5 透支計算的 x10）"""
+    st.subheader("💰 手 KEY：額外收入")
+    st.caption(
+        "院長透支計算（x10）的來源 — 非診所營收的個人收入存入帳戶。"
+        "例：投資收益、賣車、租金等，存入澤豐中信帳戶以「其餘存款」方式。"
+    )
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+
+    # 已存在資料預覽
+    try:
+        existing = (
+            sb.table("manual_extra_income")
+            .select("*")
+            .order("income_date", desc=True)
+            .limit(20)
+            .execute().data
+        )
+    except Exception as e:
+        existing = []
+        st.error(f"讀取既有資料失敗：{e}")
+
+    if existing:
+        with st.expander(f"📋 最近 20 筆紀錄（共有 {len(existing)} 筆顯示）"):
+            df = pd.DataFrame(existing)
+            cid_to_short = {v: k for k, v in short_to_cid.items()}
+            df["診所"] = df["clinic_id"].map(cid_to_short)
+            cols = ["income_date", "診所", "amount", "description", "deposit_account"]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    if not st.session_state.get("edit_mode"):
+        st.info("⚠️ 唯讀模式。如需新增，請啟用左下「編輯模式」。")
+        return
+
+    st.markdown("**新增一筆：**")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        income_date = st.date_input(
+            "收入日期", value=pd.Timestamp.today().date(), key="mei_date"
+        )
+        clinic_choice = st.selectbox(
+            "診所（選填）", ["（不指定）", "澤豐", "澤沛"], key="mei_clinic"
+        )
+    with col2:
+        amount = st.number_input(
+            "金額", min_value=0, step=100, value=0, key="mei_amount"
+        )
+        deposit_account = st.text_input(
+            "存入帳戶", value="澤豐中信", key="mei_acc"
+        )
+    with col3:
+        description = st.text_area(
+            "描述", placeholder="例：投資收益、賣車尾款、月租金", key="mei_desc"
+        )
+
+    if st.button("💾 新增", type="primary", key="mei_save"):
+        if amount <= 0 or not description:
+            st.error("金額必須大於 0 且須填寫描述")
+            return
+        payload = {
+            "income_date": str(income_date),
+            "clinic_id": short_to_cid.get(clinic_choice) if clinic_choice != "（不指定）" else None,
+            "amount": int(amount),
+            "description": description,
+            "deposit_account": deposit_account or None,
+        }
+        try:
+            sb.table("manual_extra_income").insert(payload).execute()
+            st.success("✅ 已新增")
+            st.rerun()
+        except Exception as e:
+            st.error(f"新增失敗：{e}")
+
+
+def _section_manual_entry():
+    """手 KEY 一般收支（非常規）"""
+    st.subheader("📝 手 KEY：非常規收支")
+    st.caption(
+        "其他無法歸類的收支記錄（如：抽獎收入、罰款支出、退款等）。"
+        "區分 income/expense；不影響院長透支計算。"
+    )
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+
+    try:
+        existing = (
+            sb.table("manual_entry")
+            .select("*")
+            .order("entry_date", desc=True)
+            .limit(20)
+            .execute().data
+        )
+    except Exception as e:
+        existing = []
+        st.error(f"讀取既有資料失敗：{e}")
+
+    if existing:
+        with st.expander(f"📋 最近 20 筆紀錄"):
+            df = pd.DataFrame(existing)
+            cid_to_short = {v: k for k, v in short_to_cid.items()}
+            df["診所"] = df["clinic_id"].map(cid_to_short)
+            cols = ["entry_date", "診所", "direction", "category", "amount", "description"]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    if not st.session_state.get("edit_mode"):
+        st.info("⚠️ 唯讀模式。如需新增，請啟用左下「編輯模式」。")
+        return
+
+    st.markdown("**新增一筆：**")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        entry_date = st.date_input(
+            "日期", value=pd.Timestamp.today().date(), key="me_date"
+        )
+        clinic_choice = st.selectbox(
+            "診所（選填）", ["（不指定）", "澤豐", "澤沛"], key="me_clinic"
+        )
+    with col2:
+        direction = st.radio(
+            "方向", ["income", "expense"], horizontal=True, key="me_direction"
+        )
+        amount = st.number_input(
+            "金額", min_value=0, step=100, value=0, key="me_amount"
+        )
+    with col3:
+        category = st.text_input(
+            "類別", placeholder="例：罰款、退款、紅利", key="me_category"
+        )
+        description = st.text_area("描述", key="me_desc")
+
+    if st.button("💾 新增", type="primary", key="me_save"):
+        if amount <= 0:
+            st.error("金額必須大於 0")
+            return
+        payload = {
+            "entry_date": str(entry_date),
+            "clinic_id": short_to_cid.get(clinic_choice) if clinic_choice != "（不指定）" else None,
+            "direction": direction,
+            "category": category or None,
+            "amount": int(amount),
+            "description": description or None,
+        }
+        try:
+            sb.table("manual_entry").insert(payload).execute()
+            st.success("✅ 已新增")
+            st.rerun()
+        except Exception as e:
+            st.error(f"新增失敗：{e}")
 
 
 def _section_check_expense():
