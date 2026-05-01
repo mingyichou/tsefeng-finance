@@ -341,12 +341,12 @@ def page_import():
 
     st.divider()
 
-    # ─── 手 KEY 額外收入 ─────────────────────────────
-    _section_manual_extra_income()
+    # ─── 手 KEY 補充備註（金流註解 CRUD）───────────
+    _section_manual_annotation()
 
     st.divider()
 
-    # ─── 手 KEY 一般收支 ─────────────────────────────
+    # ─── 手 KEY 診所非常規收支（CRUD）──────────────
     _section_manual_entry()
 
     # ─── 其他類型（待實作）───────────────────────────
@@ -1039,173 +1039,309 @@ def _section_self_pay_pricing():
             st.error(f"寫入失敗：{e}")
 
 
-def _section_manual_extra_income():
-    """手 KEY 額外收入（Phase 5 透支計算的 x10）"""
-    st.subheader("💰 手 KEY：額外收入")
+def _section_manual_annotation():
+    """金流補充備註 — 補齊銀行帳戶/帳本未記載的說明（CRUD）"""
+    st.subheader("📝 手 KEY：金流補充備註")
     st.caption(
-        "院長透支計算（x10）的來源 — 非診所營收的個人收入存入帳戶。"
-        "例：投資收益、賣車、租金等，存入澤豐中信帳戶以「其餘存款」方式。"
+        "用於補齊銀行帳戶/帳本中未記載的備註說明。"
+        "例：某筆轉帳實際是「個人借款還款」、某筆存現是「投資收益」。"
+        "可隨時查詢/修改/刪除。"
     )
 
-    # 跨 rerun 的成功提示（rerun 後 success 不會被吃掉）
-    if st.session_state.pop("_mei_just_saved", None):
-        st.success("✅ 已新增（重新整理後在下方表中）")
+    if st.session_state.pop("_ann_just_saved", None):
+        st.success("✅ 已儲存")
+    if st.session_state.pop("_ann_just_deleted", None):
+        st.success("✅ 已刪除")
 
     sb = get_authed_client()
     clinics_resp = sb.table("clinics").select("id, short_name").execute()
     short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
-
-    # 已存在資料預覽
-    try:
-        existing = (
-            sb.table("manual_extra_income")
-            .select("*")
-            .order("income_date", desc=True)
-            .limit(20)
-            .execute().data
-        )
-    except Exception as e:
-        existing = []
-        st.error(f"讀取既有資料失敗：{e}")
-
-    if existing:
-        with st.expander(f"📋 最近 20 筆紀錄（共有 {len(existing)} 筆顯示）"):
-            df = pd.DataFrame(existing)
-            cid_to_short = {v: k for k, v in short_to_cid.items()}
-            df["診所"] = df["clinic_id"].map(cid_to_short)
-            cols = ["income_date", "診所", "amount", "description", "deposit_account"]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-    if not st.session_state.get("edit_mode"):
-        st.info("⚠️ 唯讀模式。如需新增，請啟用左下「編輯模式」。")
-        return
-
-    st.markdown("**新增一筆：**")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        income_date = st.date_input(
-            "收入日期", value=pd.Timestamp.today().date(), key="mei_date"
-        )
-        clinic_choice = st.selectbox(
-            "診所（選填）", ["（不指定）", "澤豐", "澤沛"], key="mei_clinic"
-        )
-    with col2:
-        amount = st.number_input(
-            "金額", min_value=0, step=100, value=0, key="mei_amount"
-        )
-        deposit_account = st.text_input(
-            "存入帳戶", value="澤豐中信", key="mei_acc"
-        )
-    with col3:
-        description = st.text_area(
-            "描述", placeholder="例：投資收益、賣車尾款、月租金", key="mei_desc"
-        )
-
-    if st.button("💾 新增", type="primary", key="mei_save"):
-        if amount <= 0 or not description:
-            st.error("金額必須大於 0 且須填寫描述")
-            return
-        payload = {
-            "income_date": str(income_date),
-            "clinic_id": short_to_cid.get(clinic_choice) if clinic_choice != "（不指定）" else None,
-            "amount": int(amount),
-            "description": description,
-            "deposit_account": deposit_account or None,
-        }
-        try:
-            resp = sb.table("manual_extra_income").insert(payload).execute()
-            if resp.data:
-                # 用 session_state flag 跨 rerun 保留 success 提示
-                st.session_state["_mei_just_saved"] = True
-                st.rerun()
-            else:
-                st.error("⚠️ 寫入回傳空 data，可能未成功（檢查 RLS / 欄位）")
-        except Exception as e:
-            st.error(f"新增失敗：{e}")
-
-
-def _section_manual_entry():
-    """手 KEY 一般收支（非常規）"""
-    st.subheader("📝 手 KEY：非常規收支")
-    st.caption(
-        "其他無法歸類的收支記錄（如：抽獎收入、罰款支出、退款等）。"
-        "區分 income/expense；不影響院長透支計算。"
-    )
-
-    if st.session_state.pop("_me_just_saved", None):
-        st.success("✅ 已新增（重新整理後在下方表中）")
-
-    sb = get_authed_client()
-    clinics_resp = sb.table("clinics").select("id, short_name").execute()
-    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+    cid_to_short = {v: k for k, v in short_to_cid.items()}
 
     try:
-        existing = (
-            sb.table("manual_entry")
+        rows = (
+            sb.table("manual_annotation")
             .select("*")
             .order("entry_date", desc=True)
-            .limit(20)
             .execute().data
         )
     except Exception as e:
-        existing = []
-        st.error(f"讀取既有資料失敗：{e}")
+        rows = []
+        st.error(f"讀取失敗：{e}")
 
-    if existing:
-        with st.expander(f"📋 最近 20 筆紀錄"):
-            df = pd.DataFrame(existing)
-            cid_to_short = {v: k for k, v in short_to_cid.items()}
-            df["診所"] = df["clinic_id"].map(cid_to_short)
-            cols = ["entry_date", "診所", "direction", "category", "amount", "description"]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    if rows:
+        df = pd.DataFrame(rows)
+        df["診所"] = df["clinic_id"].map(cid_to_short).fillna("—")
+        cols = ["id", "entry_date", "scope", "form", "account",
+                "amount", "診所", "description"]
+        present = [c for c in cols if c in df.columns]
+        st.markdown(f"**現有 {len(rows)} 筆：**")
+        st.dataframe(df[present], use_container_width=True, hide_index=True)
+    else:
+        st.info("尚無資料")
 
     if not st.session_state.get("edit_mode"):
-        st.info("⚠️ 唯讀模式。如需新增，請啟用左下「編輯模式」。")
+        st.info("⚠️ 唯讀模式。如需新增/修改/刪除，請啟用左下「編輯模式」。")
         return
 
-    st.markdown("**新增一筆：**")
+    st.markdown("**新增 / 修改 / 刪除：**")
+    edit_options = ["（新增）"] + [
+        f"id={r['id']} {r.get('entry_date', '')} "
+        f"{r.get('form') or ''} {r.get('amount') or 0} "
+        f"{(r.get('description') or '')[:25]}"
+        for r in rows
+    ]
+    edit_id = st.selectbox(
+        "選擇要修改/刪除的列（或留「新增」建立新列）",
+        options=edit_options,
+        key="ann_edit_select",
+    )
+    is_edit = edit_id != "（新增）"
+    sel = None
+    sid = None
+    if is_edit:
+        try:
+            sid = int(edit_id.split()[0].split("=")[1])
+            sel = next((r for r in rows if r["id"] == sid), None)
+        except Exception:
+            sel = None
+
+    forms = ["轉入", "轉出", "存現", "領現", "原紀錄"]
+    scopes = ["診所", "個人"]
+    clinic_opts = ["（不指定）", "澤豐", "澤沛"]
+
     col1, col2, col3 = st.columns(3)
     with col1:
         entry_date = st.date_input(
-            "日期", value=pd.Timestamp.today().date(), key="me_date"
+            "日期",
+            value=(
+                pd.to_datetime(sel["entry_date"]).date()
+                if sel and sel.get("entry_date")
+                else pd.Timestamp.today().date()
+            ),
+            key="ann_date",
+        )
+        scope = st.radio(
+            "收支屬性", scopes, horizontal=True,
+            index=scopes.index(sel["scope"]) if sel and sel.get("scope") in scopes else 0,
+            key="ann_scope",
+        )
+    with col2:
+        cur_clinic = (
+            cid_to_short.get(sel["clinic_id"], "（不指定）") if sel else "（不指定）"
         )
         clinic_choice = st.selectbox(
-            "診所（選填）", ["（不指定）", "澤豐", "澤沛"], key="me_clinic"
+            "診所（scope=診所時必選）",
+            options=clinic_opts,
+            index=clinic_opts.index(cur_clinic) if cur_clinic in clinic_opts else 0,
+            key="ann_clinic",
+        )
+        form = st.selectbox(
+            "形式", forms,
+            index=forms.index(sel["form"]) if sel and sel.get("form") in forms else 0,
+            key="ann_form",
+        )
+    with col3:
+        amount = st.number_input(
+            "金額", min_value=0, step=100,
+            value=int(sel["amount"]) if sel and sel.get("amount") else 0,
+            key="ann_amount",
+        )
+        account = st.text_input(
+            "帳戶",
+            value=sel.get("account") or "" if sel else "",
+            placeholder="例：澤豐中信、澤沛玉山",
+            key="ann_account",
+        )
+
+    description = st.text_area(
+        "備註說明",
+        value=sel.get("description") or "" if sel else "",
+        placeholder="例：個人借款還款、廠商紅利、退費...",
+        key="ann_desc",
+    )
+
+    save_col, del_col = st.columns(2)
+    with save_col:
+        if st.button("💾 儲存", type="primary", key="ann_save"):
+            if amount <= 0 or not description:
+                st.error("金額必須 > 0 且須填備註")
+                return
+            payload = {
+                "entry_date": str(entry_date),
+                "scope": scope,
+                "clinic_id": (
+                    short_to_cid.get(clinic_choice)
+                    if clinic_choice != "（不指定）" else None
+                ),
+                "form": form,
+                "amount": int(amount),
+                "account": account or None,
+                "description": description,
+            }
+            try:
+                if is_edit and sid:
+                    sb.table("manual_annotation").update(payload).eq("id", sid).execute()
+                else:
+                    sb.table("manual_annotation").insert(payload).execute()
+                st.session_state["_ann_just_saved"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"儲存失敗：{e}")
+    with del_col:
+        if is_edit and sid and st.button("🗑️ 刪除", key="ann_del"):
+            try:
+                sb.table("manual_annotation").delete().eq("id", sid).execute()
+                st.session_state["_ann_just_deleted"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"刪除失敗：{e}")
+
+
+def _section_manual_entry():
+    """診所非常規收支（CRUD）— 不在銀行明細與 Excel 上的特殊收支"""
+    st.subheader("📝 手 KEY：診所非常規收支")
+    st.caption(
+        "只針對診所的非常規收支（不在銀行明細/Excel 上的）。"
+        "例：對帳後不明短少 3000 算入支出、廠商捐贈 10000 現金直接花掉算入收入。"
+        "可隨時查詢/修改/刪除。"
+    )
+
+    if st.session_state.pop("_me_just_saved", None):
+        st.success("✅ 已儲存")
+    if st.session_state.pop("_me_just_deleted", None):
+        st.success("✅ 已刪除")
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+    cid_to_short = {v: k for k, v in short_to_cid.items()}
+
+    try:
+        rows = (
+            sb.table("manual_entry")
+            .select("*")
+            .order("entry_date", desc=True)
+            .execute().data
+        )
+    except Exception as e:
+        rows = []
+        st.error(f"讀取失敗：{e}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df["診所"] = df["clinic_id"].map(cid_to_short).fillna("—")
+        cols = ["id", "entry_date", "診所", "direction", "category",
+                "amount", "description"]
+        present = [c for c in cols if c in df.columns]
+        st.markdown(f"**現有 {len(rows)} 筆：**")
+        st.dataframe(df[present], use_container_width=True, hide_index=True)
+    else:
+        st.info("尚無資料")
+
+    if not st.session_state.get("edit_mode"):
+        st.info("⚠️ 唯讀模式。如需新增/修改/刪除，請啟用左下「編輯模式」。")
+        return
+
+    st.markdown("**新增 / 修改 / 刪除：**")
+    edit_options = ["（新增）"] + [
+        f"id={r['id']} {r.get('entry_date', '')} "
+        f"{r.get('direction') or ''} {r.get('amount') or 0} "
+        f"{(r.get('category') or '')[:15]}"
+        for r in rows
+    ]
+    edit_id = st.selectbox(
+        "選擇要修改/刪除的列（或留「新增」建立新列）",
+        options=edit_options,
+        key="me_edit_select",
+    )
+    is_edit = edit_id != "（新增）"
+    sel = None
+    sid = None
+    if is_edit:
+        try:
+            sid = int(edit_id.split()[0].split("=")[1])
+            sel = next((r for r in rows if r["id"] == sid), None)
+        except Exception:
+            sel = None
+
+    clinic_opts = ["澤豐", "澤沛"]
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        entry_date = st.date_input(
+            "日期",
+            value=(
+                pd.to_datetime(sel["entry_date"]).date()
+                if sel and sel.get("entry_date")
+                else pd.Timestamp.today().date()
+            ),
+            key="me_date",
+        )
+        cur_clinic = cid_to_short.get(sel["clinic_id"], "澤豐") if sel else "澤豐"
+        clinic_choice = st.selectbox(
+            "診所",
+            options=clinic_opts,
+            index=clinic_opts.index(cur_clinic) if cur_clinic in clinic_opts else 0,
+            key="me_clinic",
         )
     with col2:
         direction = st.radio(
-            "方向", ["income", "expense"], horizontal=True, key="me_direction"
+            "方向", ["income", "expense"], horizontal=True,
+            index=0 if (sel and sel.get("direction") == "income") else (
+                1 if sel else 0
+            ),
+            key="me_direction",
         )
         amount = st.number_input(
-            "金額", min_value=0, step=100, value=0, key="me_amount"
+            "金額", min_value=0, step=100,
+            value=int(sel["amount"]) if sel and sel.get("amount") else 0,
+            key="me_amount",
         )
     with col3:
         category = st.text_input(
-            "類別", placeholder="例：罰款、退款、紅利", key="me_category"
+            "類別",
+            value=sel.get("category") or "" if sel else "",
+            placeholder="例：對帳短少、廠商捐贈、紅利、退款",
+            key="me_category",
         )
-        description = st.text_area("描述", key="me_desc")
+        description = st.text_area(
+            "描述",
+            value=sel.get("description") or "" if sel else "",
+            key="me_desc",
+        )
 
-    if st.button("💾 新增", type="primary", key="me_save"):
-        if amount <= 0:
-            st.error("金額必須大於 0")
-            return
-        payload = {
-            "entry_date": str(entry_date),
-            "clinic_id": short_to_cid.get(clinic_choice) if clinic_choice != "（不指定）" else None,
-            "direction": direction,
-            "category": category or None,
-            "amount": int(amount),
-            "description": description or None,
-        }
-        try:
-            resp = sb.table("manual_entry").insert(payload).execute()
-            if resp.data:
+    save_col, del_col = st.columns(2)
+    with save_col:
+        if st.button("💾 儲存", type="primary", key="me_save"):
+            if amount <= 0:
+                st.error("金額必須 > 0")
+                return
+            payload = {
+                "entry_date": str(entry_date),
+                "clinic_id": short_to_cid.get(clinic_choice),
+                "direction": direction,
+                "category": category or None,
+                "amount": int(amount),
+                "description": description or None,
+            }
+            try:
+                if is_edit and sid:
+                    sb.table("manual_entry").update(payload).eq("id", sid).execute()
+                else:
+                    sb.table("manual_entry").insert(payload).execute()
                 st.session_state["_me_just_saved"] = True
                 st.rerun()
-            else:
-                st.error("⚠️ 寫入回傳空 data，可能未成功（檢查 RLS / 欄位）")
-        except Exception as e:
-            st.error(f"新增失敗：{e}")
+            except Exception as e:
+                st.error(f"儲存失敗：{e}")
+    with del_col:
+        if is_edit and sid and st.button("🗑️ 刪除", key="me_del"):
+            try:
+                sb.table("manual_entry").delete().eq("id", sid).execute()
+                st.session_state["_me_just_deleted"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"刪除失敗：{e}")
 
 
 def _section_check_expense():
