@@ -13,21 +13,247 @@ from db import get_authed_client
 # ============================================================
 def page_dashboard():
     st.title("📊 業績與財務儀表板")
-    st.info("🚧 開發中（Phase 3：醫師業績圓餅圖、12 個月柱狀圖、收入結構）")
+
+    import altair as alt
 
     sb = get_authed_client()
+
+    # ─── 載入資料 ───
     try:
-        clinics = sb.table("clinics").select("*").execute()
-        doctors = sb.table("doctors").select("*").execute()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("診所主檔")
-            st.dataframe(pd.DataFrame(clinics.data), use_container_width=True)
-        with col2:
-            st.subheader("醫師主檔")
-            st.dataframe(pd.DataFrame(doctors.data), use_container_width=True)
+        clinics_data = sb.table("clinics").select("id, short_name").execute().data
+        doctors_data = sb.table("doctors").select("id, name").execute().data
+        outpatient = sb.table("doctor_outpatient_summary").select("*").execute().data
+        cash_monthly = sb.table("doctor_cash_monthly").select("*").execute().data
+        visit_stats = sb.table("doctor_visit_stats").select("*").execute().data
     except Exception as e:
-        st.error(f"資料庫連線測試失敗：{e}")
+        st.error(f"資料庫讀取失敗：{e}")
+        return
+
+    cid_to_short = {c["id"]: c["short_name"] for c in clinics_data}
+    did_to_name = {d["id"]: d["name"] for d in doctors_data}
+
+    if not (outpatient or cash_monthly or visit_stats):
+        st.warning("⚠️ 尚無業績資料，請先到「本月資料匯入」上傳健保人數+初診、門診申報金額、自費統計。")
+        return
+
+    # ─── 篩選 ───
+    out_df = pd.DataFrame(outpatient) if outpatient else pd.DataFrame()
+    cash_df = pd.DataFrame(cash_monthly) if cash_monthly else pd.DataFrame()
+    visit_df = pd.DataFrame(visit_stats) if visit_stats else pd.DataFrame()
+
+    all_months = sorted(set(
+        list(out_df["service_month"].unique() if not out_df.empty else [])
+        + list(cash_df["service_month"].unique() if not cash_df.empty else [])
+        + list(visit_df["service_month"].unique() if not visit_df.empty else [])
+    ), reverse=True)
+    if not all_months:
+        st.warning("⚠️ 尚無資料")
+        return
+
+    col_f1, col_f2 = st.columns([2, 3])
+    with col_f1:
+        clinic_filter = st.radio(
+            "診所", ["全部", "澤豐", "澤沛"],
+            horizontal=True, key="dash_clinic",
+        )
+    with col_f2:
+        sel_months = st.multiselect(
+            "月份（可多選）",
+            options=all_months,
+            default=all_months[:3],
+            format_func=lambda d: d[:7],
+            key="dash_months",
+        )
+
+    if not sel_months:
+        st.info("請選至少一個月份")
+        return
+
+    def filter_df(df):
+        if df.empty:
+            return df
+        out = df[df["service_month"].isin(sel_months)].copy()
+        if clinic_filter != "全部":
+            cid = next(c["id"] for c in clinics_data if c["short_name"] == clinic_filter)
+            out = out[out["clinic_id"] == cid]
+        return out
+
+    out_f = filter_df(out_df)
+    cash_f = filter_df(cash_df)
+    visit_f = filter_df(visit_df)
+
+    # 加 clinic_name + doctor_name 欄
+    for df in (out_f, cash_f, visit_f):
+        if df.empty:
+            continue
+        df["診所"] = df["clinic_id"].map(cid_to_short)
+        df["醫師"] = df["doctor_id"].map(did_to_name)
+        df["月份"] = df["service_month"].str[:7]
+
+    # ─── KPI 卡片 ───
+    st.divider()
+    nhi_total = int(out_f["nhi_total_points"].sum()) if not out_f.empty else 0
+    cash_total = int(cash_f["cash_total_excl_reg"].sum()) if not cash_f.empty else 0
+    visit_total = int(visit_f["nhi_visits_total"].sum()) if not visit_f.empty else 0
+    sessions_total = int(visit_f["sessions_total"].sum()) if not visit_f.empty else 0
+    avg_visits = round(visit_total / sessions_total, 2) if sessions_total else 0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("健保申報合計", f"${nhi_total:,}")
+    k2.metric("自費合計（不含掛號）", f"${cash_total:,}")
+    k3.metric("總業績", f"${nhi_total + cash_total:,}")
+    k4.metric("健保看診人次", f"{visit_total:,}")
+    k5.metric("平均人次/診", f"{avg_visits}")
+
+    # ─── 圓餅：醫師業績佔比 ───
+    st.divider()
+    st.subheader("🥧 醫師業績佔比（健保 + 自費）")
+
+    if out_f.empty and cash_f.empty:
+        st.info("該篩選條件下無資料")
+    else:
+        # 用 (診所, 醫師) 作為 group key，因為跨支援會有兩條記錄
+        nhi_by = (
+            out_f.groupby(["診所", "醫師"])["nhi_total_points"].sum().reset_index()
+            if not out_f.empty else pd.DataFrame(columns=["診所", "醫師", "nhi_total_points"])
+        )
+        cash_by = (
+            cash_f.groupby(["診所", "醫師"])["cash_total_excl_reg"].sum().reset_index()
+            if not cash_f.empty else pd.DataFrame(columns=["診所", "醫師", "cash_total_excl_reg"])
+        )
+        merged = nhi_by.merge(cash_by, on=["診所", "醫師"], how="outer").fillna(0)
+        merged["業績合計"] = merged["nhi_total_points"] + merged["cash_total_excl_reg"]
+        merged["醫師(診所)"] = merged["醫師"] + "(" + merged["診所"] + ")"
+        merged = merged[merged["業績合計"] > 0]
+
+        if not merged.empty:
+            c_pie1, c_pie2 = st.columns(2)
+            with c_pie1:
+                pie = alt.Chart(merged).mark_arc(innerRadius=50).encode(
+                    theta=alt.Theta("業績合計:Q"),
+                    color=alt.Color("醫師(診所):N", legend=alt.Legend(title="醫師(診所)")),
+                    tooltip=["醫師(診所)", alt.Tooltip("業績合計:Q", format=",")],
+                ).properties(height=350, title="總業績佔比")
+                st.altair_chart(pie, use_container_width=True)
+            with c_pie2:
+                # 健保 vs 自費 stacked bar by doctor
+                long = merged.melt(
+                    id_vars=["醫師(診所)"],
+                    value_vars=["nhi_total_points", "cash_total_excl_reg"],
+                    var_name="類別", value_name="金額",
+                )
+                long["類別"] = long["類別"].map({
+                    "nhi_total_points": "健保",
+                    "cash_total_excl_reg": "自費",
+                })
+                bar = alt.Chart(long).mark_bar().encode(
+                    x=alt.X("醫師(診所):N", sort="-y"),
+                    y=alt.Y("金額:Q"),
+                    color=alt.Color(
+                        "類別:N",
+                        scale=alt.Scale(range=["#6A5ACD", "#FFA07A"]),
+                    ),
+                    tooltip=["醫師(診所)", "類別", alt.Tooltip("金額:Q", format=",")],
+                ).properties(height=350, title="健保 vs 自費（分醫師）")
+                st.altair_chart(bar, use_container_width=True)
+
+    # ─── 月度趨勢柱狀圖 ───
+    st.divider()
+    st.subheader("📅 月度業績趨勢（堆疊：健保 + 自費）")
+
+    nhi_by_m = (
+        out_f.groupby(["月份", "診所"])["nhi_total_points"].sum().reset_index()
+        if not out_f.empty else pd.DataFrame(columns=["月份", "診所", "nhi_total_points"])
+    )
+    cash_by_m = (
+        cash_f.groupby(["月份", "診所"])["cash_total_excl_reg"].sum().reset_index()
+        if not cash_f.empty else pd.DataFrame(columns=["月份", "診所", "cash_total_excl_reg"])
+    )
+    merged_m = nhi_by_m.merge(cash_by_m, on=["月份", "診所"], how="outer").fillna(0)
+    if not merged_m.empty:
+        long_m = merged_m.melt(
+            id_vars=["月份", "診所"],
+            value_vars=["nhi_total_points", "cash_total_excl_reg"],
+            var_name="類別", value_name="金額",
+        )
+        long_m["類別"] = long_m["類別"].map({
+            "nhi_total_points": "健保", "cash_total_excl_reg": "自費",
+        })
+        bar2 = alt.Chart(long_m).mark_bar().encode(
+            x=alt.X("月份:N", sort="ascending"),
+            y=alt.Y("金額:Q", stack="zero"),
+            color=alt.Color("類別:N", scale=alt.Scale(range=["#6A5ACD", "#FFA07A"])),
+            xOffset="診所:N",
+            tooltip=["月份", "診所", "類別", alt.Tooltip("金額:Q", format=",")],
+        ).properties(height=350)
+        st.altair_chart(bar2, use_container_width=True)
+
+    # ─── 看診結構（健保人次分布）───
+    st.divider()
+    st.subheader("👥 健保看診結構（人次分布）")
+
+    if not visit_f.empty:
+        cat_cols = {
+            "內科": "nhi_internal", "純針": "nhi_pure_acu", "純傷": "nhi_pure_trauma",
+            "內+針": "nhi_internal_acu", "內+傷": "nhi_internal_trauma",
+        }
+        agg_cols = {label: visit_f[col].sum() for label, col in cat_cols.items()}
+        cat_df = pd.DataFrame([
+            {"類別": k, "人次": int(v)} for k, v in agg_cols.items() if v > 0
+        ])
+        if not cat_df.empty:
+            c_v1, c_v2 = st.columns([1, 2])
+            with c_v1:
+                pie3 = alt.Chart(cat_df).mark_arc(innerRadius=40).encode(
+                    theta="人次:Q",
+                    color="類別:N",
+                    tooltip=["類別", alt.Tooltip("人次:Q", format=",")],
+                ).properties(height=300, title="人次類別佔比")
+                st.altair_chart(pie3, use_container_width=True)
+            with c_v2:
+                # 各醫師健保人次堆疊
+                doc_cat = visit_f[["診所", "醫師"] + list(cat_cols.values())].copy()
+                doc_cat["醫師(診所)"] = doc_cat["醫師"] + "(" + doc_cat["診所"] + ")"
+                doc_long = doc_cat.melt(
+                    id_vars=["醫師(診所)"],
+                    value_vars=list(cat_cols.values()),
+                    var_name="類別", value_name="人次",
+                )
+                col_to_label = {v: k for k, v in cat_cols.items()}
+                doc_long["類別"] = doc_long["類別"].map(col_to_label)
+                doc_long = doc_long[doc_long["人次"] > 0]
+                bar3 = alt.Chart(doc_long).mark_bar().encode(
+                    x=alt.X("醫師(診所):N", sort="-y"),
+                    y=alt.Y("人次:Q"),
+                    color="類別:N",
+                    tooltip=["醫師(診所)", "類別", "人次"],
+                ).properties(height=300, title="醫師健保人次（堆疊）")
+                st.altair_chart(bar3, use_container_width=True)
+
+    # ─── 醫師月份明細表 ───
+    st.divider()
+    st.subheader("📋 醫師月份明細")
+
+    if not out_f.empty:
+        detail = out_f[[
+            "月份", "診所", "醫師",
+            "nhi_consult_fee", "nhi_drug_fee", "nhi_treatment_fee",
+            "nhi_lab_fee", "nhi_total_points",
+            "cash_internal", "cash_acupuncture", "registration_fee",
+            "acu_complex_mid_count", "acu_complex_high_count", "a91_count",
+        ]].rename(columns={
+            "nhi_consult_fee": "診察費", "nhi_drug_fee": "內科/藥費",
+            "nhi_treatment_fee": "處置費", "nhi_lab_fee": "檢驗費",
+            "nhi_total_points": "健保合計",
+            "cash_internal": "自費內科", "cash_acupuncture": "自費針傷脫",
+            "registration_fee": "掛號費",
+            "acu_complex_mid_count": "中複針", "acu_complex_high_count": "高複針",
+            "a91_count": "A91",
+        })
+        st.dataframe(
+            detail.sort_values(["月份", "診所", "醫師"]),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ============================================================
