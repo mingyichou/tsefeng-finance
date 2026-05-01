@@ -72,6 +72,12 @@ class SalaryComponent:
     bonus_total: int = 0
     perf_triggered: bool = False
     visit_count_nhi: int = 0
+    # 各類人次（顯示用，業績獎金母數）
+    visit_internal: int = 0
+    visit_pure_acu: int = 0
+    visit_pure_trauma: int = 0
+    visit_internal_acu: int = 0
+    visit_internal_trauma: int = 0
     # 4月起新制
     acu_complex_mid_count: int = 0
     acu_complex_high_count: int = 0
@@ -354,6 +360,11 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
             bonus_total=b_int + b_pure + b_combo,
             perf_triggered=triggered,
             visit_count_nhi=(visit_row or {}).get("nhi_visits_total", 0) or 0,
+            visit_internal=(visit_row or {}).get("nhi_internal", 0) or 0,
+            visit_pure_acu=(visit_row or {}).get("nhi_pure_acu", 0) or 0,
+            visit_pure_trauma=(visit_row or {}).get("nhi_pure_trauma", 0) or 0,
+            visit_internal_acu=(visit_row or {}).get("nhi_internal_acu", 0) or 0,
+            visit_internal_trauma=(visit_row or {}).get("nhi_internal_trauma", 0) or 0,
             acu_complex_mid_count=acu_mid,
             acu_complex_high_count=acu_high,
             acu_complex_bonus=acu_bonus,
