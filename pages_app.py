@@ -949,23 +949,48 @@ def _section_contract_expense():
 
 
 def _section_self_pay_pricing():
-    """自費商品成本&售價（Sprint 2.8a 部分）— 解析「膠囊&OTC」sheet 寫 product_pricing"""
+    """
+    自費商品成本&售價 — 全表 single source of truth
+
+    上傳邏輯：DELETE 全表 + INSERT 全部新資料
+    （院長澄清 2026-05-02：檔名年月=最後編輯時間；同廠商同品項只有一筆最新值）
+    """
     from data_processor.pricing import parse_self_pay_otc
 
-    st.subheader("🛒 自費商品成本&售價（膠囊&OTC sheet）")
+    st.subheader("🛒 自費商品成本&售價（最新版本，全表覆蓋）")
     st.caption(
-        "目前解析 sheet「膠囊&OTC」的 進價/售價/廠商 對照表。"
-        "其他 sheet（自費藥粉、金流計算）下個 sprint 補。"
-        "生效月由下方指定，自費商品調貨金額計算依此查詢。"
+        "🔄 **每次上傳會完全覆蓋舊資料**。檔案是 single source of truth，"
+        "沒有月份版本概念；檔名年月 = 院長最後編輯日期（顯示用）。"
+        "目前解析 sheet「膠囊&OTC」；其他 sheet（自費藥粉、金流計算）下次擴展。"
     )
+
+    sb = get_authed_client()
+
+    # 顯示目前 DB 狀態
+    try:
+        existing = sb.table("product_pricing").select(
+            "id, effective_month"
+        ).execute().data
+        if existing:
+            current_count = len(existing)
+            current_em = existing[0].get("effective_month") if existing else None
+            st.info(
+                f"📋 目前 DB 有 **{current_count}** 筆資料，"
+                f"最後編輯月份：{current_em[:7] if current_em else '未知'}"
+            )
+        else:
+            st.info("📋 目前 DB 為空")
+    except Exception as e:
+        st.warning(f"讀取 DB 狀態失敗：{e}")
 
     col1, col2 = st.columns([1, 4])
     with col1:
+        st.markdown("**檔案最後編輯：**")
         roc_y = st.number_input("民國年", 110, 130, 115, 1, key="pricing_y")
         roc_m = st.number_input("月份", 1, 12, 4, 1, key="pricing_m")
     with col2:
         uploaded = st.file_uploader(
-            "上傳自費商品成本&售價 xlsx",
+            "上傳新版「自費商品成本&售價」xlsx（取代既有資料）",
             type=["xlsx"],
             key="pricing_uploader",
         )
@@ -974,7 +999,6 @@ def _section_self_pay_pricing():
     if not uploaded:
         return
 
-    sb = get_authed_client()
     try:
         records = parse_self_pay_otc(uploaded, uploaded.name, effective_month)
     except Exception as e:
@@ -985,7 +1009,7 @@ def _section_self_pay_pricing():
         return
 
     df = pd.DataFrame(records)
-    st.success(f"✅ 解析 {len(records)} 筆，生效月 {effective_month[:7]}")
+    st.success(f"✅ 解析 {len(records)} 筆，標記編輯月 {effective_month[:7]}")
 
     by_vendor = df.groupby("vendor", as_index=False).agg(
         筆數=("product_name", "count"),
@@ -1001,16 +1025,23 @@ def _section_self_pay_pricing():
         use_container_width=True, height=300, hide_index=True,
     )
 
+    st.warning(
+        "⚠️ 確認匯入會 **DELETE 整張 product_pricing 表 + 重新 INSERT**。"
+        "舊資料不可復原，請確認新版資料已備齊（沒漏掉的廠商品項）再按下。"
+    )
+
     if st.button(
-        f"💾 確認匯入（{len(records)} 筆，生效月 {effective_month[:7]}）",
+        f"💾 確認覆蓋全表（{len(records)} 筆，編輯月 {effective_month[:7]}）",
         type="primary",
         key=f"pricing_save_{effective_month}",
     ):
         try:
-            sb.table("product_pricing").upsert(
-                records, on_conflict="effective_month,vendor,product_name",
-            ).execute()
-            st.success(f"✅ 寫入 {len(records)} 筆")
+            # 1. DELETE 全表
+            # Supabase Python SDK 沒有 truncate；用 .delete().neq("id", -1)
+            sb.table("product_pricing").delete().neq("id", -1).execute()
+            # 2. INSERT 新資料
+            sb.table("product_pricing").insert(records).execute()
+            st.success(f"✅ 已清空舊資料並寫入 {len(records)} 筆")
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
