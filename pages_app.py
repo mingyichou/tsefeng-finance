@@ -1970,6 +1970,18 @@ def page_salary():
             )
             st.markdown(f"## **實領總額：NT {ps.take_home:,} 元**")
 
+        # ─── 此醫師專屬 列印 HTML 下載 ───
+        html_str = generate_doctor_payslip_html(
+            comps, ps, cash_lookup, role_label, service_month
+        )
+        st.download_button(
+            f"📄 下載 {doctor_name} 薪資單 HTML（開啟後 Ctrl+P 列印乾淨版面）",
+            data=html_str.encode("utf-8"),
+            file_name=f"薪資單_{doctor_name}_{service_month[:7]}.html",
+            mime="text/html",
+            key=f"dl_html_{doctor_id}",
+        )
+
     if selected_doctor == SHOW_ALL:
         st.info(
             "📄 一頁顯示所有醫師薪資單。瀏覽器 Ctrl+P 可印出整頁，"
@@ -2104,18 +2116,19 @@ def _payslip_lines(c, cash_lookup: dict, role_label: dict,
         cash_row.get(k, 0) or 0 for k in
         ("internal_drug", "external_drug", "wellness", "herb_decoction")
     )
+    # ⚠️ commission_breakdown 的 key 是英文（salary.py COMMISSION_FIELDS）
     sales_commission = sum(bd.get(k, 0) for k in
-                           ("內服藥", "外用藥", "保養費", "飲片費"))
+                           ("internal_drug", "external_drug", "wellness", "herb_decoction"))
     treatment_revenue = sum(
         cash_row.get(k, 0) or 0 for k in ("acupuncture", "trauma", "dislocation")
     )
-    treatment_commission = sum(bd.get(k, 0) for k in ("針灸費", "傷科費", "脫臼費"))
+    treatment_commission = sum(bd.get(k, 0) for k in ("acupuncture", "trauma", "dislocation"))
     other_revenue = cash_row.get("other", 0) or 0
-    other_commission = bd.get("其它", 0)
+    other_commission = bd.get("other", 0)
     lab_revenue = cash_row.get("lab", 0) or 0
-    lab_commission = bd.get("檢驗費", 0)
+    lab_commission = bd.get("lab", 0)
     consult_revenue = cash_row.get("consult", 0) or 0
-    consult_commission = bd.get("診察費", 0)
+    consult_commission = bd.get("consult", 0)
 
     cash_lines = []
     if sales_revenue:
@@ -2180,6 +2193,109 @@ def _render_payslip_block(c, cash_lookup, role_label,
     """渲染薪資單到 streamlit"""
     for line in _payslip_lines(c, cash_lookup, role_label, labor_ded, nhi_ded):
         st.markdown(line)
+
+
+def _md_inline_to_html(s: str) -> str:
+    """把 **bold** 轉 <b>bold</b>"""
+    import re
+    return re.sub(r"\*\*([^*]+?)\*\*", r"<b>\1</b>", s)
+
+
+def _md_line_to_html(line: str) -> str:
+    """單行 markdown → HTML"""
+    if line.startswith("### "):
+        return f"<h3>{_md_inline_to_html(line[4:])}</h3>"
+    if line.startswith("## "):
+        return f"<h2>{_md_inline_to_html(line[3:])}</h2>"
+    if line == "---":
+        return "<hr>"
+    if line.startswith("- "):
+        return f"<div style='margin-left:1.5em'>• {_md_inline_to_html(line[2:])}</div>"
+    return f"<div>{_md_inline_to_html(line)}</div>"
+
+
+def generate_doctor_payslip_html(
+    comps, ps, cash_lookup: dict, role_label: dict, service_month: str
+) -> str:
+    """產生單一醫師薪資單的完整 HTML（給下載+瀏覽器列印用）"""
+    doctor_name = comps[0].doctor_name
+    title = f"{doctor_name} 薪資單 {service_month[:7]}"
+
+    css = """
+    <style>
+    body { font-family: "Microsoft JhengHei", "PingFang TC", "Heiti TC", sans-serif;
+           max-width: 1100px; margin: 30px auto; padding: 20px;
+           color: #222; line-height: 1.6; }
+    h1 { color: #6A5ACD; border-bottom: 2px solid #6A5ACD; padding-bottom: 8px; }
+    h2 { color: #6A5ACD; }
+    h3 { color: #444; margin-bottom: 6px; }
+    .clinic-block { border-left: 4px solid #6A5ACD; padding: 8px 16px;
+                    margin: 16px 0; background: #fafafa; border-radius: 4px; }
+    .total { background: #f0eafc; padding: 16px; border-radius: 8px;
+             margin-top: 24px; font-size: 17px; }
+    .two-cols { display: flex; gap: 20px; flex-wrap: wrap; }
+    .two-cols > div { flex: 1; min-width: 380px; }
+    hr { border: none; border-top: 1px dashed #ccc; margin: 12px 0; }
+    @media print {
+        @page { margin: 1.5cm; }
+        body { margin: 0; }
+        .total { background: #fff; border: 1px solid #6A5ACD; }
+    }
+    </style>
+    """
+
+    html = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>",
+        f"<title>{title}</title>", css, "</head><body>",
+        f"<h1>🩺 {doctor_name}　薪資單　{service_month[:7]}</h1>",
+    ]
+
+    if len(comps) > 1:
+        comps_sorted = sorted(comps, key=lambda c: 0 if c.role != "support" else 1)
+        html.append("<div class='two-cols'>")
+        for c in comps_sorted:
+            html.append("<div class='clinic-block'>")
+            ld, nd = (
+                (ps.labor_deduction, ps.nhi_deduction)
+                if c.role != "support" and ps
+                else (0, 0)
+            )
+            for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
+                html.append(_md_line_to_html(line))
+            html.append("</div>")
+        html.append("</div>")
+        if ps and ps.support_clinic_id:
+            main_take = ps.gross_main - ps.labor_deduction - ps.nhi_deduction
+            html.append("<div class='total'>")
+            html.append("<h2>📊 兩診所合計</h2>")
+            html.append(
+                f"<div>{ps.main_clinic_name} 實領 NT {main_take:,} 元　＋　"
+                f"{ps.support_clinic_name} 應付 NT {ps.gross_support:,} 元</div>"
+            )
+            html.append(
+                f"<h2 style='color:#6A5ACD;margin-top:12px'>"
+                f"實領總額：NT {ps.take_home:,} 元</h2>"
+            )
+            html.append("</div>")
+    else:
+        c = comps[0]
+        html.append("<div class='clinic-block'>")
+        ld, nd = (
+            (ps.labor_deduction, ps.nhi_deduction)
+            if c.role != "support" and ps
+            else (0, 0)
+        )
+        for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
+            html.append(_md_line_to_html(line))
+        html.append("</div>")
+
+    html.append(
+        "<p style='text-align:center;color:#999;font-size:12px;margin-top:30px'>"
+        f"由澤豐聯盟財務系統產出於 "
+        f"{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>"
+    )
+    html.append("</body></html>")
+    return "\n".join(html)
 
 
 def _visit_field(component, field_name: str) -> int:
