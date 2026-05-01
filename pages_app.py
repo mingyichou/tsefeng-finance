@@ -953,54 +953,46 @@ def _section_self_pay_pricing():
     自費商品成本&售價 — 全表 single source of truth
 
     上傳邏輯：DELETE 全表 + INSERT 全部新資料
-    （院長澄清 2026-05-02：檔名年月=最後編輯時間；同廠商同品項只有一筆最新值）
+    每次上傳完全覆蓋舊資料；effective_month 用今天當 placeholder 不顯示給使用者。
     """
-    from data_processor.pricing import parse_self_pay_otc
+    from data_processor.pricing import parse_self_pay_all_sheets
 
     st.subheader("🛒 自費商品成本&售價（最新版本，全表覆蓋）")
     st.caption(
         "🔄 **每次上傳會完全覆蓋舊資料**。檔案是 single source of truth，"
-        "沒有月份版本概念；檔名年月 = 院長最後編輯日期（顯示用）。"
-        "目前解析 sheet「膠囊&OTC」；其他 sheet（自費藥粉、金流計算）下次擴展。"
+        "沒有月份版本概念；上傳即更新。"
+        "解析兩個 sheet：「膠囊&OTC」+「自費藥粉&自費商品」。"
     )
 
     sb = get_authed_client()
 
     # 顯示目前 DB 狀態
     try:
-        existing = sb.table("product_pricing").select(
-            "id, effective_month"
-        ).execute().data
-        if existing:
-            current_count = len(existing)
-            current_em = existing[0].get("effective_month") if existing else None
-            st.info(
-                f"📋 目前 DB 有 **{current_count}** 筆資料，"
-                f"最後編輯月份：{current_em[:7] if current_em else '未知'}"
-            )
+        existing_count = len(
+            sb.table("product_pricing").select("id").execute().data or []
+        )
+        if existing_count:
+            st.info(f"📋 目前 DB 有 **{existing_count}** 筆資料")
         else:
             st.info("📋 目前 DB 為空")
     except Exception as e:
         st.warning(f"讀取 DB 狀態失敗：{e}")
 
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        st.markdown("**檔案最後編輯：**")
-        roc_y = st.number_input("民國年", 110, 130, 115, 1, key="pricing_y")
-        roc_m = st.number_input("月份", 1, 12, 4, 1, key="pricing_m")
-    with col2:
-        uploaded = st.file_uploader(
-            "上傳新版「自費商品成本&售價」xlsx（取代既有資料）",
-            type=["xlsx"],
-            key="pricing_uploader",
-        )
+    uploaded = st.file_uploader(
+        "上傳新版「自費商品成本&售價」xlsx（取代既有資料）",
+        type=["xlsx"],
+        key="pricing_uploader",
+    )
 
-    effective_month = f"{int(roc_y) + 1911:04d}-{int(roc_m):02d}-01"
+    # effective_month placeholder = 今天的月份首日（schema NOT NULL 但邏輯不再用此欄區分版本）
+    from datetime import date
+    effective_month = date.today().replace(day=1).isoformat()
+
     if not uploaded:
         return
 
     try:
-        records = parse_self_pay_otc(uploaded, uploaded.name, effective_month)
+        records = parse_self_pay_all_sheets(uploaded, uploaded.name, effective_month)
     except Exception as e:
         st.error(f"解析失敗：{e}")
         return
@@ -1009,7 +1001,7 @@ def _section_self_pay_pricing():
         return
 
     df = pd.DataFrame(records)
-    st.success(f"✅ 解析 {len(records)} 筆，標記編輯月 {effective_month[:7]}")
+    st.success(f"✅ 解析 {len(records)} 筆（合併兩個 sheet，重複品項 OTC 優先）")
 
     by_vendor = df.groupby("vendor", as_index=False).agg(
         筆數=("product_name", "count"),
@@ -1031,9 +1023,9 @@ def _section_self_pay_pricing():
     )
 
     if st.button(
-        f"💾 確認覆蓋全表（{len(records)} 筆，編輯月 {effective_month[:7]}）",
+        f"💾 確認覆蓋全表（{len(records)} 筆）",
         type="primary",
-        key=f"pricing_save_{effective_month}",
+        key="pricing_save_btn",
     ):
         try:
             # 1. DELETE 全表
@@ -1054,6 +1046,10 @@ def _section_manual_extra_income():
         "院長透支計算（x10）的來源 — 非診所營收的個人收入存入帳戶。"
         "例：投資收益、賣車、租金等，存入澤豐中信帳戶以「其餘存款」方式。"
     )
+
+    # 跨 rerun 的成功提示（rerun 後 success 不會被吃掉）
+    if st.session_state.pop("_mei_just_saved", None):
+        st.success("✅ 已新增（重新整理後在下方表中）")
 
     sb = get_authed_client()
     clinics_resp = sb.table("clinics").select("id, short_name").execute()
@@ -1117,9 +1113,13 @@ def _section_manual_extra_income():
             "deposit_account": deposit_account or None,
         }
         try:
-            sb.table("manual_extra_income").insert(payload).execute()
-            st.success("✅ 已新增")
-            st.rerun()
+            resp = sb.table("manual_extra_income").insert(payload).execute()
+            if resp.data:
+                # 用 session_state flag 跨 rerun 保留 success 提示
+                st.session_state["_mei_just_saved"] = True
+                st.rerun()
+            else:
+                st.error("⚠️ 寫入回傳空 data，可能未成功（檢查 RLS / 欄位）")
         except Exception as e:
             st.error(f"新增失敗：{e}")
 
@@ -1131,6 +1131,9 @@ def _section_manual_entry():
         "其他無法歸類的收支記錄（如：抽獎收入、罰款支出、退款等）。"
         "區分 income/expense；不影響院長透支計算。"
     )
+
+    if st.session_state.pop("_me_just_saved", None):
+        st.success("✅ 已新增（重新整理後在下方表中）")
 
     sb = get_authed_client()
     clinics_resp = sb.table("clinics").select("id, short_name").execute()
@@ -1195,9 +1198,12 @@ def _section_manual_entry():
             "description": description or None,
         }
         try:
-            sb.table("manual_entry").insert(payload).execute()
-            st.success("✅ 已新增")
-            st.rerun()
+            resp = sb.table("manual_entry").insert(payload).execute()
+            if resp.data:
+                st.session_state["_me_just_saved"] = True
+                st.rerun()
+            else:
+                st.error("⚠️ 寫入回傳空 data，可能未成功（檢查 RLS / 欄位）")
         except Exception as e:
             st.error(f"新增失敗：{e}")
 
