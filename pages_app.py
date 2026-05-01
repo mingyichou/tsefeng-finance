@@ -98,12 +98,21 @@ def page_import():
     # ─── 合約支出 ────────────────────────────────────
     _section_contract_expense()
 
+    st.divider()
+
+    # ─── 支票支出（共用） ────────────────────────────
+    _section_check_expense()
+
+    st.divider()
+
+    # ─── 調貨整理 ────────────────────────────────────
+    _section_inventory_transfer()
+
     # ─── 其他類型（待實作）───────────────────────────
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
     - 合理門診量
-    - 支票支出、調貨整理
     - 薪資表、商品成本售價、@科中進貨價目表
     - 手 KEY：額外收入、非常規收支
     """)
@@ -693,6 +702,141 @@ def _section_contract_expense():
                 records, on_conflict="clinic_id,service_month,vendor",
             ).execute()
             st.success(f"✅ 寫入 {len(records)} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+def _section_check_expense():
+    """支票支出（Sprint 2.7b）— 兩家共用一個檔，每年一檔"""
+    from data_processor.expenses import parse_check_expense
+
+    st.subheader("🧾 支票支出（年度檔，兩家共用）")
+    st.caption(
+        "檔名範例：『@@支票支出115.xlsx』。每列一個年/月，多廠商重複"
+        "(廠商/金額/銀行) 三聯欄。銀行「玉延/中延」自動忽略「延」字。"
+    )
+    uploaded = st.file_uploader(
+        "上傳支票支出 xlsx",
+        type=["xlsx"], key="check_exp_uploader",
+    )
+    if not uploaded:
+        return
+    sb = get_authed_client()
+    try:
+        records = parse_check_expense(uploaded, uploaded.name)
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+    if not records:
+        st.warning("無可匯入的資料")
+        return
+
+    df = pd.DataFrame(records)
+    st.success(f"✅ 解析 {len(records)} 筆")
+
+    summary = df.groupby("issue_month", as_index=False).agg(
+        筆數=("amount", "count"), 合計=("amount", "sum"),
+    )
+    st.markdown("**按月份彙總：**")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    by_vendor = df.groupby("vendor", as_index=False).agg(
+        筆數=("amount", "count"), 合計=("amount", "sum"),
+    ).sort_values("合計", ascending=False)
+    st.markdown("**按廠商彙總：**")
+    st.dataframe(by_vendor, use_container_width=True, hide_index=True)
+
+    st.markdown("**逐筆預覽：**")
+    st.dataframe(
+        df[["issue_month", "vendor", "amount", "bank", "note"]],
+        use_container_width=True, height=300, hide_index=True,
+    )
+
+    if st.button(
+        f"💾 確認匯入支票支出（{len(records)} 筆）",
+        type="primary", key="check_exp_save",
+    ):
+        try:
+            sb.table("check_expense").upsert(
+                records, on_conflict="issue_month,vendor,bank",
+            ).execute()
+            st.success(f"✅ 寫入 {len(records)} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+def _section_inventory_transfer():
+    """調貨整理（Sprint 2.7b）— 兩家間實物調撥；amount 待 product_pricing 上線後計算"""
+    from data_processor.expenses import parse_inventory_transfer
+
+    st.subheader("🔄 調貨整理（年度檔）")
+    st.caption(
+        "檔名範例：『澤豐中醫診所調貨整理.xlsx』。系統解析每月區塊的雙欄向"
+        "（澤沛 pay 澤豐 / 澤豐 pay 澤沛）。"
+        "金額暫不算（等 Sprint 2.8 自費商品成本售價表上線後由 trigger 帶入）。"
+    )
+    uploaded = st.file_uploader(
+        "上傳調貨整理 xlsx",
+        type=["xlsx"], key="transfer_uploader",
+    )
+    if not uploaded:
+        return
+
+    sb = get_authed_client()
+    clinics = {
+        c["short_name"]: c["id"]
+        for c in sb.table("clinics").select("id, short_name").execute().data
+    }
+    fz_id = clinics.get("澤豐")
+    fp_id = clinics.get("澤沛")
+    if not (fz_id and fp_id):
+        st.error("找不到澤豐/澤沛診所")
+        return
+
+    try:
+        records = parse_inventory_transfer(
+            uploaded, uploaded.name,
+            clinic_zefeng_id=fz_id, clinic_zepei_id=fp_id,
+        )
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+    if not records:
+        st.warning("無可匯入的資料")
+        return
+
+    df = pd.DataFrame(records)
+    df["方向"] = df["from_clinic_id"].map(
+        lambda x: "澤豐→澤沛" if x == fz_id else "澤沛→澤豐"
+    )
+
+    st.success(f"✅ 解析 {len(records)} 筆")
+
+    summary = df.groupby(["transfer_month", "方向"], as_index=False).size()
+    summary.columns = ["月份", "方向", "筆數"]
+    st.markdown("**按月份+方向彙總：**")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    st.markdown("**逐筆預覽：**")
+    st.dataframe(
+        df[["transfer_month", "方向", "item", "qty"]],
+        use_container_width=True, height=400, hide_index=True,
+    )
+
+    if st.button(
+        f"💾 確認匯入調貨（{len(records)} 筆，金額暫空）",
+        type="primary", key="transfer_save",
+    ):
+        try:
+            payload = [
+                {k: v for k, v in r.items() if k != "方向"}
+                for r in records
+            ]
+            # inventory_transfer 沒 UNIQUE constraint — 用 INSERT
+            sb.table("inventory_transfer").insert(payload).execute()
+            st.success(f"✅ 寫入 {len(payload)} 筆")
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")

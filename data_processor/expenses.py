@@ -1,11 +1,13 @@
 """
-診所支出類匯入處理（Sprint 2.7a：現金 + 合約）
+診所支出類匯入處理（Sprint 2.7）
 
 對應 schema:
-  - cash_expense       (兩家共用) 一筆一列
-  - contract_expense   (兩家共用) 橫向月度表 → 轉長表
+  - cash_expense       (2.7a) 一筆一列
+  - contract_expense   (2.7a) 橫向月度表 → 轉長表
+  - check_expense      (2.7b) 一年一檔，每列一個年/月，多廠商重複欄組
+  - inventory_transfer (2.7b) 一年一檔，按月區塊，雙欄向 (澤沛pay澤豐 / 澤豐pay澤沛)
 
-(支票支出 check_expense + 調貨 inventory_transfer 留 Sprint 2.7b)
+⚠️ 調貨 amount 留 NULL，等 Sprint 2.8 product_pricing 表上線後由 trigger 帶入
 """
 
 from __future__ import annotations
@@ -240,5 +242,181 @@ def parse_contract_expense(
                 "amount": round(amount, 2),
                 "note": None,
             })
+
+    return records
+
+
+# ─── 支票支出 (check_expense) ───────────────────────────
+
+
+# 銀行短碼 → 全名（院長指示忽略「延」字）
+_BANK_MAP = {
+    "玉": "玉山", "玉延": "玉山",
+    "中": "中信", "中延": "中信",
+}
+
+
+def parse_check_expense(file_obj: IO, source_filename: str) -> list[dict]:
+    """
+    解析 @@支票支出115.xlsx 共用檔。
+
+    結構：
+      R1: 表頭（廠商/金額/銀行 重複出現）
+      R2+: 列 = 民國年/月（如 115/01），每列多組「廠商/金額/銀行」三聯欄
+
+    策略：
+      1. R1 找出所有「廠商」欄索引（值 == '廠商'）
+      2. 每個廠商欄 c → 金額 c+1 → 銀行 c+2（但實際 layout 有變動，需動態識別）
+      3. 對每個資料列，掃所有 (廠商, 金額, 銀行) 三聯，若三者皆有效則收一筆
+
+    院長指示：忽略「玉延/中延」的「延」字，按金額對帳即可。
+    """
+    file_obj.seek(0)
+    df = pd.read_excel(file_obj, sheet_name="支票支出表115", header=None)
+
+    if df.shape[0] < 3:
+        return []
+
+    # R1 找「廠商」欄；金額在 +1，銀行在 +2
+    header = df.iloc[1]
+    vendor_cols: list[int] = []
+    for c in range(df.shape[1] - 2):
+        if pd.notna(header[c]) and str(header[c]).strip() == "廠商":
+            vendor_cols.append(c)
+
+    month_re = re.compile(r"^(\d{3})/(\d{1,2})$")
+    records: list[dict] = []
+    seen: set[tuple[str, str, str, int]] = set()
+
+    for r in range(2, df.shape[0]):
+        cell = df.iloc[r, 0]
+        if pd.isna(cell):
+            continue
+        m = month_re.match(str(cell).strip())
+        if not m:
+            continue
+        roc_y, mo = int(m.group(1)), int(m.group(2))
+        if not (100 <= roc_y <= 130 and 1 <= mo <= 12):
+            continue
+        ad_y = roc_y + 1911
+        issue_month = f"{ad_y:04d}-{mo:02d}-01"
+
+        for vc in vendor_cols:
+            vendor = _norm_str(df.iloc[r, vc])
+            amount = _to_int(df.iloc[r, vc + 1])
+            bank_raw = _norm_str(df.iloc[r, vc + 2]) if vc + 2 < df.shape[1] else None
+            if not vendor or amount <= 0 or not bank_raw:
+                continue
+            bank = _BANK_MAP.get(bank_raw, bank_raw)
+            if bank not in ("玉山", "中信"):
+                continue
+            key = (issue_month, vendor, bank, amount)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append({
+                "issue_month": issue_month,
+                "vendor": vendor,
+                "amount": amount,
+                "bank": bank,
+                "note": (
+                    f"原始銀行欄: {bank_raw}（含『延』字，已忽略）"
+                    if "延" in bank_raw else None
+                ),
+            })
+
+    return records
+
+
+# ─── 調貨整理 (inventory_transfer) ───────────────────────
+
+
+# 月份區塊標題：'11501調貨整理'
+_TRANSFER_MONTH_RE = re.compile(r"^(\d{3})(\d{2})\s*調貨整理")
+
+
+def parse_inventory_transfer(
+    file_obj: IO,
+    source_filename: str,
+    clinic_zefeng_id: int,
+    clinic_zepei_id: int,
+) -> list[dict]:
+    """
+    解析調貨整理 xlsx。
+
+    結構（一年一檔，多月區塊堆疊）：
+      R: '{ROCYM}調貨整理'  (區塊標題)
+      R+1: 'X pay Y' | 空 | ... | 'Y pay X'
+      R+2 ...: 商品名(C0) / 數量(C1)  ||  商品名(C6) / 數量(C7)
+      （區塊間有空白列）
+
+    左欄組（C0/C1）= 「澤沛 pay 澤豐」→ 從 澤豐 → 澤沛 調撥（澤豐出貨給澤沛，澤沛欠錢）
+    右欄組（C6/C7）= 「澤豐 pay 澤沛」→ 從 澤沛 → 澤豐 調撥
+
+    Args:
+        clinic_zefeng_id: 澤豐 clinic_id
+        clinic_zepei_id: 澤沛 clinic_id
+
+    Returns:
+        list[dict] 對應 inventory_transfer 表（amount/unit_price 暫 None）
+    """
+    file_obj.seek(0)
+    df = pd.read_excel(file_obj, sheet_name=0, header=None)
+
+    records: list[dict] = []
+    current_month: str | None = None
+    in_block = False  # True 表示目前在某月區塊內的資料列範圍
+
+    for r in range(df.shape[0]):
+        c0 = df.iloc[r, 0] if df.shape[1] > 0 else None
+        c0_str = str(c0).strip() if pd.notna(c0) else ""
+
+        # 月份區塊標題
+        m = _TRANSFER_MONTH_RE.match(c0_str)
+        if m:
+            roc_y, mo = int(m.group(1)), int(m.group(2))
+            ad_y = roc_y + 1911
+            current_month = f"{ad_y:04d}-{mo:02d}-01"
+            in_block = False  # 等 'pay' 表頭列出現再開始
+            continue
+
+        # 表頭列（'澤沛 pay 澤豐'）— 啟動資料收集
+        if "pay" in c0_str:
+            in_block = True
+            continue
+
+        if not (in_block and current_month):
+            continue
+
+        # 資料列：左欄 (C0=item, C1=qty) 澤豐→澤沛；右欄 (C6=item, C7=qty) 澤沛→澤豐
+        # 左欄組
+        if df.shape[1] > 1:
+            item_l = _norm_str(df.iloc[r, 0])
+            qty_l = _to_float(df.iloc[r, 1])
+            if item_l and qty_l and qty_l > 0:
+                records.append({
+                    "transfer_month": current_month,
+                    "from_clinic_id": clinic_zefeng_id,
+                    "to_clinic_id": clinic_zepei_id,
+                    "item": item_l,
+                    "qty": round(qty_l, 2),
+                    "unit_price": None,
+                    "amount": None,
+                })
+
+        # 右欄組
+        if df.shape[1] > 7:
+            item_r = _norm_str(df.iloc[r, 6])
+            qty_r = _to_float(df.iloc[r, 7])
+            if item_r and qty_r and qty_r > 0:
+                records.append({
+                    "transfer_month": current_month,
+                    "from_clinic_id": clinic_zepei_id,
+                    "to_clinic_id": clinic_zefeng_id,
+                    "item": item_r,
+                    "qty": round(qty_r, 2),
+                    "unit_price": None,
+                    "amount": None,
+                })
 
     return records
