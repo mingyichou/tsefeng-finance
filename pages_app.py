@@ -341,6 +341,11 @@ def page_import():
 
     st.divider()
 
+    # ─── 員工薪資（自動偵測最新 sheet）─────────────
+    _section_staff_salary()
+
+    st.divider()
+
     # ─── 手 KEY 補充備註（金流註解 CRUD）───────────
     _section_manual_annotation()
 
@@ -1034,6 +1039,95 @@ def _section_self_pay_pricing():
             # 2. INSERT 新資料
             sb.table("product_pricing").insert(records).execute()
             st.success(f"✅ 已清空舊資料並寫入 {len(records)} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+def _section_staff_salary():
+    """員工薪資批次匯入（Sprint 2.8c）— 自動偵測最新 sheet + 跨診所代付辨識"""
+    from data_processor.staff_salary import parse_staff_salary
+
+    st.subheader("👤 員工薪資（自動偵測最新月份 sheet）")
+    st.caption(
+        "一個檔多個月 sheet。系統自動辨識最新月份；含「-更正」字尾優先採用。"
+        "抓員工總額 + 跨診所代付（影響豐沛金流）。"
+        "支援標題：「YYY年MM月薪資明細」、「YYY年MM月X薪資明細(Y代付)」。"
+    )
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        default_clinic = st.radio(
+            "檔案主聘診所",
+            ["澤豐", "澤沛"],
+            key="staff_clinic",
+            help="一般員工區塊（無代付字樣）會歸到此診所",
+        )
+    with col2:
+        uploaded = st.file_uploader(
+            "上傳薪資 xlsx", type=["xlsx"], key="staff_uploader"
+        )
+
+    if not uploaded:
+        return
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+    cid_to_short = {v: k for k, v in short_to_cid.items()}
+    default_cid = short_to_cid[default_clinic]
+
+    try:
+        sheet_name, records = parse_staff_salary(
+            uploaded, uploaded.name, default_cid, short_to_cid
+        )
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+
+    st.success(
+        f"📋 自動偵測 sheet：**{sheet_name}**　|　解析 **{len(records)}** 位員工"
+    )
+
+    if records:
+        df = pd.DataFrame(records)
+        df["主聘診所"] = df["clinic_id"].map(cid_to_short)
+        df["實付方"] = df["paid_by_clinic_id"].map(cid_to_short).fillna("（自付）")
+        cols = [
+            "service_month", "主聘診所", "employee_label",
+            "gross_salary", "實付方", "note",
+        ]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    cross = [r for r in records if r["paid_by_clinic_id"]]
+    if cross:
+        st.markdown("**🔁 跨診所代付摘要（影響豐沛金流）：**")
+        from collections import defaultdict
+        agg = defaultdict(int)
+        for r in cross:
+            owner = cid_to_short.get(r["clinic_id"], "?")
+            payer = cid_to_short.get(r["paid_by_clinic_id"], "?")
+            agg[(owner, payer)] += r["gross_salary"]
+        for (owner, payer), total in agg.items():
+            st.markdown(
+                f"- **{owner}** 應付薪資但 **{payer}** 代付 → "
+                f"{owner} 應給 {payer} **NT {total:,} 元**"
+            )
+
+    if st.button(
+        f"💾 確認匯入（{len(records)} 筆）",
+        type="primary",
+        key="staff_save",
+    ):
+        if not records:
+            st.warning("無可匯入資料")
+            return
+        try:
+            sb.table("staff_salary_summary").upsert(
+                records,
+                on_conflict="clinic_id,service_month,employee_label",
+            ).execute()
+            st.success(f"✅ 寫入 {len(records)} 筆")
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
