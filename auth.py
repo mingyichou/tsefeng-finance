@@ -70,15 +70,20 @@ def show_login_page():
                     color: white !important;
                   }}
                 </style>
-                <a href="{oauth_url}" target="_top" rel="noopener noreferrer" class="google-signin-btn">
+                <a href="{oauth_url}" target="_blank" rel="noopener noreferrer" class="google-signin-btn">
                   🔐 使用 Google 帳號登入
                 </a>
                 """,
                 unsafe_allow_html=True,
             )
             st.caption(
-                "點上方按鈕後會跳轉到 Google 登入頁（**本分頁**內），完成登入後自動返回本系統。"
+                "點上方按鈕會在**新分頁**開啟 Google 登入。完成後新分頁顯示主畫面，可關閉此分頁。"
             )
+            # ⚠️ 已知問題：剛 git push 觸發 Streamlit Cloud 重新部署期間登入，
+            # 會發生 PKCE code_verifier mismatch（cache_resource 失效）。
+            # 解法待實作：自管 PKCE — verifier 存 supabase oauth_pending table，
+            # callback 用 state_id 查回後手動 exchange。
+            # 暫時 workaround：部署完成後（約 30-60 秒）再登入。
         else:
             st.error("Google 登入連結建立失敗，請改用 Email OTP")
 
