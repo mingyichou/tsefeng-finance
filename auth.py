@@ -70,14 +70,14 @@ def show_login_page():
                     color: white !important;
                   }}
                 </style>
-                <a href="{oauth_url}" target="_blank" rel="noopener noreferrer" class="google-signin-btn">
+                <a href="{oauth_url}" target="_top" rel="noopener noreferrer" class="google-signin-btn">
                   🔐 使用 Google 帳號登入
                 </a>
                 """,
                 unsafe_allow_html=True,
             )
             st.caption(
-                "點上方按鈕後會在**新分頁**開啟 Google 登入頁，完成登入後新分頁會顯示主畫面，您可關閉此分頁。"
+                "點上方按鈕後會跳轉到 Google 登入頁（**本分頁**內），完成登入後自動返回本系統。"
             )
         else:
             st.error("Google 登入連結建立失敗，請改用 Email OTP")
