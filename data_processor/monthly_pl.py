@@ -1,81 +1,151 @@
 """
-月度損益計算（Phase 4）
+月度損益（實帳模式 v2）— 院長 2026-05-04 補充規則
 
-從 DB 即時聚合各種資料來源，產出兩家診所×月份×收入支出的損益表。
+核心原則：每筆款項按「實際入帳/出帳的銀行交易日期」歸屬月份，
+不用「服務月（業績）」歸屬。
 
-收入端：
-  1. 健保收入（按 service_month 歸屬）— nhi_payment_notices.paid_amount
-  2. 自費收入（不含掛號）— doctor_cash_monthly view.cash_total_excl_reg
-  3. 掛號費 — doctor_cash_monthly.registration（也計入自費收入；兩家行為不同）
-  4. 部分負擔 — doctor_outpatient_summary.copay_*
-  5. 手 KEY 非常規收入 — manual_entry direction=income
+健保以「玉山健保戶 bank_transactions」為基準，
+nhi_payment_notices 只用於核對 + 取 A/B/C/點值（業績用）。
 
-支出端：
-  1. 員工薪資 — staff_salary_summary.gross_salary
-  2. 醫師薪資 — doctor_salary_monthly.total_salary（含跨支援代付）
-  3. 現金支出 — cash_expense.amount（按 accrual_month）
-  4. 合約支出 — contract_expense.amount（按 service_month）
-  5. 支票支出 — check_expense.amount（共用檔，暫歸澤豐）
-  6. 手 KEY 非常規支出 — manual_entry direction=expense
+兩家邏輯：
+  • 澤沛（簡單）：玉山健保戶 + 中信進出戶逐筆按 transaction_date 月份聚合
+  • 澤豐（複雜）：12 變數規則
+    x1  前月餘額                 中信月初餘額
+    x2  玉山健保轉入             中信進出戶 counterparty=玉山的入帳
+    x3  澤豐現金支出（隱形）     cash_expense clinic=澤豐 當月 accrual
+    x4  澤沛現金支出代墊（隱形） cash_expense clinic=澤沛 當月 accrual
+    x5  前月澤沛現金結算還款      （4月入帳 = 3月收入）  ← 跨月
+    x6  澤沛→澤豐金流            （4月入帳 = 3月收入）  ← 跨月
+    x7  澤沛合約進帳              （4月入帳 = 3月收入）  ← 跨月
+    x8  澤豐現金入帳補存         中信存款機 現金存入  ← 跨月（4月存=3月收）
+    x9  編制外人力薪資（謝松坊） staff_salary 中該員工
+    x10 手 KEY 非常規收支         manual_entry
+    x11 當月餘額                 中信月末餘額
+    x12 澤豐合約支出             contract_expense clinic=澤豐 當月
 
-跨支援代付（豐沛金流）：另列項目，便於院長對帳。
-
-⚠️ 簡化假設：
-  - 支票支出全歸澤豐（兩家共用支票戶，院長以澤豐入帳；之後可細分）
-  - 調貨金額暫 0（等 product_pricing trigger 算）
+健保收入 (從玉山健保戶 bank_transactions)：summary 含「健保醫療給付」
+員工薪資扣款（玉山健保戶）：summary 含「薪資轉帳」「健保扣繳」「勞保」
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, fields
-from datetime import date, timedelta
+from dataclasses import dataclass, field, fields
+from datetime import date
+
+
+# ============================================================================
+# Dataclasses
+# ============================================================================
 
 
 @dataclass
-class MonthlyIncome:
-    nhi_paid: int = 0
-    cash_self_pay: int = 0
-    registration_fee: int = 0
-    copay: int = 0
-    misc_income: int = 0
-
-    @property
-    def total(self) -> int:
-        return sum(getattr(self, f.name) for f in fields(self))
-
-
-@dataclass
-class MonthlyExpense:
-    staff_salary: int = 0
-    doctor_salary: int = 0
-    cash_expense: int = 0
-    contract_expense: int = 0
-    check_expense: int = 0
+class ZepeiMonthly:
+    """澤沛實帳（簡單版）"""
+    service_month: str
+    # 收入
+    nhi_inflow: int = 0          # 玉山健保戶健保入帳
+    cross_inflow: int = 0        # 中信跨診所匯入
+    cash_deposit: int = 0        # 中信現金存入
+    other_income: int = 0
+    misc_income: int = 0         # 手 KEY income
+    # 支出
+    salary_outflow: int = 0      # 玉山薪資轉帳出
+    nhi_premium: int = 0         # 玉山健保代繳
+    contract_outflow: int = 0    # 中信轉廠商
+    cross_outflow: int = 0       # 中信跨診所匯出
+    other_expense: int = 0
+    cash_expense_total: int = 0  # cash_expense 當月（澤沛 self）
+    contract_expense_total: int = 0  # contract_expense 當月
     misc_expense: int = 0
+    staff_salary: int = 0        # staff_salary_summary 當月
+    doctor_salary: int = 0       # doctor_salary_monthly 當月
 
     @property
-    def total(self) -> int:
-        return sum(getattr(self, f.name) for f in fields(self))
+    def total_income(self) -> int:
+        return (
+            self.nhi_inflow + self.cross_inflow + self.cash_deposit
+            + self.other_income + self.misc_income
+        )
+
+    @property
+    def total_expense(self) -> int:
+        # 銀行扣款（薪資/健保/合約/跨診所/其他）已是現金流出
+        # cash_expense / contract_expense 是「實際支出記帳」歸屬該月（避免重複）
+        # 這裡只用代表月度支出的 cash_expense_total / contract_expense_total / staff/doctor salary
+        return (
+            self.cash_expense_total + self.contract_expense_total
+            + self.staff_salary + self.doctor_salary + self.misc_expense
+        )
+
+    @property
+    def net(self) -> int:
+        return self.total_income - self.total_expense
 
 
 @dataclass
-class MonthlyPL:
-    clinic_id: int
-    clinic_name: str
-    service_month: str   # 'YYYY-MM-01'
-    income: MonthlyIncome
-    expense: MonthlyExpense
-    cross_support_payable: int = 0   # 應付給對方診所的金額（豐沛金流）
-    cross_support_receivable: int = 0  # 對方應付的金額（豐沛金流）
+class ZefengMonthly:
+    """澤豐實帳（12 變數）"""
+    service_month: str
+    # 玉山健保戶（實際銀行）
+    nhi_inflow: int = 0          # 健保醫療給付
+    nhi_premium_outflow: int = 0  # 健保代繳
+    salary_outflow_esun: int = 0  # 玉山薪資轉帳
+    other_esun_in: int = 0
+    other_esun_out: int = 0
+    # 中信進出戶（11 變數）
+    x1_prev_balance: int = 0
+    x2_zefeng_inflow: int = 0
+    x5_zepei_prev_repay: int = 0
+    x6_fengpei_settle: int = 0
+    x7_zepei_contract_repay: int = 0
+    x8_zefeng_cash_revenue: int = 0
+    x10_misc: int = 0  # net (income - expense)
+    x11_current_balance: int = 0
+    # 隱形支出（已知為當月支出但中信看不到逐筆）
+    x3_zefeng_cash_expense: int = 0
+    x4_zepei_cash_expense_proxy: int = 0  # 代墊（澤沛之後還）
+    x9_offsite_staff_pay: int = 0
+    x12_zefeng_contract_expense: int = 0
+    # 系統計算
+    doctor_salary: int = 0
+    staff_salary: int = 0  # 該診所主聘員工
+    misc_income_x10: int = 0
+    misc_expense_x10: int = 0
 
     @property
-    def net_profit(self) -> int:
-        return self.income.total - self.expense.total
+    def total_income(self) -> int:
+        """總收入 = 健保入帳 + 玉山其他收入 + x5 + x6 + x7 + x8 + x10收入 + x2"""
+        return (
+            self.nhi_inflow + self.other_esun_in
+            + self.x2_zefeng_inflow
+            + self.x5_zepei_prev_repay
+            + self.x6_fengpei_settle
+            + self.x7_zepei_contract_repay
+            + self.x8_zefeng_cash_revenue
+            + self.misc_income_x10
+        )
 
     @property
-    def fengpei_net(self) -> int:
-        """豐沛金流淨值（正=對方欠我；負=我欠對方）"""
-        return self.cross_support_receivable - self.cross_support_payable
+    def total_expense(self) -> int:
+        """總支出 = 薪資 + 醫師薪資 + x3 + x4 + x9 + x12 + 健保代繳 + x10支出"""
+        return (
+            self.staff_salary + self.doctor_salary
+            + self.x3_zefeng_cash_expense
+            + self.x4_zepei_cash_expense_proxy
+            + self.x9_offsite_staff_pay
+            + self.x12_zefeng_contract_expense
+            + self.nhi_premium_outflow
+            + self.misc_expense_x10
+        )
+
+    @property
+    def net(self) -> int:
+        return self.total_income - self.total_expense
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
 
 
 def _next_month(service_month: str) -> str:
@@ -87,205 +157,325 @@ def _next_month(service_month: str) -> str:
     return n.isoformat()
 
 
-def _sum_field(rows: list[dict], field_name: str) -> int:
+def _prev_month(service_month: str) -> str:
+    d = date.fromisoformat(service_month)
+    if d.month == 1:
+        n = date(d.year - 1, 12, 1)
+    else:
+        n = date(d.year, d.month - 1, 1)
+    return n.isoformat()
+
+
+def _sum_amount(rows: list[dict], field_name: str = "amount") -> int:
     return sum((r.get(field_name) or 0) for r in rows)
 
 
-def calculate_monthly_pl(
-    sb,
-    service_month: str,
-    clinic_id: int,
-    clinic_name: str,
-    is_zefeng: bool,
-) -> MonthlyPL:
-    """從 DB 聚合單一(診所×月份)的損益。"""
+# ============================================================================
+# Sheet 抓取
+# ============================================================================
+
+
+def _get_bank_account_id(sb, clinic_id: int, account_type: str) -> int | None:
+    resp = (
+        sb.table("bank_accounts")
+        .select("id")
+        .eq("clinic_id", clinic_id)
+        .eq("account_type", account_type)
+        .execute().data
+    )
+    if resp:
+        return resp[0]["id"]
+    return None
+
+
+def _fetch_bank_transactions(
+    sb, account_id: int, service_month: str
+) -> list[dict]:
     next_month = _next_month(service_month)
-    income = MonthlyIncome()
-    expense = MonthlyExpense()
-
-    # ─── 收入 ───
-    # 1. 健保
-    nhi = (
-        sb.table("nhi_payment_notices")
-        .select("paid_amount")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+    return (
+        sb.table("bank_transactions")
+        .select("transaction_date, summary, amount, counterparty, channel, note, memo_month")
+        .eq("account_id", account_id)
+        .gte("transaction_date", service_month)
+        .lt("transaction_date", next_month)
         .execute().data
     )
-    income.nhi_paid = _sum_field(nhi, "paid_amount")
 
-    # 2-3. 自費（含/不含掛號分兩欄）
+
+# ============================================================================
+# 澤沛 — 簡單聚合
+# ============================================================================
+
+
+def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMonthly:
+    m = ZepeiMonthly(service_month=service_month)
+    next_month = _next_month(service_month)
+
+    # 玉山健保戶
+    esun_id = _get_bank_account_id(sb, clinic_id, "健保戶")
+    if esun_id:
+        for tx in _fetch_bank_transactions(sb, esun_id, service_month):
+            amt = tx["amount"]
+            summary = (tx.get("summary") or "")
+            if amt > 0:
+                if "健保醫療給付" in summary or "健保" in summary:
+                    m.nhi_inflow += amt
+                else:
+                    m.other_income += amt
+            else:
+                a = -amt
+                if "薪資轉帳" in summary or "薪資" in summary:
+                    m.salary_outflow += a
+                elif "健保" in summary or "勞保" in summary:
+                    m.nhi_premium += a
+                else:
+                    m.other_expense += a
+
+    # 中信進出戶
+    ctbc_id = _get_bank_account_id(sb, clinic_id, "進出戶")
+    if ctbc_id:
+        for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
+            amt = tx["amount"]
+            summary = (tx.get("summary") or "")
+            cp = (tx.get("counterparty") or "")
+            note = (tx.get("note") or "")
+            if amt > 0:
+                if "澤豐" in note or "澤豐" in cp:
+                    m.cross_inflow += amt
+                elif "現金" in summary:
+                    m.cash_deposit += amt
+                else:
+                    m.other_income += amt
+            else:
+                a = -amt
+                if "澤豐" in note or "澤豐" in cp:
+                    m.cross_outflow += a
+                elif any(k in note for k in ("莊松榮", "港香蘭", "天一", "駿賀", "大墩", "順天")):
+                    m.contract_outflow += a
+                else:
+                    m.other_expense += a
+
+    # 系統計算的薪資/支出彙總
     cash = (
-        sb.table("doctor_cash_monthly")
-        .select("cash_total_excl_reg, registration")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+        sb.table("cash_expense").select("amount")
+        .eq("clinic_id", clinic_id).eq("accrual_month", service_month)
         .execute().data
     )
-    income.cash_self_pay = _sum_field(cash, "cash_total_excl_reg")
-    income.registration_fee = _sum_field(cash, "registration")
+    m.cash_expense_total = _sum_amount(cash)
 
-    # 4. 部分負擔（澤豐 copay_outpatient / 澤沛 copay_drug+trauma 都 sum）
-    out = (
-        sb.table("doctor_outpatient_summary")
-        .select("copay_outpatient, copay_drug, copay_trauma")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+    contract = (
+        sb.table("contract_expense").select("amount")
+        .eq("clinic_id", clinic_id).eq("service_month", service_month)
         .execute().data
     )
-    income.copay = sum(
-        (r.get("copay_outpatient") or 0)
-        + (r.get("copay_drug") or 0)
-        + (r.get("copay_trauma") or 0)
-        for r in out
-    )
+    m.contract_expense_total = int(_sum_amount(contract))
 
-    # 5. 手 KEY 非常規收入
-    me_in = (
-        sb.table("manual_entry")
-        .select("amount")
-        .eq("clinic_id", clinic_id)
-        .eq("direction", "income")
-        .gte("entry_date", service_month)
-        .lt("entry_date", next_month)
-        .execute().data
-    )
-    income.misc_income = _sum_field(me_in, "amount")
-
-    # ─── 支出 ───
-    # 1. 員工薪資（gross 都計，含主聘代付給對方）
     ss = (
-        sb.table("staff_salary_summary")
-        .select("gross_salary")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+        sb.table("staff_salary_summary").select("gross_salary")
+        .eq("clinic_id", clinic_id).eq("service_month", service_month)
         .execute().data
     )
-    expense.staff_salary = _sum_field(ss, "gross_salary")
+    m.staff_salary = _sum_amount(ss, "gross_salary")
 
-    # 2. 醫師薪資 — total_salary 已含主聘+跨支援
     ds = (
-        sb.table("doctor_salary_monthly")
-        .select("total_salary")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+        sb.table("doctor_salary_monthly").select("total_salary")
+        .eq("clinic_id", clinic_id).eq("service_month", service_month)
         .execute().data
     )
-    expense.doctor_salary = _sum_field(ds, "total_salary")
+    m.doctor_salary = _sum_amount(ds, "total_salary")
 
-    # 3. 現金支出（按 accrual_month）
-    ce = (
-        sb.table("cash_expense")
-        .select("amount")
-        .eq("clinic_id", clinic_id)
-        .eq("accrual_month", service_month)
+    me_in = (
+        sb.table("manual_entry").select("amount")
+        .eq("clinic_id", clinic_id).eq("direction", "income")
+        .gte("entry_date", service_month).lt("entry_date", next_month)
         .execute().data
     )
-    expense.cash_expense = _sum_field(ce, "amount")
+    m.misc_income = _sum_amount(me_in)
 
-    # 4. 合約支出
-    ct = (
-        sb.table("contract_expense")
-        .select("amount")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
-        .execute().data
-    )
-    expense.contract_expense = int(_sum_field(ct, "amount"))  # NUMERIC
-
-    # 5. 支票支出（共用檔，暫歸澤豐）
-    if is_zefeng:
-        chk = (
-            sb.table("check_expense")
-            .select("amount")
-            .eq("issue_month", service_month)
-            .execute().data
-        )
-        expense.check_expense = _sum_field(chk, "amount")
-
-    # 6. 手 KEY 非常規支出
     me_ex = (
-        sb.table("manual_entry")
-        .select("amount")
-        .eq("clinic_id", clinic_id)
-        .eq("direction", "expense")
-        .gte("entry_date", service_month)
-        .lt("entry_date", next_month)
+        sb.table("manual_entry").select("amount")
+        .eq("clinic_id", clinic_id).eq("direction", "expense")
+        .gte("entry_date", service_month).lt("entry_date", next_month)
         .execute().data
     )
-    expense.misc_expense = _sum_field(me_ex, "amount")
+    m.misc_expense = _sum_amount(me_ex)
 
-    # ─── 跨支援豐沛金流 ───
-    # A. 員工薪資代付（staff_salary_summary.paid_by_clinic_id）
-    # B. 醫師薪資跨診所（從 doctor_salary_monthly 推；目前 schema 沒直接欄位）
-    cross_payable = 0    # 我應付給對方
-    cross_receivable = 0  # 對方應付給我
+    return m
 
-    # 員工：clinic=我 + paid_by=對方 → 對方代付 → 我欠對方
-    ss_payable = (
-        sb.table("staff_salary_summary")
-        .select("gross_salary, paid_by_clinic_id")
-        .eq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+
+# ============================================================================
+# 澤豐 — 12 變數聚合
+# ============================================================================
+
+
+def calculate_zefeng_monthly(
+    sb, service_month: str, clinic_id: int, zepei_clinic_id: int
+) -> ZefengMonthly:
+    m = ZefengMonthly(service_month=service_month)
+    next_month = _next_month(service_month)
+    prev_month = _prev_month(service_month)
+
+    # 玉山健保戶
+    esun_id = _get_bank_account_id(sb, clinic_id, "健保戶")
+    if esun_id:
+        for tx in _fetch_bank_transactions(sb, esun_id, service_month):
+            amt = tx["amount"]
+            summary = (tx.get("summary") or "")
+            if amt > 0:
+                if "健保醫療給付" in summary or "健保" in summary:
+                    m.nhi_inflow += amt
+                else:
+                    m.other_esun_in += amt
+            else:
+                a = -amt
+                if "薪資" in summary:
+                    m.salary_outflow_esun += a
+                elif "健保" in summary or "勞保" in summary:
+                    m.nhi_premium_outflow += a
+                else:
+                    m.other_esun_out += a
+
+    # 中信進出戶（澤豐&個人混戶）
+    ctbc_id = _get_bank_account_id(sb, clinic_id, "進出戶")
+    if ctbc_id:
+        # 月初餘額（前月最後一筆 balance；近似）
+        first = (
+            sb.table("bank_transactions").select("balance, transaction_date")
+            .eq("account_id", ctbc_id)
+            .lt("transaction_date", service_month)
+            .order("transaction_date", desc=True).order("id", desc=True)
+            .limit(1).execute().data
+        )
+        if first:
+            m.x1_prev_balance = first[0].get("balance") or 0
+
+        for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
+            amt = tx["amount"]
+            summary = (tx.get("summary") or "")
+            cp = (tx.get("counterparty") or "")
+            note = (tx.get("note") or "")
+            channel = (tx.get("channel") or "")
+            if amt > 0:
+                # x2: 玉山健保戶轉入
+                if "玉山" in cp or "0668" in cp:
+                    m.x2_zefeng_inflow += amt
+                # x6/x5/x7: 澤沛來的款項 — 暫合併為 x6（前月歸屬）
+                elif "澤沛" in note or "澤沛" in cp or any(k in cp for k in ("0050", "1375")):
+                    m.x6_fengpei_settle += amt
+                # x8: 現金存入
+                elif "現金" in summary or "存款機" in channel:
+                    m.x8_zefeng_cash_revenue += amt
+                # 其他
+                else:
+                    m.other_esun_in += amt
+            # amt < 0 的支出在中信不分類（透支計算用，這裡略）
+
+        # 月末餘額（最後一筆）
+        last = (
+            sb.table("bank_transactions").select("balance, transaction_date")
+            .eq("account_id", ctbc_id)
+            .gte("transaction_date", service_month)
+            .lt("transaction_date", next_month)
+            .order("transaction_date", desc=True).order("id", desc=True)
+            .limit(1).execute().data
+        )
+        if last:
+            m.x11_current_balance = last[0].get("balance") or 0
+
+    # x3 澤豐現金支出（cash_expense clinic=澤豐 該月）
+    cash_zf = (
+        sb.table("cash_expense").select("amount")
+        .eq("clinic_id", clinic_id).eq("accrual_month", service_month)
         .execute().data
     )
-    for r in ss_payable:
-        pid = r.get("paid_by_clinic_id")
-        if pid and pid != clinic_id:
-            cross_payable += r.get("gross_salary") or 0
+    m.x3_zefeng_cash_expense = _sum_amount(cash_zf)
 
-    # 員工：clinic=對方 + paid_by=我 → 我代付 → 對方欠我
-    ss_receivable = (
-        sb.table("staff_salary_summary")
-        .select("gross_salary, clinic_id")
-        .eq("paid_by_clinic_id", clinic_id)
-        .neq("clinic_id", clinic_id)
-        .eq("service_month", service_month)
+    # x4 澤沛現金支出（澤豐代墊）
+    cash_zp = (
+        sb.table("cash_expense").select("amount")
+        .eq("clinic_id", zepei_clinic_id).eq("accrual_month", service_month)
         .execute().data
     )
-    for r in ss_receivable:
-        cross_receivable += r.get("gross_salary") or 0
+    m.x4_zepei_cash_expense_proxy = _sum_amount(cash_zp)
 
-    return MonthlyPL(
-        clinic_id=clinic_id,
-        clinic_name=clinic_name,
-        service_month=service_month,
-        income=income,
-        expense=expense,
-        cross_support_payable=cross_payable,
-        cross_support_receivable=cross_receivable,
+    # x12 澤豐合約支出
+    contract_zf = (
+        sb.table("contract_expense").select("amount")
+        .eq("clinic_id", clinic_id).eq("service_month", service_month)
+        .execute().data
+    )
+    m.x12_zefeng_contract_expense = int(_sum_amount(contract_zf))
+
+    # x9 編制外人力（謝松坊）— 從 staff_salary_summary 找
+    offsite = (
+        sb.table("staff_salary_summary").select("gross_salary, employee_label")
+        .eq("clinic_id", clinic_id).eq("service_month", service_month)
+        .execute().data
+    )
+    for r in offsite:
+        if "謝松坊" in (r.get("employee_label") or ""):
+            m.x9_offsite_staff_pay += r.get("gross_salary") or 0
+
+    # 一般員工薪資（不含 x9）
+    m.staff_salary = sum(
+        (r.get("gross_salary") or 0) for r in offsite
+        if "謝松坊" not in (r.get("employee_label") or "")
     )
 
+    # 醫師薪資
+    ds = (
+        sb.table("doctor_salary_monthly").select("total_salary")
+        .eq("clinic_id", clinic_id).eq("service_month", service_month)
+        .execute().data
+    )
+    m.doctor_salary = _sum_amount(ds, "total_salary")
 
-def calculate_both_clinics(
-    sb,
-    service_month: str,
-) -> tuple[MonthlyPL, MonthlyPL]:
-    """便利函式：一次算澤豐+澤沛"""
+    # x10 手 KEY 非常規收支
+    me_in = (
+        sb.table("manual_entry").select("amount")
+        .eq("clinic_id", clinic_id).eq("direction", "income")
+        .gte("entry_date", service_month).lt("entry_date", next_month)
+        .execute().data
+    )
+    m.misc_income_x10 = _sum_amount(me_in)
+    me_ex = (
+        sb.table("manual_entry").select("amount")
+        .eq("clinic_id", clinic_id).eq("direction", "expense")
+        .gte("entry_date", service_month).lt("entry_date", next_month)
+        .execute().data
+    )
+    m.misc_expense_x10 = _sum_amount(me_ex)
+
+    return m
+
+
+# ============================================================================
+# 高層 API
+# ============================================================================
+
+
+def calculate_both_clinics(sb, service_month: str):
+    """一次算澤豐 + 澤沛"""
     clinics = sb.table("clinics").select("id, short_name").execute().data
     fz = next(c for c in clinics if c["short_name"] == "澤豐")
     fp = next(c for c in clinics if c["short_name"] == "澤沛")
-    pl_fz = calculate_monthly_pl(
-        sb, service_month, fz["id"], fz["short_name"], is_zefeng=True,
-    )
-    pl_fp = calculate_monthly_pl(
-        sb, service_month, fp["id"], fp["short_name"], is_zefeng=False,
-    )
+    pl_fz = calculate_zefeng_monthly(sb, service_month, fz["id"], fp["id"])
+    pl_fp = calculate_zepei_monthly(sb, service_month, fp["id"])
     return pl_fz, pl_fp
 
 
 def list_available_months(sb) -> list[str]:
-    """掃描多個關鍵 table 找出有資料的服務月份（去重 + desc）"""
+    """掃多 table 找有資料的月份"""
     months: set[str] = set()
-    for tbl, col in [
-        ("nhi_payment_notices", "service_month"),
-        ("doctor_outpatient_summary", "service_month"),
-        ("doctor_visit_stats", "service_month"),
-        ("contract_expense", "service_month"),
-    ]:
-        try:
-            rows = sb.table(tbl).select(col).execute().data
-            months.update(r[col] for r in rows if r.get(col))
-        except Exception:
-            pass
+    # 從 bank_transactions 找（最關鍵）
+    try:
+        rows = (
+            sb.table("bank_transactions").select("transaction_date").execute().data
+        )
+        for r in rows:
+            d = r.get("transaction_date")
+            if d:
+                months.add(d[:7] + "-01")
+    except Exception:
+        pass
     return sorted(months, reverse=True)
