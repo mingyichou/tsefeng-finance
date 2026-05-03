@@ -257,19 +257,189 @@ def page_dashboard():
 
 
 # ============================================================
-# 2. 收支總覽（Phase 2 + 4）
+# 2. 收支總覽（Phase 4 月度損益）
 # ============================================================
 def page_overview():
-    st.title("💰 收支總覽")
-    st.info("🚧 開發中（Phase 2 匯入 + Phase 4 權責還原後此頁顯示月度損益）")
+    st.title("💰 月度損益總覽")
 
-    st.markdown("**本頁將顯示：**")
-    st.markdown("""
-    - 月度損益表（收入細項 vs 支出細項）
-    - 健保 vs 自費收入結構
-    - 兩家診所合併與分開檢視
-    - 12 個月趨勢
-    """)
+    from data_processor.monthly_pl import (
+        calculate_both_clinics, list_available_months,
+    )
+
+    sb = get_authed_client()
+
+    months = list_available_months(sb)
+    if not months:
+        st.warning("⚠️ 尚無資料。請先到「本月資料匯入」上傳。")
+        return
+
+    col1, _ = st.columns([2, 5])
+    with col1:
+        service_month = st.selectbox(
+            "服務月份", months,
+            format_func=lambda d: d[:7], key="pl_month",
+        )
+
+    with st.spinner("計算中..."):
+        pl_fz, pl_fp = calculate_both_clinics(sb, service_month)
+
+    # ─── KPI 卡片 ───
+    st.divider()
+    total_income = pl_fz.income.total + pl_fp.income.total
+    total_expense = pl_fz.expense.total + pl_fp.expense.total
+    total_profit = total_income - total_expense
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("總收入", f"${total_income:,}")
+    k2.metric("總支出", f"${total_expense:,}")
+    k3.metric("淨利", f"${total_profit:,}",
+              delta=f"{total_profit/total_income:.1%}" if total_income else "N/A")
+    k4.metric("豐沛金流淨", f"${pl_fz.fengpei_net:,}",
+              help="正=澤沛欠澤豐；負=澤豐欠澤沛")
+
+    # ─── 損益表（兩家並列 + 合計）───
+    st.divider()
+    st.subheader("📊 月度損益明細")
+
+    income_rows = [
+        ("健保收入", "nhi_paid"),
+        ("自費收入(不含掛號)", "cash_self_pay"),
+        ("掛號費", "registration_fee"),
+        ("部分負擔", "copay"),
+        ("非常規收入(手KEY)", "misc_income"),
+    ]
+    expense_rows = [
+        ("員工薪資", "staff_salary"),
+        ("醫師薪資", "doctor_salary"),
+        ("現金支出", "cash_expense"),
+        ("合約支出", "contract_expense"),
+        ("支票支出", "check_expense"),
+        ("非常規支出(手KEY)", "misc_expense"),
+    ]
+
+    pl_data = []
+    for label, key in income_rows:
+        fz_v = getattr(pl_fz.income, key)
+        fp_v = getattr(pl_fp.income, key)
+        pl_data.append({
+            "類別": "收入", "項目": label,
+            "澤豐": fz_v, "澤沛": fp_v,
+            "合計": fz_v + fp_v,
+        })
+    pl_data.append({
+        "類別": "收入", "項目": "▶ 收入合計",
+        "澤豐": pl_fz.income.total,
+        "澤沛": pl_fp.income.total,
+        "合計": pl_fz.income.total + pl_fp.income.total,
+    })
+    for label, key in expense_rows:
+        fz_v = getattr(pl_fz.expense, key)
+        fp_v = getattr(pl_fp.expense, key)
+        pl_data.append({
+            "類別": "支出", "項目": label,
+            "澤豐": fz_v, "澤沛": fp_v,
+            "合計": fz_v + fp_v,
+        })
+    pl_data.append({
+        "類別": "支出", "項目": "▶ 支出合計",
+        "澤豐": pl_fz.expense.total,
+        "澤沛": pl_fp.expense.total,
+        "合計": pl_fz.expense.total + pl_fp.expense.total,
+    })
+    pl_data.append({
+        "類別": "盈餘", "項目": "▶ 淨利",
+        "澤豐": pl_fz.net_profit,
+        "澤沛": pl_fp.net_profit,
+        "合計": pl_fz.net_profit + pl_fp.net_profit,
+    })
+
+    st.dataframe(
+        pd.DataFrame(pl_data), use_container_width=True, hide_index=True,
+    )
+
+    # ─── 豐沛金流 ───
+    if pl_fz.cross_support_payable or pl_fz.cross_support_receivable:
+        st.divider()
+        st.subheader("🔁 豐沛金流（員工跨診所代付）")
+        st.markdown(
+            f"- 澤豐應付澤沛：NT ${pl_fz.cross_support_payable:,}　"
+            f"（澤豐主聘員工但澤沛代付）\n"
+            f"- 澤沛應付澤豐：NT ${pl_fz.cross_support_receivable:,}　"
+            f"（澤沛主聘員工但澤豐代付）\n"
+            f"- **淨：澤沛{'欠' if pl_fz.fengpei_net >= 0 else '反向給'}澤豐 "
+            f"NT ${abs(pl_fz.fengpei_net):,}**"
+        )
+        st.caption(
+            "醫師跨支援薪資已含在「醫師薪資」項中（doctor_salary_monthly 含跨支援）。"
+            "調貨金額待 product_pricing trigger 上線後計入。"
+        )
+
+    # ─── 12 月趨勢圖 ───
+    st.divider()
+    st.subheader("📈 月度損益趨勢")
+
+    trend_data = []
+    for m in sorted(months)[-12:]:  # 最近 12 個月
+        try:
+            tfz, tfp = calculate_both_clinics(sb, m)
+            trend_data.append({
+                "月份": m[:7],
+                "澤豐淨利": tfz.net_profit,
+                "澤沛淨利": tfp.net_profit,
+                "合計淨利": tfz.net_profit + tfp.net_profit,
+                "總收入": tfz.income.total + tfp.income.total,
+                "總支出": tfz.expense.total + tfp.expense.total,
+            })
+        except Exception:
+            continue
+
+    if trend_data:
+        import altair as alt
+        df_t = pd.DataFrame(trend_data)
+        c1, c2 = st.columns(2)
+        with c1:
+            # 收入 vs 支出 stacked
+            df_long = df_t.melt(
+                id_vars=["月份"],
+                value_vars=["總收入", "總支出"],
+                var_name="類別", value_name="金額",
+            )
+            chart1 = alt.Chart(df_long).mark_bar().encode(
+                x=alt.X("月份:N", sort="ascending"),
+                y=alt.Y("金額:Q"),
+                color=alt.Color(
+                    "類別:N",
+                    scale=alt.Scale(range=["#6A5ACD", "#FFA07A"]),
+                ),
+                xOffset="類別:N",
+                tooltip=["月份", "類別", alt.Tooltip("金額:Q", format=",")],
+            ).properties(height=300, title="月度收入 vs 支出")
+            st.altair_chart(chart1, use_container_width=True)
+        with c2:
+            # 淨利線圖
+            df_net = df_t.melt(
+                id_vars=["月份"],
+                value_vars=["澤豐淨利", "澤沛淨利", "合計淨利"],
+                var_name="診所", value_name="淨利",
+            )
+            chart2 = alt.Chart(df_net).mark_line(point=True).encode(
+                x=alt.X("月份:N", sort="ascending"),
+                y=alt.Y("淨利:Q"),
+                color="診所:N",
+                tooltip=["月份", "診所", alt.Tooltip("淨利:Q", format=",")],
+            ).properties(height=300, title="月度淨利趨勢")
+            st.altair_chart(chart2, use_container_width=True)
+
+    # ─── 簡化假設說明 ───
+    with st.expander("ℹ️ 計算假設"):
+        st.markdown("""
+        - **健保收入**按 `service_month`（費用年月）歸屬，跨次給付都計入該月
+        - **支票支出**全歸澤豐（兩家共用支票戶）
+        - **調貨金額**暫 0（待 product_pricing trigger 上線後計入）
+        - **醫師薪資**已含跨支援代付（從 doctor_salary_monthly.total_salary 取）
+        - **跨支援豐沛金流**只列員工薪資代付（醫師代付已含在醫師薪資中）
+        - **手 KEY 補充備註**不影響損益（純對帳註解）
+        """)
 
 
 # ============================================================
