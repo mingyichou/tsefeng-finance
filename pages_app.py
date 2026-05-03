@@ -1370,9 +1370,11 @@ def _section_manual_annotation():
         except Exception:
             sel = None
 
-    forms = ["轉入", "轉出", "存現", "領現", "原紀錄"]
+    forms = ["轉入", "轉出", "存現", "領現"]
     scopes = ["診所", "個人"]
     clinic_opts = ["（不指定）", "澤豐", "澤沛"]
+    # 帳戶限定四個（協助解讀帳簿用）
+    account_opts = ["澤豐&個人中信", "澤豐玉山", "澤沛中信", "澤沛玉山"]
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1411,11 +1413,16 @@ def _section_manual_annotation():
             value=int(sel["amount"]) if sel and sel.get("amount") else 0,
             key="ann_amount",
         )
-        account = st.text_input(
+        cur_account = (
+            sel.get("account") if sel and sel.get("account") in account_opts
+            else account_opts[0]
+        )
+        account = st.selectbox(
             "帳戶",
-            value=sel.get("account") or "" if sel else "",
-            placeholder="例：澤豐中信、澤沛玉山",
+            options=account_opts,
+            index=account_opts.index(cur_account),
             key="ann_account",
+            help="僅四個帳戶可選，用於核對帳簿備註",
         )
 
     description = st.text_area(
