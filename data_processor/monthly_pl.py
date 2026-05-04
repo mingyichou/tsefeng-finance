@@ -37,31 +37,41 @@ from datetime import date
 # ─── 帳號 / 標籤辨識 ──────────────────────────────────────
 ZEPEI_CTBC_TAIL = "137540125004"   # 澤沛中信帳號末段（精確匹配避免誤判）
 
-# 澤沛現金支出標籤：「沛02月現金支出」「澤沛現金支出」「11502 現金支出」
-_ZEPEI_CASH_LABEL_RE = re.compile(
-    r"(?:沛|澤沛|11)\s*(\d{1,2})?\s*月?\s*現金支出"
-)
-# 澤沛合約支出標籤
-_ZEPEI_CONTRACT_LABEL_RE = re.compile(
-    r"(?:沛|澤沛|11)\s*(\d{1,2})?\s*月?\s*合約"
+_LABEL_MONTH_PATTERNS = (
+    re.compile(r"沛\s*(\d{1,2})\s*月"),       # 「沛02月...」「沛 3 月...」
+    re.compile(r"澤沛\s*(\d{1,2})\s*月"),     # 「澤沛02月...」
+    re.compile(r"11(\d{2})"),                  # 「11502...」→ 02
+    re.compile(r"(\d{1,2})\s*月\s*(?:現金|合約)"),  # 「02月現金支出」
 )
 
 
-def _extract_label_month(text: str, pattern: re.Pattern) -> int | None:
-    """從交易註記抓出標籤月份。例：「沛02月現金支出」→ 2 / 「11502現金支出」→ 2"""
+def _zepei_settle_kind(text: str) -> str | None:
+    """note/summary 含「現金支出」or「合約」 → 回 'cash'/'contract'；否則 None。
+    用於判斷澤沛中信轉澤豐的款項是 x5/x7 結算還款（不算 x6）。"""
     if not text:
         return None
-    m = pattern.search(text)
-    if not m:
+    if "現金支出" in text:
+        return "cash"
+    if "合約" in text:
+        return "contract"
+    return None
+
+
+def _extract_label_month(text: str) -> int | None:
+    """從 note/summary 抓出標籤月份（支援多種寫法）。
+    例：「沛02月現金支出」→ 2 / 「11502 現金支出」→ 2 / 「02月合約」→ 2
+    """
+    if not text:
         return None
-    g = m.group(1)
-    if not g:
-        return None
-    n = int(g)
-    # 11502 → 02
-    if n > 12:
-        n = n % 100
-    return n if 1 <= n <= 12 else None
+    for pattern in _LABEL_MONTH_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            n = int(m.group(1))
+            if n > 12:
+                n = n % 100
+            if 1 <= n <= 12:
+                return n
+    return None
 
 
 # ============================================================================
@@ -266,12 +276,16 @@ def _calc_zepei_labeled_expenses(
         note = (r.get("note") or "")
         summary = (r.get("summary") or "")
         blob = f"{note}|{summary}"
-        n_cash = _extract_label_month(blob, _ZEPEI_CASH_LABEL_RE)
-        n_contract = _extract_label_month(blob, _ZEPEI_CONTRACT_LABEL_RE)
+        kind = _zepei_settle_kind(blob)
+        if kind is None:
+            continue
+        n = _extract_label_month(blob)
+        if n != target_month:
+            continue
         amt = abs(r.get("amount") or 0)
-        if n_cash == target_month:
+        if kind == "cash":
             cash_total += amt
-        if n_contract == target_month:
+        elif kind == "contract":
             contract_total += amt
 
     return cash_total, contract_total
@@ -336,11 +350,8 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
                     m.other_ctbc_in += amt  # 廠商匯款等
             else:
                 a = -amt
-                # 跳過「沛N月現金支出/合約」這類結算標籤（已在 cash_/contract_expense_total 算）
-                if (
-                    _ZEPEI_CASH_LABEL_RE.search(note)
-                    or _ZEPEI_CONTRACT_LABEL_RE.search(note)
-                ):
+                # 跳過「現金支出/合約」結算款（已在 cash_/contract_expense_total 算）
+                if _zepei_settle_kind(note) is not None:
                     continue
                 if "澤豐" in blob:
                     m.cross_outflow += a
@@ -441,23 +452,18 @@ def calculate_zefeng_monthly(
             channel = (tx.get("channel") or "")
             if amt > 0:
                 # x6 澤沛→澤豐金流：用精確帳號末段比對 + note 含「澤沛」字樣
-                # （標籤如「澤沛現金支出/澤沛合約」屬於 x5/x7 不在這裡算）
                 is_from_zepei = (
                     cp.endswith(ZEPEI_CTBC_TAIL)
                     or "澤沛" in note
                 )
-                # 排除標示為「沛N月現金支出」「沛N月合約」（這些是 x5/x7 結算款）
-                is_settle_back = bool(
-                    _ZEPEI_CASH_LABEL_RE.search(note)
-                    or _ZEPEI_CONTRACT_LABEL_RE.search(note)
-                )
-                if is_from_zepei and not is_settle_back:
+                # 排除「現金支出/合約」結算款（屬 x5/x7，不算 x6）
+                kind = _zepei_settle_kind(note)
+                if is_from_zepei and kind is None:
                     m.x6_zepei_to_zefeng += amt
-                # x8 現金存入（前月診所現金收入）
-                elif "現金" in summary or "存款機" in channel:
+                # x8 現金存入（前月診所現金收入）— 必須是 amt > 0 且非澤沛
+                elif not is_from_zepei and ("現金" in summary or "存款機" in channel):
                     m.x8_zefeng_cash_revenue += amt
-                # x2 玉山轉入屬診所內部周轉（不算收入）— 略過
-                # 其他入帳屬個人 — 略過
+                # x2 玉山轉入 / 其他個人款項 略過
 
         # 月末餘額
         last = (
