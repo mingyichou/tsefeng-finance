@@ -35,36 +35,53 @@ from datetime import date
 
 
 # ─── 帳號 / 標籤辨識 ──────────────────────────────────────
-ZEPEI_CTBC_TAIL = "137540125004"   # 澤沛中信帳號末段（精確匹配避免誤判）
+ZEPEI_CTBC_TAIL = "137540125004"   # 澤沛中信帳號末段
+
+
+def _normalize(text: str) -> str:
+    """全形 → 半形 + 英數標準化（NFKC）— 處理「沛２月」「沛ｔｏ豐」等"""
+    import unicodedata
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKC", text)
+
 
 _LABEL_MONTH_PATTERNS = (
-    re.compile(r"沛\s*(\d{1,2})\s*月"),       # 「沛02月...」「沛 3 月...」
-    re.compile(r"澤沛\s*(\d{1,2})\s*月"),     # 「澤沛02月...」
-    re.compile(r"11(\d{2})"),                  # 「11502...」→ 02
-    re.compile(r"(\d{1,2})\s*月\s*(?:現金|合約)"),  # 「02月現金支出」
+    re.compile(r"沛\s*(\d{1,2})\s*月"),
+    re.compile(r"澤沛\s*(\d{1,2})\s*月"),
+    re.compile(r"11(\d{2})"),
+    re.compile(r"(\d{1,2})\s*月\s*(?:現金|合約)"),
 )
 
 
 def _zepei_settle_kind(text: str) -> str | None:
-    """note/summary 含「現金支出」or「合約」 → 回 'cash'/'contract'；否則 None。
-    用於判斷澤沛中信轉澤豐的款項是 x5/x7 結算還款（不算 x6）。"""
+    """
+    判斷 note/summary 屬於哪一種「澤沛 → 澤豐」結算還款：
+    - x5 cash:  含「現金支出」
+    - x6 fengpei: 含「豐沛金流」或「沛to豐」（含全形「ｔｏ」）
+    - x7 contract: 含「合約」
+    其他（如「澤沛房租」「澤沛傳單」）回 None
+    """
     if not text:
         return None
-    if "現金支出" in text:
-        return "cash"
-    if "合約" in text:
-        return "contract"
+    s = _normalize(text)
+    # x6 fengpei（先檢查避免「豐沛金流」誤判其他）
+    if "豐沛金流" in s or "沛to豐" in s or "沛 to 豐" in s:
+        return "x6_fengpei"
+    if "現金支出" in s:
+        return "x5_cash"
+    if "合約" in s:
+        return "x7_contract"
     return None
 
 
 def _extract_label_month(text: str) -> int | None:
-    """從 note/summary 抓出標籤月份（支援多種寫法）。
-    例：「沛02月現金支出」→ 2 / 「11502 現金支出」→ 2 / 「02月合約」→ 2
-    """
+    """從 note/summary 抓標籤月份（含全形數字標準化）"""
     if not text:
         return None
+    s = _normalize(text)
     for pattern in _LABEL_MONTH_PATTERNS:
-        m = pattern.search(text)
+        m = pattern.search(s)
         if m:
             n = int(m.group(1))
             if n > 12:
@@ -72,6 +89,24 @@ def _extract_label_month(text: str) -> int | None:
             if 1 <= n <= 12:
                 return n
     return None
+
+
+def _settle_target_month(text: str, transaction_date: str) -> int | None:
+    """
+    決定結算款歸屬的月份：
+    優先 note 內的月份標籤；無則用 transaction_date 倒推前月
+    （院長：下月入帳 = 前月結算）
+    """
+    n = _extract_label_month(text)
+    if n is not None:
+        return n
+    if not transaction_date:
+        return None
+    try:
+        tx_m = int(transaction_date[5:7])
+        return 12 if tx_m == 1 else tx_m - 1
+    except (ValueError, IndexError):
+        return None
 
 
 # ============================================================================
@@ -101,9 +136,10 @@ class ZepeiMonthly:
     rent_outflow: int = 0          # 房租支出
     consulting_outflow: int = 0    # 管理顧問費
     other_ctbc_out: int = 0        # 其他中信支出
-    # 系統推算（補充）
-    cash_expense_total: int = 0    # 該月 cash_expense（逐筆現金支出）
-    contract_expense_total: int = 0  # 該月 contract_expense（合約彙總）
+    # 系統推算（補充）— 從中信 note 標籤辨識（不從 cash_expense 上傳檔）
+    cash_expense_total: int = 0    # 「沛N月現金支出」結算款（澤沛實際 N 月現金支出）
+    contract_expense_total: int = 0  # 「沛N月合約/澤沛合約」結算款（澤沛 N 月合約）
+    fengpei_outflow: int = 0       # 「豐沛金流/沛to豐」結算款（澤沛還澤豐淨額）
     # 手 KEY
     misc_income: int = 0
     misc_expense: int = 0
@@ -118,13 +154,18 @@ class ZepeiMonthly:
 
     @property
     def total_expense(self) -> int:
-        # 銀行直接扣款 + 系統彙總（cash/contract_expense_total）+ 手KEY 支出
-        # 注意：銀行扣款（薪資/合約轉帳/跨診所匯出/房租/顧問費/其他）+ 系統彙總
+        # 系統算「澤沛實際支出」=
+        #   銀行其他支出（薪資、房租、顧問、合約轉廠商等）
+        #   + cash_expense_total（澤沛 N 月現金支出，澤豐代墊）
+        #   + contract_expense_total（澤沛 N 月合約，澤豐代墊）
+        #   + fengpei_outflow（豐沛金流結算）
+        # 不重複計算 cross_outflow（已包含在 cash/contract/fengpei settle 中）
         return (
             self.salary_outflow_esun + self.other_esun_out
-            + self.contract_outflow + self.cross_outflow
+            + self.contract_outflow
             + self.rent_outflow + self.consulting_outflow + self.other_ctbc_out
-            + self.cash_expense_total
+            + self.cash_expense_total + self.contract_expense_total
+            + self.fengpei_outflow
             + self.misc_expense
         )
 
@@ -149,11 +190,14 @@ class ZefengMonthly:
     nhi_inflow: int = 0          # 健保醫療給付
     salary_outflow_esun: int = 0  # 玉山薪資轉帳
     nhi_premium_outflow: int = 0  # 玉山健保扣繳/勞保
-    # 中信進出戶（明確屬診所收入）
-    x6_zepei_to_zefeng: int = 0  # 澤沛→澤豐金流（含 x5/x6/x7 來款）
+    # 澤沛還款 3 筆（跨月歸屬：下月入帳屬前月）
+    x5_zepei_cash_settle: int = 0      # 「沛N月現金支出」結算款
+    x6_fengpei_settle: int = 0         # 「豐沛金流/沛to豐金流」結算款（含調貨+薪水代付）
+    x7_zepei_contract_settle: int = 0   # 「澤沛合約」結算款
+    # 中信當月
     x8_zefeng_cash_revenue: int = 0  # 現金存入（前月診所現金收入）
-    misc_income_x10: int = 0     # 手 KEY 非常規收入
-    misc_expense_x10: int = 0    # 手 KEY 非常規支出
+    misc_income_x10: int = 0
+    misc_expense_x10: int = 0
     # 中信餘額（資訊用，不算入收支）
     x1_prev_balance: int = 0
     x11_current_balance: int = 0
@@ -166,7 +210,10 @@ class ZefengMonthly:
     @property
     def total_income(self) -> int:
         return (
-            self.nhi_inflow + self.x6_zepei_to_zefeng
+            self.nhi_inflow
+            + self.x5_zepei_cash_settle
+            + self.x6_fengpei_settle
+            + self.x7_zepei_contract_settle
             + self.x8_zefeng_cash_revenue + self.misc_income_x10
         )
 
@@ -243,18 +290,16 @@ def _get_bank_account_id(sb, clinic_id: int, account_type: str) -> int | None:
 
 def _calc_zepei_labeled_expenses(
     sb, zepei_clinic_id: int, target_month: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
-    從**澤沛中信** bank_transactions 出帳找標籤「沛N月現金支出」「沛N月合約」
-    N == target_month 的金額算為該月澤沛現金支出/合約支出。
+    從澤沛中信 amt < 0 找「沛N月現金支出/合約/豐沛金流」結算款。
+    歸屬月份從 note 抓，無則用 transaction_date - 1。
 
-    院長規則：例「沛02月現金支出 42955」於 3/10 出帳澤沛中信
-    → 屬 11502 的澤沛現金支出（澤豐代墊還款）
-
-    Returns: (cash_expense_total, contract_expense_total)
+    Returns: (cash_expense_total, contract_expense_total, fengpei_outflow)
     """
     cash_total = 0
     contract_total = 0
+    fengpei_total = 0
 
     zepei_ctbc = (
         sb.table("bank_accounts").select("id")
@@ -262,33 +307,33 @@ def _calc_zepei_labeled_expenses(
         .execute().data
     )
     if not zepei_ctbc:
-        return 0, 0
+        return 0, 0, 0
     zepei_ctbc_id = zepei_ctbc[0]["id"]
 
     rows = (
         sb.table("bank_transactions")
-        .select("amount, summary, note")
+        .select("transaction_date, amount, summary, note")
         .eq("account_id", zepei_ctbc_id)
-        .lt("amount", 0)  # 出帳
+        .lt("amount", 0)
         .execute().data
     )
     for r in rows:
-        note = (r.get("note") or "")
-        summary = (r.get("summary") or "")
-        blob = f"{note}|{summary}"
-        kind = _zepei_settle_kind(blob)
+        note = _normalize(r.get("note") or "")
+        kind = _zepei_settle_kind(note)
         if kind is None:
             continue
-        n = _extract_label_month(blob)
+        n = _settle_target_month(note, r.get("transaction_date") or "")
         if n != target_month:
             continue
         amt = abs(r.get("amount") or 0)
-        if kind == "cash":
+        if kind == "x5_cash":
             cash_total += amt
-        elif kind == "contract":
+        elif kind == "x7_contract":
             contract_total += amt
+        elif kind == "x6_fengpei":
+            fengpei_total += amt
 
-    return cash_total, contract_total
+    return cash_total, contract_total, fengpei_total
 
 
 def _fetch_bank_transactions(
@@ -350,12 +395,10 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
                     m.other_ctbc_in += amt  # 廠商匯款等
             else:
                 a = -amt
-                # 跳過「現金支出/合約」結算款（已在 cash_/contract_expense_total 算）
+                # 跳過「現金支出/合約/豐沛金流」結算款（在 _calc_zepei_labeled_expenses 處理）
                 if _zepei_settle_kind(note) is not None:
                     continue
-                if "澤豐" in blob:
-                    m.cross_outflow += a
-                elif "房租" in note or "房租" in cp:
+                if "房租" in note or "房租" in cp:
                     m.rent_outflow += a
                 elif "管理" in note or "顧問" in note or "管理費" in note:
                     m.consulting_outflow += a
@@ -367,12 +410,14 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
                 else:
                     m.other_ctbc_out += a
 
-    # 澤沛現金支出 / 合約支出：從 bank_transactions note 標籤抓
-    # （院長 2026-05-05 規則：不從 cash_expense / contract_expense 上傳檔取澤沛資料）
-    target_month = int(service_month[5:7])  # 取月份數字
-    m.cash_expense_total, m.contract_expense_total = (
-        _calc_zepei_labeled_expenses(sb, clinic_id, target_month)
-    )
+    # 澤沛現金支出 / 合約 / 豐沛金流：從中信 note 標籤抓
+    # （規則：澤沛 N 月還澤豐 → 標籤「沛N月現金支出/合約/豐沛金流」於 N+1 月出帳）
+    target_month = int(service_month[5:7])
+    (
+        m.cash_expense_total,
+        m.contract_expense_total,
+        m.fengpei_outflow,
+    ) = _calc_zepei_labeled_expenses(sb, clinic_id, target_month)
 
     me_in = (
         sb.table("manual_entry").select("amount")
@@ -451,19 +496,17 @@ def calculate_zefeng_monthly(
             note = (tx.get("note") or "")
             channel = (tx.get("channel") or "")
             if amt > 0:
-                # x6 澤沛→澤豐金流：用精確帳號末段比對 + note 含「澤沛」字樣
-                is_from_zepei = (
-                    cp.endswith(ZEPEI_CTBC_TAIL)
-                    or "澤沛" in note
-                )
-                # 排除「現金支出/合約」結算款（屬 x5/x7，不算 x6）
-                kind = _zepei_settle_kind(note)
-                if is_from_zepei and kind is None:
-                    m.x6_zepei_to_zefeng += amt
-                # x8 現金存入（前月診所現金收入）— 必須是 amt > 0 且非澤沛
-                elif not is_from_zepei and ("現金" in summary or "存款機" in channel):
-                    m.x8_zefeng_cash_revenue += amt
-                # x2 玉山轉入 / 其他個人款項 略過
+                # x8 現金存入（透過存款機，前月診所現金收入）
+                if "現金" in summary or "存款機" in channel:
+                    # 排除：可能是某些跨診所現金匯入
+                    is_from_zepei = (
+                        cp.endswith(ZEPEI_CTBC_TAIL)
+                        or "澤沛" in note
+                    )
+                    if not is_from_zepei:
+                        m.x8_zefeng_cash_revenue += amt
+                # x5/x6/x7 澤沛還款由跨月邏輯處理（下方）
+                # 其他入帳（玉山轉入、個人款項）略過
 
         # 月末餘額
         last = (
@@ -476,6 +519,36 @@ def calculate_zefeng_monthly(
         )
         if last:
             m.x11_current_balance = last[0].get("balance") or 0
+
+        # ─── x5/x6/x7 跨月歸屬：澤沛還款（下月入帳=前月歸屬）───
+        # 掃所有月份的澤豐中信 amt > 0；只取「澤沛來款 + 結算款註記」
+        # 月份從 note 標籤抓，無則用 transaction_date - 1
+        target_m_int = int(service_month[5:7])
+        all_settles = (
+            sb.table("bank_transactions")
+            .select("transaction_date, amount, note, summary, counterparty")
+            .eq("account_id", ctbc_id)
+            .gt("amount", 0)
+            .execute().data
+        )
+        for tx in all_settles:
+            note_n = _normalize(tx.get("note") or "")
+            cp_n = (tx.get("counterparty") or "")
+            if not (cp_n.endswith(ZEPEI_CTBC_TAIL) or "澤沛" in note_n):
+                continue
+            kind = _zepei_settle_kind(note_n)
+            if kind is None:
+                continue
+            n = _settle_target_month(note_n, tx.get("transaction_date") or "")
+            if n != target_m_int:
+                continue
+            amt_v = tx.get("amount") or 0
+            if kind == "x5_cash":
+                m.x5_zepei_cash_settle += amt_v
+            elif kind == "x6_fengpei":
+                m.x6_fengpei_settle += amt_v
+            elif kind == "x7_contract":
+                m.x7_zepei_contract_settle += amt_v
 
     # ─── 隱形支出 ───
     # x3 澤豐現金支出

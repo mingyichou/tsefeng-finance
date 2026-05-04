@@ -308,7 +308,9 @@ def page_overview():
     with st.expander("📑 澤豐收支細項"):
         fz_rows = [
             ("收入 - 玉山", "健保醫療給付", pl_fz.nhi_inflow),
-            ("收入 - 中信", "x6 澤沛→澤豐金流（前月）", pl_fz.x6_zepei_to_zefeng),
+            ("收入 - 中信", "x5 澤沛現金支出結算（前月）", pl_fz.x5_zepei_cash_settle),
+            ("收入 - 中信", "x6 豐沛金流結算（前月）", pl_fz.x6_fengpei_settle),
+            ("收入 - 中信", "x7 澤沛合約結算（前月）", pl_fz.x7_zepei_contract_settle),
             ("收入 - 中信", "x8 現金存入（前月診所現金）", pl_fz.x8_zefeng_cash_revenue),
             ("收入 - 中信", "x10 手KEY 非常規收入", pl_fz.misc_income_x10),
             ("支出 - 玉山", "薪資轉帳（含醫師+員工）", pl_fz.salary_outflow_esun),
@@ -356,8 +358,9 @@ def page_overview():
             ("支出 - 中信", "房租", pl_fp.rent_outflow),
             ("支出 - 中信", "管理顧問費", pl_fp.consulting_outflow),
             ("支出 - 中信", "其他支出", pl_fp.other_ctbc_out),
-            ("支出 - 彙總", "現金支出（cash_expense）", pl_fp.cash_expense_total),
-            ("支出 - 彙總", "合約支出（contract_expense）", pl_fp.contract_expense_total),
+            ("支出 - 結算（屬該月）", "現金支出（澤豐代墊）", pl_fp.cash_expense_total),
+            ("支出 - 結算（屬該月）", "合約支出（澤豐代墊）", pl_fp.contract_expense_total),
+            ("支出 - 結算（屬該月）", "豐沛金流結算款", pl_fp.fengpei_outflow),
             ("支出", "非常規支出 (手KEY)", pl_fp.misc_expense),
         ]
         st.dataframe(
