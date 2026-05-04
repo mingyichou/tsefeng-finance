@@ -305,7 +305,7 @@ def page_overview():
         ),
     )
 
-    with st.expander("📑 澤豐收支細項（玉山健保戶 + 中信進出戶 + 隱形支出）"):
+    with st.expander("📑 澤豐收支細項"):
         fz_rows = [
             ("收入 - 玉山", "健保醫療給付", pl_fz.nhi_inflow),
             ("收入 - 中信", "x6 澤沛→澤豐金流（前月）", pl_fz.x6_zepei_to_zefeng),
@@ -317,8 +317,6 @@ def page_overview():
             ("支出 - 隱形", "x3 澤豐現金支出（cash_expense）", pl_fz.x3_zefeng_cash_expense),
             ("支出 - 隱形", "x9 編制外人力（謝松坊）", pl_fz.x9_offsite_staff_pay),
             ("支出 - 隱形", "x12 澤豐合約支出", pl_fz.x12_zefeng_contract_expense),
-            ("資訊", "中信前月餘額 (x1)", pl_fz.x1_prev_balance),
-            ("資訊", "中信當月餘額 (x11)", pl_fz.x11_current_balance),
         ]
         st.dataframe(
             pd.DataFrame(fz_rows, columns=["類別", "項目", "金額"]),
@@ -342,16 +340,21 @@ def page_overview():
         ),
     )
 
-    with st.expander("📑 澤沛收支細項"):
+    with st.expander("📑 澤沛收支細項（完整記錄帳戶內容）"):
         fp_rows = [
             ("收入 - 玉山", "健保醫療給付", pl_fp.nhi_inflow),
-            ("收入 - 中信", "跨診所匯入", pl_fp.cross_inflow),
+            ("收入 - 玉山", "其他入帳", pl_fp.other_esun_in),
+            ("收入 - 中信", "跨診所匯入（澤豐→澤沛）", pl_fp.cross_inflow),
             ("收入 - 中信", "現金存入", pl_fp.cash_deposit),
+            ("收入 - 中信", "其他入帳（廠商匯款等）", pl_fp.other_ctbc_in),
             ("收入", "非常規收入 (手KEY)", pl_fp.misc_income),
             ("支出 - 玉山", "薪資轉帳", pl_fp.salary_outflow_esun),
-            ("支出 - 玉山", "健保/勞保代繳", pl_fp.nhi_premium_outflow),
+            ("支出 - 玉山", "其他支出", pl_fp.other_esun_out),
             ("支出 - 中信", "合約轉廠商", pl_fp.contract_outflow),
-            ("支出 - 中信", "跨診所匯出", pl_fp.cross_outflow),
+            ("支出 - 中信", "跨診所匯出（澤沛→澤豐）", pl_fp.cross_outflow),
+            ("支出 - 中信", "房租", pl_fp.rent_outflow),
+            ("支出 - 中信", "管理顧問費", pl_fp.consulting_outflow),
+            ("支出 - 中信", "其他支出", pl_fp.other_ctbc_out),
             ("支出 - 彙總", "現金支出（cash_expense）", pl_fp.cash_expense_total),
             ("支出 - 彙總", "合約支出（contract_expense）", pl_fp.contract_expense_total),
             ("支出", "非常規支出 (手KEY)", pl_fp.misc_expense),
@@ -504,10 +507,7 @@ def page_import():
 
     st.divider()
 
-    # ─── 支票支出（共用） ────────────────────────────
-    _section_check_expense()
-
-    st.divider()
+    # ─── 支票支出已併入「現金支出」自動分流（描述「支票-」開頭）───
 
     # ─── 調貨整理 ────────────────────────────────────
     _section_inventory_transfer()
@@ -971,13 +971,14 @@ def _section_cash_visits():
 
 
 def _section_cash_expense():
-    """現金支出（Sprint 2.7a）— 年度累積檔，非按月"""
-    from data_processor.expenses import parse_cash_expense
+    """現金支出 + 自動分流支票（描述「支票-」開頭歸 check_expense）"""
+    from data_processor.expenses import parse_cash_expense_split
 
-    st.subheader("💵 現金支出（年度累積檔）")
+    st.subheader("💵 現金支出（含支票自動分流）")
     st.caption(
-        "檔名範例：『澤豐中醫診所現金支出.xlsx』、『澤沛中醫診所現金支出.xlsx』。"
-        "檔內每列是一筆支出（月/日/描述/金額/備註）。"
+        "檔名範例：『澤豐中醫診所現金支出.xlsx』。"
+        "檔內描述以「支票-XXX(銀行)」開頭的列會自動分流到 check_expense 表，"
+        "其他歸 cash_expense。**不需另外上傳支票檔。**"
     )
 
     col1, col2, col3 = st.columns([1, 1, 3])
@@ -987,7 +988,6 @@ def _section_cash_expense():
         roc_year = st.number_input(
             "民國年", min_value=110, max_value=130, value=115, step=1,
             key="cash_exp_year",
-            help="檔內 C0 是月份，年份要由此指定（檔名沒帶年）",
         )
     with col3:
         uploaded = st.file_uploader(
@@ -1008,44 +1008,75 @@ def _section_cash_expense():
     clinic_id = clinic_resp.data[0]["id"]
 
     try:
-        records = parse_cash_expense(uploaded, uploaded.name, clinic_id, roc_year=int(roc_year))
+        cash_records, check_records = parse_cash_expense_split(
+            uploaded, uploaded.name, clinic_id, roc_year=int(roc_year)
+        )
     except Exception as e:
         st.error(f"解析失敗：{e}")
         return
 
-    if not records:
+    if not (cash_records or check_records):
         st.warning("無可匯入的資料")
         return
 
-    df = pd.DataFrame(records)
-    st.success(f"✅ 解析 {len(records)} 筆")
-
-    # 月份分組摘要
-    df_sum = df.copy()
-    df_sum["月份"] = df_sum["expense_date"].str[:7]
-    summary = df_sum.groupby("月份", as_index=False).agg(
-        筆數=("amount", "count"), 合計=("amount", "sum"),
+    st.success(
+        f"✅ 解析完成：現金 {len(cash_records)} 筆 + 支票 {len(check_records)} 筆"
     )
-    st.markdown("**按月份彙總：**")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    st.markdown("**逐筆預覽：**")
-    cols = ["expense_date", "description", "amount", "note"]
-    st.dataframe(df[cols], use_container_width=True, height=300, hide_index=True)
+    if cash_records:
+        df = pd.DataFrame(cash_records)
+        df_sum = df.copy()
+        df_sum["月份"] = df_sum["expense_date"].str[:7]
+        summary = df_sum.groupby("月份", as_index=False).agg(
+            筆數=("amount", "count"), 合計=("amount", "sum"),
+        )
+        st.markdown("**現金支出按月份彙總：**")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        with st.expander("逐筆現金支出預覽"):
+            st.dataframe(
+                df[["expense_date", "description", "amount", "note"]],
+                use_container_width=True, height=300, hide_index=True,
+            )
+
+    if check_records:
+        df_chk = pd.DataFrame(check_records)
+        df_chk_sum = df_chk.copy()
+        df_chk_sum["月份"] = df_chk_sum["issue_month"].str[:7]
+        chk_summary = df_chk_sum.groupby("月份", as_index=False).agg(
+            筆數=("amount", "count"), 合計=("amount", "sum"),
+        )
+        st.markdown("**支票分流按月份彙總：**")
+        st.dataframe(chk_summary, use_container_width=True, hide_index=True)
+        with st.expander("逐筆支票預覽"):
+            st.dataframe(
+                df_chk[["issue_month", "vendor", "amount", "bank", "note"]],
+                use_container_width=True, height=300, hide_index=True,
+            )
 
     if st.button(
-        f"💾 確認匯入 {clinic_choice} 現金支出（{len(records)} 筆）",
+        f"💾 確認匯入（現金 {len(cash_records)} + 支票 {len(check_records)}）",
         type="primary",
         key=f"cash_exp_save_{clinic_choice}",
     ):
         try:
-            sb.table("cash_expense").upsert(
-                records, on_conflict="raw_row_hash", ignore_duplicates=True
-            ).execute()
-            st.success(f"✅ 寫入 {len(records)} 筆（重複 hash 自動跳過）")
+            if cash_records:
+                sb.table("cash_expense").upsert(
+                    cash_records, on_conflict="raw_row_hash",
+                    ignore_duplicates=True,
+                ).execute()
+            if check_records:
+                sb.table("check_expense").upsert(
+                    check_records, on_conflict="issue_month,vendor,bank",
+                ).execute()
+            st.success(
+                f"✅ 寫入：現金 {len(cash_records)} 筆、支票 {len(check_records)} 筆"
+            )
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
+    # 注意：支票（描述開頭「支票-」）已分流到 check_expense
+    # _section_cash_expense 只處理一般現金支出。
+    # 如需重新處理（含支票分流），請改用 _section_cash_expense_v2
 
 
 def _section_contract_expense():

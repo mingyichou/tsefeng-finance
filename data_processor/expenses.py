@@ -74,6 +74,34 @@ def _row_hash_cash(rec: dict) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
+_CHECK_PREFIX_RE = re.compile(r"^支票[-\s]")
+_CHECK_VENDOR_RE = re.compile(r"^支票[-\s]([^(（]+?)[(（]([^)）]*)[)）]")
+
+
+def _parse_check_desc(desc: str) -> tuple[str, str, str]:
+    """
+    解析「支票-XXX(銀行)」格式 → (vendor, bank, note)
+
+    例：
+      「支票-順天(無票合約-中)」 → ("順天", "中信", "無票合約-中")
+      「支票-天一(中)」          → ("天一", "中信", "")
+      「支票-莊松榮(玉)」         → ("莊松榮", "玉山", "")
+      「支票-大墩-(玉)」          → ("大墩-", "玉山", "")
+    """
+    m = _CHECK_VENDOR_RE.match(desc)
+    if m:
+        vendor = m.group(1).strip().rstrip("-").strip() or m.group(1).strip()
+        info = m.group(2).strip()
+        # 銀行判斷：含「中」→ 中信；含「玉」→ 玉山
+        bank = "中信" if "中" in info else ("玉山" if "玉" in info else "中信")
+        # note 保留括號內非銀行字樣（如「無票合約」）
+        note = info if not (info in ("中", "玉", "中延", "玉延")) else ""
+        return vendor, bank, note
+    # fallback：去掉「支票-」前綴當 vendor
+    vendor = re.sub(r"^支票[-\s]", "", desc).strip()
+    return vendor, "中信", ""
+
+
 def parse_cash_expense(
     file_obj: IO,
     source_filename: str,
@@ -90,11 +118,33 @@ def parse_cash_expense(
     Args:
         roc_year: 民國年（檔名通常是「澤豐中醫診所現金支出.xlsx」沒帶年；
                   預設 115，可由 UI 讓使用者選）
+
+    Returns:
+        list[dict] 對應 cash_expense 表的 row
+    """
+    cash, _ = parse_cash_expense_split(
+        file_obj, source_filename, clinic_id, roc_year=roc_year
+    )
+    return cash
+
+
+def parse_cash_expense_split(
+    file_obj: IO,
+    source_filename: str,
+    clinic_id: int,
+    roc_year: int = 115,
+) -> tuple[list[dict], list[dict]]:
+    """
+    解析現金支出 xlsx，分流：
+    - 描述以「支票-」開頭 → check_expense records
+    - 其他 → cash_expense records
+
+    Returns:
+        (cash_records, check_records)
     """
     file_obj.seek(0)
     df = pd.read_excel(file_obj, sheet_name=0, header=None)
 
-    # 找出備註欄（最後有「備註」標題的欄）
     note_col = None
     if df.shape[0] > 0:
         for c in range(df.shape[1] - 1, -1, -1):
@@ -103,7 +153,10 @@ def parse_cash_expense(
                 note_col = c
                 break
 
-    records: list[dict] = []
+    cash_records: list[dict] = []
+    check_records: list[dict] = []
+    seen_check: set[tuple[str, str, str, int]] = set()
+
     for r in range(1, df.shape[0]):
         month = _to_int(df.iloc[r, 0])
         day = _to_int(df.iloc[r, 1])
@@ -116,25 +169,41 @@ def parse_cash_expense(
         ad_y = roc_year + 1911
         try:
             expense_date = f"{ad_y:04d}-{month:02d}-{day:02d}"
-            # 驗證日期合法
             pd.Timestamp(expense_date)
         except Exception:
             continue
         accrual_month = f"{ad_y:04d}-{month:02d}-01"
-        note = _norm_str(df.iloc[r, note_col]) if note_col is not None else None
+        row_note = _norm_str(df.iloc[r, note_col]) if note_col is not None else None
 
-        rec = {
-            "clinic_id": clinic_id,
-            "expense_date": expense_date,
-            "description": desc,
-            "amount": amount,
-            "note": note,
-            "accrual_month": accrual_month,
-        }
-        rec["raw_row_hash"] = _row_hash_cash(rec)
-        records.append(rec)
+        if _CHECK_PREFIX_RE.match(desc):
+            # 分流到 check_expense
+            vendor, bank, info_note = _parse_check_desc(desc)
+            note_text = "；".join(filter(None, [info_note, row_note])) or None
+            key = (accrual_month, vendor, bank, amount)
+            if key in seen_check:
+                # 同月份多筆同廠商同銀行同金額：合併避免 UNIQUE 衝突
+                continue
+            seen_check.add(key)
+            check_records.append({
+                "issue_month": accrual_month,
+                "vendor": vendor,
+                "amount": amount,
+                "bank": bank,
+                "note": note_text,
+            })
+        else:
+            rec = {
+                "clinic_id": clinic_id,
+                "expense_date": expense_date,
+                "description": desc,
+                "amount": amount,
+                "note": row_note,
+                "accrual_month": accrual_month,
+            }
+            rec["raw_row_hash"] = _row_hash_cash(rec)
+            cash_records.append(rec)
 
-    return records
+    return cash_records, check_records
 
 
 # ─── 合約支出（橫向月度表 → 長表）─────────────────────

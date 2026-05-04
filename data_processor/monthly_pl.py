@@ -40,20 +40,29 @@ from datetime import date
 
 @dataclass
 class ZepeiMonthly:
-    """澤沛實帳收支"""
+    """
+    澤沛實帳收支（院長 2026-05-04 重做）
+    完全記錄帳戶內容，每一筆都歸類到適當項目，不忽略任何 transaction。
+    澤沛沒有混到私人財務，全部歸屬診所。
+    """
     service_month: str
     # 玉山健保戶
-    nhi_inflow: int = 0          # 健保醫療給付
-    salary_outflow_esun: int = 0  # 玉山薪資轉帳
-    nhi_premium_outflow: int = 0  # 玉山健保扣繳/勞保
-    # 中信進出戶
-    cross_inflow: int = 0        # 跨診所匯入（澤豐→澤沛）
-    cash_deposit: int = 0        # 現金存入
-    contract_outflow: int = 0    # 轉廠商（合約）
-    cross_outflow: int = 0       # 跨診所匯出（澤沛→澤豐）
-    # 系統推算（中信看不到逐筆）
-    cash_expense_total: int = 0  # 該月 cash_expense
-    contract_expense_total: int = 0  # 該月 contract_expense
+    nhi_inflow: int = 0           # 健保醫療給付
+    other_esun_in: int = 0        # 玉山其他入帳（極少見）
+    salary_outflow_esun: int = 0   # 薪資轉帳
+    other_esun_out: int = 0       # 玉山其他支出
+    # 中信進出戶（全部記錄）
+    cross_inflow: int = 0          # 澤豐→澤沛 跨診所匯入
+    cash_deposit: int = 0          # 現金存入
+    other_ctbc_in: int = 0         # 其他中信入帳（廠商匯款等）
+    contract_outflow: int = 0      # 轉合約廠商
+    cross_outflow: int = 0         # 澤沛→澤豐 跨診所匯出
+    rent_outflow: int = 0          # 房租支出
+    consulting_outflow: int = 0    # 管理顧問費
+    other_ctbc_out: int = 0        # 其他中信支出
+    # 系統推算（補充）
+    cash_expense_total: int = 0    # 該月 cash_expense（逐筆現金支出）
+    contract_expense_total: int = 0  # 該月 contract_expense（合約彙總）
     # 手 KEY
     misc_income: int = 0
     misc_expense: int = 0
@@ -61,17 +70,19 @@ class ZepeiMonthly:
     @property
     def total_income(self) -> int:
         return (
-            self.nhi_inflow + self.cross_inflow + self.cash_deposit
+            self.nhi_inflow + self.other_esun_in
+            + self.cross_inflow + self.cash_deposit + self.other_ctbc_in
             + self.misc_income
         )
 
     @property
     def total_expense(self) -> int:
-        # 玉山扣款（薪資+健保）+ 中信外流（合約+跨診所）+ 手KEY支出
-        # cash_expense_total / contract_expense_total 是「逐筆記帳彙總」當主軸
+        # 銀行直接扣款 + 系統彙總（cash/contract_expense_total）+ 手KEY 支出
+        # 注意：銀行扣款（薪資/合約轉帳/跨診所匯出/房租/顧問費/其他）+ 系統彙總
         return (
-            self.salary_outflow_esun + self.nhi_premium_outflow
+            self.salary_outflow_esun + self.other_esun_out
             + self.contract_outflow + self.cross_outflow
+            + self.rent_outflow + self.consulting_outflow + self.other_ctbc_out
             + self.cash_expense_total
             + self.misc_expense
         )
@@ -210,7 +221,7 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
     m = ZepeiMonthly(service_month=service_month)
     next_month = _next_month(service_month)
 
-    # 玉山健保戶
+    # ─── 玉山健保戶：每筆都記 ───
     esun_id = _get_bank_account_id(sb, clinic_id, "健保戶")
     if esun_id:
         for tx in _fetch_bank_transactions(sb, esun_id, service_month):
@@ -219,15 +230,16 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             if amt > 0:
                 if "健保醫療給付" in summary:
                     m.nhi_inflow += amt
-                # 其他玉山入帳不算（未明確屬診所收入）
+                else:
+                    m.other_esun_in += amt  # 不忽略
             else:
                 a = -amt
                 if "薪資" in summary:
                     m.salary_outflow_esun += a
-                elif "健保" in summary or "勞保" in summary:
-                    m.nhi_premium_outflow += a
+                else:
+                    m.other_esun_out += a  # 不忽略（手續費等也記）
 
-    # 中信進出戶
+    # ─── 中信進出戶：每筆都記 ───
     ctbc_id = _get_bank_account_id(sb, clinic_id, "進出戶")
     if ctbc_id:
         for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
@@ -235,17 +247,29 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             summary = (tx.get("summary") or "")
             cp = (tx.get("counterparty") or "")
             note = (tx.get("note") or "")
+            blob = f"{note}|{cp}|{summary}"
             if amt > 0:
-                if "澤豐" in note or "澤豐" in cp:
+                if "澤豐" in blob:
                     m.cross_inflow += amt
                 elif "現金" in summary or "存款機" in summary:
                     m.cash_deposit += amt
+                else:
+                    m.other_ctbc_in += amt  # 廠商匯款等
             else:
                 a = -amt
-                if "澤豐" in note or "澤豐" in cp:
+                if "澤豐" in blob:
                     m.cross_outflow += a
-                elif any(k in note for k in ("莊松榮", "港香蘭", "天一", "駿賀", "大墩", "順天", "簽口")):
+                elif "房租" in note or "房租" in cp:
+                    m.rent_outflow += a
+                elif "管理" in note or "顧問" in note or "管理費" in note:
+                    m.consulting_outflow += a
+                elif any(k in blob for k in (
+                    "莊松榮", "港香蘭", "天一", "駿賀", "大墩",
+                    "順天", "簽口", "力至高", "科達",
+                )):
                     m.contract_outflow += a
+                else:
+                    m.other_ctbc_out += a  # 不忽略
 
     # cash_expense / contract_expense 當月彙總（澤沛清楚的支出主軸）
     cash = (
