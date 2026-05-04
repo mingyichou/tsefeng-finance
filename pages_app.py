@@ -263,12 +263,13 @@ def page_overview():
     st.title("💰 月度實帳收支總覽")
 
     from data_processor.monthly_pl import (
-        calculate_both_clinics, list_available_months,
+        calculate_both_clinics, calculate_check_expense_month,
+        list_available_months,
     )
 
     st.caption(
         "🗓️ **實帳模式**：每筆按實際入帳/出帳月份歸屬（不是業績服務月）。"
-        "業績按服務月歸屬請見「業績儀表板」頁。"
+        "業績按服務月歸屬請見「業績儀表板」。"
     )
 
     sb = get_authed_client()
@@ -285,114 +286,134 @@ def page_overview():
 
     with st.spinner("計算中..."):
         pl_fz, pl_fp = calculate_both_clinics(sb, service_month)
+        check = calculate_check_expense_month(sb, service_month)
 
-    # ─── KPI 卡片 ───
+    # ════════════════════════════════════════════════════════
+    # 1. 澤豐中醫診所實帳收支（總院，置頂）
+    # ════════════════════════════════════════════════════════
     st.divider()
-    total_income = pl_fz.total_income + pl_fp.total_income
-    total_expense = pl_fz.total_expense + pl_fp.total_expense
-    total_net = total_income - total_expense
+    st.markdown("# 🏥 澤豐中醫診所實帳收支")
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("總收入", f"${total_income:,}")
-    k2.metric("總支出", f"${total_expense:,}")
-    k3.metric("淨利", f"${total_net:,}",
-              delta=f"{total_net/total_income:.1%}" if total_income else "N/A")
-    k4.metric(
-        "澤豐中信餘額（月末）",
-        f"${pl_fz.x11_current_balance:,}",
-        delta=f"從 {pl_fz.x1_prev_balance:,} → {pl_fz.x11_current_balance:,}",
+    k1, k2, k3 = st.columns(3)
+    k1.metric("總收入", f"NT$ {pl_fz.total_income:,}")
+    k2.metric("總支出", f"NT$ {pl_fz.total_expense:,}")
+    k3.metric(
+        "淨利", f"NT$ {pl_fz.net:,}",
+        delta=(
+            f"{pl_fz.net/pl_fz.total_income:.1%}"
+            if pl_fz.total_income else None
+        ),
     )
 
-    # ─── 澤沛實帳 ───
-    st.divider()
-    st.subheader("🏥 澤沛實帳")
-    st.caption("玉山健保戶 + 中信進出戶逐筆按月聚合。")
+    with st.expander("📑 澤豐收支細項（玉山健保戶 + 中信進出戶 + 隱形支出）"):
+        fz_rows = [
+            ("收入 - 玉山", "健保醫療給付", pl_fz.nhi_inflow),
+            ("收入 - 中信", "x6 澤沛→澤豐金流（前月）", pl_fz.x6_zepei_to_zefeng),
+            ("收入 - 中信", "x8 現金存入（前月診所現金）", pl_fz.x8_zefeng_cash_revenue),
+            ("收入 - 中信", "x10 手KEY 非常規收入", pl_fz.misc_income_x10),
+            ("支出 - 玉山", "薪資轉帳（含醫師+員工）", pl_fz.salary_outflow_esun),
+            ("支出 - 玉山", "健保/勞保代繳", pl_fz.nhi_premium_outflow),
+            ("支出 - 中信", "x10 手KEY 非常規支出", pl_fz.misc_expense_x10),
+            ("支出 - 隱形", "x3 澤豐現金支出（cash_expense）", pl_fz.x3_zefeng_cash_expense),
+            ("支出 - 隱形", "x9 編制外人力（謝松坊）", pl_fz.x9_offsite_staff_pay),
+            ("支出 - 隱形", "x12 澤豐合約支出", pl_fz.x12_zefeng_contract_expense),
+            ("資訊", "中信前月餘額 (x1)", pl_fz.x1_prev_balance),
+            ("資訊", "中信當月餘額 (x11)", pl_fz.x11_current_balance),
+        ]
+        st.dataframe(
+            pd.DataFrame(fz_rows, columns=["類別", "項目", "金額"]),
+            use_container_width=True, hide_index=True,
+        )
 
-    fp_rows = [
-        ("收入", "玉山健保入帳", pl_fp.nhi_inflow),
-        ("收入", "中信跨診所匯入", pl_fp.cross_inflow),
-        ("收入", "中信現金存入", pl_fp.cash_deposit),
-        ("收入", "其他入帳", pl_fp.other_income),
-        ("收入", "非常規收入(手KEY)", pl_fp.misc_income),
-        ("收入", "▶ 收入合計", pl_fp.total_income),
-        ("支出", "員工薪資", pl_fp.staff_salary),
-        ("支出", "醫師薪資", pl_fp.doctor_salary),
-        ("支出", "現金支出彙總", pl_fp.cash_expense_total),
-        ("支出", "合約支出彙總", pl_fp.contract_expense_total),
-        ("支出", "非常規支出(手KEY)", pl_fp.misc_expense),
-        ("支出", "▶ 支出合計", pl_fp.total_expense),
-        ("盈餘", "▶ 淨利", pl_fp.net),
-    ]
-    st.dataframe(
-        pd.DataFrame(fp_rows, columns=["類別", "項目", "金額"]),
-        use_container_width=True, hide_index=True,
+    # ════════════════════════════════════════════════════════
+    # 2. 澤沛中醫診所實帳收支
+    # ════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("# 🏥 澤沛中醫診所實帳收支")
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("總收入", f"NT$ {pl_fp.total_income:,}")
+    k2.metric("總支出", f"NT$ {pl_fp.total_expense:,}")
+    k3.metric(
+        "淨利", f"NT$ {pl_fp.net:,}",
+        delta=(
+            f"{pl_fp.net/pl_fp.total_income:.1%}"
+            if pl_fp.total_income else None
+        ),
     )
 
-    with st.expander("📑 澤沛玉山+中信銀行交易 raw"):
-        st.caption("供院長對帳用。系統有歸不到類的會列在「其他」項。")
+    with st.expander("📑 澤沛收支細項"):
+        fp_rows = [
+            ("收入 - 玉山", "健保醫療給付", pl_fp.nhi_inflow),
+            ("收入 - 中信", "跨診所匯入", pl_fp.cross_inflow),
+            ("收入 - 中信", "現金存入", pl_fp.cash_deposit),
+            ("收入", "非常規收入 (手KEY)", pl_fp.misc_income),
+            ("支出 - 玉山", "薪資轉帳", pl_fp.salary_outflow_esun),
+            ("支出 - 玉山", "健保/勞保代繳", pl_fp.nhi_premium_outflow),
+            ("支出 - 中信", "合約轉廠商", pl_fp.contract_outflow),
+            ("支出 - 中信", "跨診所匯出", pl_fp.cross_outflow),
+            ("支出 - 彙總", "現金支出（cash_expense）", pl_fp.cash_expense_total),
+            ("支出 - 彙總", "合約支出（contract_expense）", pl_fp.contract_expense_total),
+            ("支出", "非常規支出 (手KEY)", pl_fp.misc_expense),
+        ]
+        st.dataframe(
+            pd.DataFrame(fp_rows, columns=["類別", "項目", "金額"]),
+            use_container_width=True, hide_index=True,
+        )
 
-    # ─── 澤豐實帳（11+1 變數）───
+    # ════════════════════════════════════════════════════════
+    # 3. 支票支出（兩家共用，獨立項目，不入合計）
+    # ════════════════════════════════════════════════════════
     st.divider()
-    st.subheader("🏥 澤豐實帳（12 變數規則）")
+    st.markdown("# 🧾 支票支出（獨立項目）")
     st.caption(
-        "x5/x6/x7/x8 是「下月入帳屬於前月」性質（豐沛金流來回款）。"
-        "目前系統按入帳月份顯示，跨月歸屬需另一頁業績分析。"
+        "兩家診所共用支票戶（玉山+中信）。獨立顯示，**不入兩家收支淨利合計**。"
+        "院長後續可能用此替換澤豐合約支出做 B 版總院月平衡表。"
     )
 
-    fz_rows = [
-        # 玉山
-        ("玉山健保戶", "健保醫療給付入帳", pl_fz.nhi_inflow),
-        ("玉山健保戶", "其他入帳", pl_fz.other_esun_in),
-        ("玉山健保戶", "薪資轉帳支出", pl_fz.salary_outflow_esun),
-        ("玉山健保戶", "健保/勞保代繳", pl_fz.nhi_premium_outflow),
-        ("玉山健保戶", "其他支出", pl_fz.other_esun_out),
-        # 中信 11 變數
-        ("中信進出戶", "x1 前月餘額", pl_fz.x1_prev_balance),
-        ("中信進出戶", "x2 玉山健保轉入", pl_fz.x2_zefeng_inflow),
-        ("中信進出戶", "x5+x6+x7 澤沛來款（前月歸屬）", pl_fz.x6_fengpei_settle),
-        ("中信進出戶", "x8 澤豐現金存入（前月歸屬）", pl_fz.x8_zefeng_cash_revenue),
-        ("中信進出戶", "x10 手KEY 非常規收入", pl_fz.misc_income_x10),
-        ("中信進出戶", "x10 手KEY 非常規支出", pl_fz.misc_expense_x10),
-        ("中信進出戶", "x11 當月餘額", pl_fz.x11_current_balance),
-        # 隱形支出
-        ("隱形支出", "x3 澤豐現金支出", pl_fz.x3_zefeng_cash_expense),
-        ("隱形支出", "x4 澤沛現金支出（澤豐代墊）", pl_fz.x4_zepei_cash_expense_proxy),
-        ("隱形支出", "x9 編制外人力（謝松坊）", pl_fz.x9_offsite_staff_pay),
-        ("隱形支出", "x12 澤豐合約支出", pl_fz.x12_zefeng_contract_expense),
-        # 系統計算
-        ("系統計算", "員工薪資（不含 x9）", pl_fz.staff_salary),
-        ("系統計算", "醫師薪資", pl_fz.doctor_salary),
-        # 合計
-        ("合計", "▶ 總收入", pl_fz.total_income),
-        ("合計", "▶ 總支出", pl_fz.total_expense),
-        ("合計", "▶ 淨利", pl_fz.net),
-    ]
-    st.dataframe(
-        pd.DataFrame(fz_rows, columns=["類別", "項目", "金額"]),
-        use_container_width=True, hide_index=True,
-    )
+    k1, k2 = st.columns(2)
+    k1.metric("當月支票合計", f"NT$ {check.total:,}")
+    k2.metric("筆數", f"{len(check.raw_items)}")
 
-    # ─── 12 月趨勢圖 ───
+    if check.raw_items:
+        with st.expander("📑 支票明細（廠商、銀行、金額）"):
+            df_chk = pd.DataFrame(check.raw_items)
+            cols = [c for c in ["vendor", "amount", "bank", "note"] if c in df_chk.columns]
+            st.dataframe(df_chk[cols], use_container_width=True, hide_index=True)
+
+            st.markdown("**按廠商：**")
+            vd = pd.DataFrame(
+                [{"廠商": v, "合計": a} for v, a in check.by_vendor.items()]
+            ).sort_values("合計", ascending=False)
+            st.dataframe(vd, use_container_width=True, hide_index=True)
+
+    # ════════════════════════════════════════════════════════
+    # 4. 12 月淨利趨勢（不含支票）
+    # ════════════════════════════════════════════════════════
     st.divider()
-    st.subheader("📈 月度淨利趨勢")
+    st.markdown("## 📈 月度淨利趨勢（合計不含支票，支票獨立）")
     trend_data = []
+    chk_data = []
     for m in sorted(months)[-12:]:
         try:
             tfz, tfp = calculate_both_clinics(sb, m)
+            tchk = calculate_check_expense_month(sb, m)
             trend_data.append({
                 "月份": m[:7],
                 "澤豐淨利": tfz.net,
                 "澤沛淨利": tfp.net,
-                "合計": tfz.net + tfp.net,
+                "合計（不含支票）": tfz.net + tfp.net,
             })
+            chk_data.append({"月份": m[:7], "支票支出": tchk.total})
         except Exception:
             continue
+
     if trend_data:
         import altair as alt
         df_t = pd.DataFrame(trend_data)
         df_long = df_t.melt(
             id_vars=["月份"],
-            value_vars=["澤豐淨利", "澤沛淨利", "合計"],
+            value_vars=["澤豐淨利", "澤沛淨利", "合計（不含支票）"],
             var_name="診所", value_name="淨利",
         )
         chart = alt.Chart(df_long).mark_line(point=True).encode(
@@ -400,20 +421,32 @@ def page_overview():
             y=alt.Y("淨利:Q"),
             color="診所:N",
             tooltip=["月份", "診所", alt.Tooltip("淨利:Q", format=",")],
-        ).properties(height=350)
+        ).properties(height=300, title="淨利趨勢")
         st.altair_chart(chart, use_container_width=True)
+
+        if chk_data:
+            df_chk = pd.DataFrame(chk_data)
+            chart_chk = alt.Chart(df_chk).mark_bar(color="#FFA07A").encode(
+                x=alt.X("月份:N", sort="ascending"),
+                y=alt.Y("支票支出:Q"),
+                tooltip=["月份", alt.Tooltip("支票支出:Q", format=",")],
+            ).properties(height=200, title="支票支出（獨立）")
+            st.altair_chart(chart_chk, use_container_width=True)
 
     with st.expander("ℹ️ 計算規則說明"):
         st.markdown("""
-**澤沛**（簡單）：玉山健保戶 + 中信進出戶逐筆按 `transaction_date` 月份聚合。
+**澤豐中醫診所**（精簡）：
+- 收入：玉山「健保醫療給付」+ 中信 x6（澤沛來款）+ x8（現金存入）+ x10（手KEY收入）
+- 支出：玉山薪資轉帳 + 玉山健保扣繳 + x3（澤豐現金）+ x9（謝松坊）+ x12（澤豐合約）+ x10（手KEY支出）
+- ⛔ 排除轉到 808/0000668979072975 周院長個人帳戶的款項
+- ⛔ 不重複算 staff_salary_summary（玉山薪資轉帳已含）
 
-**澤豐**（12 變數）：
-- 玉山健保戶逐筆 + 中信進出戶 11 變數推斷
-- x3/x4/x9 是「中信看不到逐筆」的隱形支出，從其他 source 聚合
-- x12 為澤豐合約支出（從 contract_expense 表）
+**澤沛中醫診所**：玉山健保戶 + 中信進出戶逐筆按月聚合。
 
-**注意：** x5/x6/x7/x8 院長指示「下月入帳屬前月」邏輯尚未實作，
-目前按實際入帳月份顯示。後續做業績分析頁時會用「跨月歸屬」邏輯。
+**支票支出**：兩家共用，獨立顯示，不入合計趨勢。
+
+**已知未實作**：x5/x6/x7/x8 跨月歸屬「下月入帳=前月收入」邏輯，
+目前按實際入帳月份顯示。業績分析頁會用跨月歸屬。
 """)
 
 
