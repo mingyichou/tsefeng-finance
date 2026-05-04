@@ -315,8 +315,9 @@ def page_overview():
             ("支出 - 玉山", "健保/勞保代繳", pl_fz.nhi_premium_outflow),
             ("支出 - 中信", "x10 手KEY 非常規支出", pl_fz.misc_expense_x10),
             ("支出 - 隱形", "x3 澤豐現金支出（cash_expense）", pl_fz.x3_zefeng_cash_expense),
-            ("支出 - 隱形", "x9 編制外人力（謝松坊）", pl_fz.x9_offsite_staff_pay),
+            ("支出 - 隱形", "x9 編制外人力（謝松坊，前月薪）", pl_fz.x9_offsite_staff_pay),
             ("支出 - 隱形", "x12 澤豐合約支出", pl_fz.x12_zefeng_contract_expense),
+            ("支出 - 隱形", "x13 周院長薪資（兩院總和）", pl_fz.x13_zhou_doctor_salary),
         ]
         st.dataframe(
             pd.DataFrame(fz_rows, columns=["類別", "項目", "金額"]),
@@ -981,9 +982,14 @@ def _section_cash_expense():
         "其他歸 cash_expense。**不需另外上傳支票檔。**"
     )
 
+    st.info(
+        "ℹ️ **澤沛現金支出由系統從澤沛中信交易自動辨識**（標籤如「沛02月現金支出」），"
+        "不需上傳檔案。本區僅供澤豐使用。"
+    )
+
     col1, col2, col3 = st.columns([1, 1, 3])
     with col1:
-        clinic_choice = st.radio("診所", ["澤豐", "澤沛"], key="cash_exp_clinic")
+        clinic_choice = st.radio("診所", ["澤豐"], key="cash_exp_clinic")
     with col2:
         roc_year = st.number_input(
             "民國年", min_value=110, max_value=130, value=115, step=1,
@@ -1089,9 +1095,14 @@ def _section_contract_expense():
         "(月份 × 廠商) 的長表逐筆寫入 contract_expense。"
     )
 
+    st.info(
+        "ℹ️ **澤沛合約支出由系統從澤沛中信交易自動辨識**（標籤如「沛02月合約」），"
+        "不需上傳檔案。本區僅供澤豐使用。"
+    )
+
     col1, col2 = st.columns([1, 4])
     with col1:
-        clinic_choice = st.radio("診所", ["澤豐", "澤沛"], key="contract_exp_clinic")
+        clinic_choice = st.radio("診所", ["澤豐"], key="contract_exp_clinic")
     with col2:
         uploaded = st.file_uploader(
             f"上傳 {clinic_choice} 合約支出 xlsx",
