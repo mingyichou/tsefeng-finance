@@ -268,8 +268,9 @@ def page_overview():
     )
 
     st.caption(
-        "🗓️ **實帳模式**：每筆按實際入帳/出帳月份歸屬（不是業績服務月）。"
-        "業績按服務月歸屬請見「業績儀表板」。"
+        "🗓️ **實帳模式**：N 月帳上實際發生的款項記在 N 月。"
+        "標註「歸屬：前月」的款項屬於前月損益（之後另做月度損益分析），"
+        "**不**影響本月實帳合計。"
     )
 
     sb = get_authed_client()
@@ -305,26 +306,77 @@ def page_overview():
         ),
     )
 
-    with st.expander("📑 澤豐收支細項"):
-        fz_rows = [
-            ("收入 - 玉山", "健保醫療給付", pl_fz.nhi_inflow),
-            ("收入 - 中信", "x5 澤沛現金支出結算（前月）", pl_fz.x5_zepei_cash_settle),
-            ("收入 - 中信", "x6 豐沛金流結算（前月）", pl_fz.x6_fengpei_settle),
-            ("收入 - 中信", "x7 澤沛合約結算（前月）", pl_fz.x7_zepei_contract_settle),
-            ("收入 - 中信", "x8 現金存入（前月診所現金）", pl_fz.x8_zefeng_cash_revenue),
-            ("收入 - 中信", "x10 手KEY 非常規收入", pl_fz.misc_income_x10),
-            ("支出 - 玉山", "薪資轉帳（含醫師+員工）", pl_fz.salary_outflow_esun),
-            ("支出 - 玉山", "健保/勞保代繳", pl_fz.nhi_premium_outflow),
-            ("支出 - 中信", "x10 手KEY 非常規支出", pl_fz.misc_expense_x10),
-            ("支出 - 隱形", "x3 澤豐現金支出（cash_expense）", pl_fz.x3_zefeng_cash_expense),
-            ("支出 - 隱形", "x9 編制外人力（謝松坊，前月薪）", pl_fz.x9_offsite_staff_pay),
-            ("支出 - 隱形", "x12 澤豐合約支出", pl_fz.x12_zefeng_contract_expense),
-            ("支出 - 隱形", "x13 周院長薪資（兩院總和）", pl_fz.x13_zhou_doctor_salary),
-        ]
-        st.dataframe(
-            pd.DataFrame(fz_rows, columns=["類別", "項目", "金額"]),
-            use_container_width=True, hide_index=True,
-        )
+    _BANK_COLS = [
+        "transaction_date", "summary", "counterparty",
+        "amount", "note", "attribution_month",
+    ]
+
+    def _show_items(items, columns=None):
+        if not items:
+            return
+        df = pd.DataFrame(items)
+        if columns:
+            cols = [c for c in columns if c in df.columns]
+            df = df[cols]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "玉山健保戶逐筆，排除轉到周院長個人 668979072975 與澤豐自家中信 0347940007803；"
+        "中信只取 x6 豐沛金流入帳 + x8 現金存入；"
+        "隱形支出 x3 / x9 / x12 / x13；x10 手 KEY 逐筆。"
+    )
+
+    st.markdown("### 📥 收入")
+    fz_in_summary = pd.DataFrame([
+        {"項目": "玉山逐筆入帳", "小計": pl_fz.esun_inflow_total, "歸屬": "本月"},
+        {"項目": "x6 豐沛金流（澤沛→澤豐）", "小計": pl_fz.x6_fengpei_settle, "歸屬": "前月"},
+        {"項目": "x8 澤豐現金入帳", "小計": pl_fz.x8_zefeng_cash_revenue, "歸屬": "前月"},
+        {"項目": "x10 手 KEY 收入", "小計": pl_fz.x10_income_total, "歸屬": "本月"},
+    ])
+    st.dataframe(fz_in_summary, use_container_width=True, hide_index=True)
+
+    if pl_fz.esun_inflow_items:
+        with st.expander(f"📑 玉山入帳明細（{len(pl_fz.esun_inflow_items)} 筆）"):
+            _show_items(pl_fz.esun_inflow_items, _BANK_COLS)
+    if pl_fz.x6_items:
+        with st.expander(f"📑 x6 豐沛金流明細（{len(pl_fz.x6_items)} 筆，歸屬前月）"):
+            _show_items(pl_fz.x6_items, _BANK_COLS)
+    if pl_fz.x8_items:
+        with st.expander(f"📑 x8 現金存入明細（{len(pl_fz.x8_items)} 筆，歸屬前月）"):
+            _show_items(pl_fz.x8_items, _BANK_COLS)
+    if pl_fz.x10_income_items:
+        with st.expander(f"📑 x10 手 KEY 收入明細（{len(pl_fz.x10_income_items)} 筆）"):
+            _show_items(pl_fz.x10_income_items)
+
+    st.markdown("### 📤 支出")
+    fz_ex_summary = pd.DataFrame([
+        {"項目": "玉山逐筆出帳", "小計": pl_fz.esun_outflow_total, "歸屬": "本月"},
+        {"項目": "x3 澤豐現金支出", "小計": pl_fz.x3_zefeng_cash_expense, "歸屬": "本月"},
+        {"項目": "x9 謝松坊薪資", "小計": pl_fz.x9_offsite_staff_pay, "歸屬": "前月"},
+        {"項目": "x10 手 KEY 支出", "小計": pl_fz.x10_expense_total, "歸屬": "本月"},
+        {"項目": "x12 澤豐合約支出", "小計": pl_fz.x12_zefeng_contract_expense, "歸屬": "本月"},
+        {"項目": "x13 周院長薪資（兩院總和）", "小計": pl_fz.x13_zhou_doctor_salary, "歸屬": "前月"},
+    ])
+    st.dataframe(fz_ex_summary, use_container_width=True, hide_index=True)
+
+    if pl_fz.esun_outflow_items:
+        with st.expander(f"📑 玉山出帳明細（{len(pl_fz.esun_outflow_items)} 筆）"):
+            _show_items(pl_fz.esun_outflow_items, _BANK_COLS)
+    if pl_fz.x3_items:
+        with st.expander(f"📑 x3 澤豐現金支出明細（{len(pl_fz.x3_items)} 筆）"):
+            _show_items(pl_fz.x3_items)
+    if pl_fz.x9_items:
+        with st.expander("📑 x9 謝松坊薪資明細（歸屬前月）"):
+            _show_items(pl_fz.x9_items)
+    if pl_fz.x10_expense_items:
+        with st.expander(f"📑 x10 手 KEY 支出明細（{len(pl_fz.x10_expense_items)} 筆）"):
+            _show_items(pl_fz.x10_expense_items)
+    if pl_fz.x12_items:
+        with st.expander(f"📑 x12 澤豐合約支出明細（{len(pl_fz.x12_items)} 筆）"):
+            _show_items(pl_fz.x12_items)
+    if pl_fz.x13_items:
+        with st.expander("📑 x13 周院長薪資明細（歸屬前月）"):
+            _show_items(pl_fz.x13_items)
 
     # ════════════════════════════════════════════════════════
     # 2. 澤沛中醫診所實帳收支
@@ -343,30 +395,54 @@ def page_overview():
         ),
     )
 
-    with st.expander("📑 澤沛收支細項（完整記錄帳戶內容）"):
-        fp_rows = [
-            ("收入 - 玉山", "健保醫療給付", pl_fp.nhi_inflow),
-            ("收入 - 玉山", "其他入帳", pl_fp.other_esun_in),
-            ("收入 - 中信", "跨診所匯入（澤豐→澤沛）", pl_fp.cross_inflow),
-            ("收入 - 中信", "現金存入", pl_fp.cash_deposit),
-            ("收入 - 中信", "其他入帳（廠商匯款等）", pl_fp.other_ctbc_in),
-            ("收入", "非常規收入 (手KEY)", pl_fp.misc_income),
-            ("支出 - 玉山", "薪資轉帳", pl_fp.salary_outflow_esun),
-            ("支出 - 玉山", "其他支出", pl_fp.other_esun_out),
-            ("支出 - 中信", "合約轉廠商", pl_fp.contract_outflow),
-            ("支出 - 中信", "跨診所匯出（澤沛→澤豐）", pl_fp.cross_outflow),
-            ("支出 - 中信", "房租", pl_fp.rent_outflow),
-            ("支出 - 中信", "管理顧問費", pl_fp.consulting_outflow),
-            ("支出 - 中信", "其他支出", pl_fp.other_ctbc_out),
-            ("支出 - 結算（屬該月）", "現金支出（澤豐代墊）", pl_fp.cash_expense_total),
-            ("支出 - 結算（屬該月）", "合約支出（澤豐代墊）", pl_fp.contract_expense_total),
-            ("支出 - 結算（屬該月）", "豐沛金流結算款", pl_fp.fengpei_outflow),
-            ("支出", "非常規支出 (手KEY)", pl_fp.misc_expense),
-        ]
-        st.dataframe(
-            pd.DataFrame(fp_rows, columns=["類別", "項目", "金額"]),
-            use_container_width=True, hide_index=True,
-        )
+    st.caption(
+        "玉山 + 中信進出戶逐筆全記（澤沛沒混到私人財務）。"
+        "中信 3 筆固定 settle（x5 現金 / x6 豐沛金流 / x7 合約）已標註分類，"
+        "歸屬前月；月份用實際出帳日（不再用標籤月）。"
+    )
+
+    st.markdown("### 📥 收入")
+    fp_in_summary = pd.DataFrame([
+        {"項目": "玉山逐筆入帳", "小計": pl_fp.esun_inflow_total, "歸屬": "本月"},
+        {"項目": "中信逐筆入帳", "小計": pl_fp.ctbc_inflow_total, "歸屬": "本月"},
+        {"項目": "x10 手 KEY 收入", "小計": pl_fp.x10_income_total, "歸屬": "本月"},
+    ])
+    st.dataframe(fp_in_summary, use_container_width=True, hide_index=True)
+
+    if pl_fp.esun_inflow_items:
+        with st.expander(f"📑 玉山入帳明細（{len(pl_fp.esun_inflow_items)} 筆）"):
+            _show_items(pl_fp.esun_inflow_items, _BANK_COLS)
+    if pl_fp.ctbc_inflow_items:
+        with st.expander(f"📑 中信入帳明細（{len(pl_fp.ctbc_inflow_items)} 筆）"):
+            _show_items(pl_fp.ctbc_inflow_items, _BANK_COLS)
+    if pl_fp.x10_income_items:
+        with st.expander(f"📑 x10 手 KEY 收入明細（{len(pl_fp.x10_income_items)} 筆）"):
+            _show_items(pl_fp.x10_income_items)
+
+    st.markdown("### 📤 支出")
+    fp_ex_summary = pd.DataFrame([
+        {"項目": "玉山逐筆出帳", "小計": pl_fp.esun_outflow_total, "歸屬": "本月"},
+        {"項目": "中信逐筆出帳（含 3 筆 settle）", "小計": pl_fp.ctbc_outflow_total, "歸屬": "本月"},
+        {"項目": "　└ x5 現金結算（→周院長）", "小計": pl_fp.cash_settle_outflow, "歸屬": "前月"},
+        {"項目": "　└ x6 豐沛金流（→澤豐）", "小計": pl_fp.fengpei_outflow, "歸屬": "前月"},
+        {"項目": "　└ x7 合約結算（→周院長）", "小計": pl_fp.contract_settle_outflow, "歸屬": "前月"},
+        {"項目": "x10 手 KEY 支出", "小計": pl_fp.x10_expense_total, "歸屬": "本月"},
+    ])
+    st.dataframe(fp_ex_summary, use_container_width=True, hide_index=True)
+    st.caption("ℹ️ x5 / x6 / x7 已包含於「中信逐筆出帳」中，分類項僅供識別不重複加總。")
+
+    if pl_fp.esun_outflow_items:
+        with st.expander(f"📑 玉山出帳明細（{len(pl_fp.esun_outflow_items)} 筆）"):
+            _show_items(pl_fp.esun_outflow_items, _BANK_COLS)
+    if pl_fp.ctbc_outflow_items:
+        with st.expander(f"📑 中信出帳明細（{len(pl_fp.ctbc_outflow_items)} 筆，含 settle 標註）"):
+            _show_items(
+                pl_fp.ctbc_outflow_items,
+                ["transaction_date", "summary", "counterparty", "amount", "note", "settle_kind", "attribution_month"],
+            )
+    if pl_fp.x10_expense_items:
+        with st.expander(f"📑 x10 手 KEY 支出明細（{len(pl_fp.x10_expense_items)} 筆）"):
+            _show_items(pl_fp.x10_expense_items)
 
     # ════════════════════════════════════════════════════════
     # 3. 支票支出（兩家共用，獨立項目，不入合計）
@@ -442,18 +518,28 @@ def page_overview():
 
     with st.expander("ℹ️ 計算規則說明"):
         st.markdown("""
-**澤豐中醫診所**（精簡）：
-- 收入：玉山「健保醫療給付」+ 中信 x6（澤沛來款）+ x8（現金存入）+ x10（手KEY收入）
-- 支出：玉山薪資轉帳 + 玉山健保扣繳 + x3（澤豐現金）+ x9（謝松坊）+ x12（澤豐合約）+ x10（手KEY支出）
-- ⛔ 排除轉到 808/0000668979072975 周院長個人帳戶的款項
-- ⛔ 不重複算 staff_salary_summary（玉山薪資轉帳已含）
+**大前提（院長 2026-05-05）**：
 
-**澤沛中醫診所**：玉山健保戶 + 中信進出戶逐筆按月聚合。
+3 個收支主體：周院長個人 / 澤豐中醫診所 / 澤沛中醫診所。
+本頁只算澤豐、澤沛兩家診所的「實帳收支」（N 月帳上發生的款項記在 N 月）。
+跨月歸屬的款項會標註「歸屬：前月」，**不**在本月合計，未來再做月度損益分析。
+
+---
+
+**澤豐中醫診所**：
+- 收入 = 玉山逐筆入帳 + x6 豐沛金流 + x8 現金存入 + x10 手 KEY 收入
+- 支出 = 玉山逐筆出帳 + x3 澤豐現金支出 + x9 謝松坊薪資 + x10 手 KEY 支出 + x12 澤豐合約 + x13 周院長薪資
+- ⛔ 玉山戶排除：轉到 668979072975（周院長個人）、轉到 0347940007803（澤豐自家中信，內部移轉）
+- ⛔ 中信混戶不全抓：只取 x6（澤沛→澤豐豐沛金流）+ x8（現金存入）。其他款項視為周院長個人或無法歸屬
+- 「歸屬前月」：x6 / x8 / x9 / x13（當月帳但實質屬前月損益）
+
+**澤沛中醫診所**：
+- 玉山 + 中信進出戶逐筆全記（澤沛沒混到私人財務）
+- 中信 3 筆固定 settle 用 note 關鍵字分類：x5 現金支出 / x6 豐沛金流 / x7 合約
+- 月份用 transaction_date 當月（不再用標籤月歸屬）
+- x4（澤沛 N-1 月現金支出，由周院長代墊）— 屬周院長個人，不在此記
 
 **支票支出**：兩家共用，獨立顯示，不入合計趨勢。
-
-**已知未實作**：x5/x6/x7/x8 跨月歸屬「下月入帳=前月收入」邏輯，
-目前按實際入帳月份顯示。業績分析頁會用跨月歸屬。
 """)
 
 
