@@ -491,7 +491,7 @@ def calculate_zefeng_monthly(
     # x12 澤豐合約支出
     contract_zf = (
         sb.table("contract_expense")
-        .select("expense_date, vendor, item_label, amount, service_month")
+        .select("service_month, vendor, amount, note")
         .eq("clinic_id", clinic_id).eq("service_month", service_month)
         .execute().data
     )
@@ -499,9 +499,9 @@ def calculate_zefeng_monthly(
         amt = int(r.get("amount") or 0)
         m.x12_zefeng_contract_expense += amt
         m.x12_items.append({
-            "expense_date": r.get("expense_date"),
+            "service_month": r.get("service_month"),
             "vendor": r.get("vendor") or "",
-            "item_label": r.get("item_label") or "",
+            "note": r.get("note") or "",
             "amount": amt,
             "attribution_month": service_month,
         })
