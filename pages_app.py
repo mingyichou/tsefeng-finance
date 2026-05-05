@@ -1154,6 +1154,14 @@ def _section_cash_expense():
         key=f"cash_exp_save_{clinic_choice}",
     ):
         try:
+            # 先清掉舊的「支票-」殘留（避免之前未分流時寫入的紀錄重複計算）
+            cleanup_resp = (
+                sb.table("cash_expense").delete()
+                .eq("clinic_id", clinic_id)
+                .like("description", "支票-%")
+                .execute()
+            )
+            cleaned = len(cleanup_resp.data or [])
             if cash_records:
                 sb.table("cash_expense").upsert(
                     cash_records, on_conflict="raw_row_hash",
@@ -1165,6 +1173,7 @@ def _section_cash_expense():
                 ).execute()
             st.success(
                 f"✅ 寫入：現金 {len(cash_records)} 筆、支票 {len(check_records)} 筆"
+                + (f"（清掉舊支票殘留 {cleaned} 筆）" if cleaned else "")
             )
             st.balloons()
         except Exception as e:

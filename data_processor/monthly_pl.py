@@ -82,6 +82,30 @@ def _is_zefeng_ctbc_internal(counterparty: str) -> bool:
     return ZEFENG_CTBC_TAIL.lstrip("0") in _digits_only(counterparty)
 
 
+def _extract_attr_month_from_desc(desc: str, fallback: str | None = None) -> str | None:
+    """
+    從 manual_annotation.description 或 csv note 抓「11502 / 11504 / 沛N月」格式
+    並轉成 ISO 月份字串（"2026-02-01"）。抓不到回 fallback。
+    """
+    if not desc:
+        return fallback
+    import re
+    s = _normalize(desc)
+    # 「11502」「11504」格式（民國年+月）
+    m = re.search(r"11(\d{2})", s)
+    if m:
+        mo = int(m.group(1))
+        if 1 <= mo <= 12:
+            return f"2026-{mo:02d}-01"
+    # 「沛 N 月」「N 月」格式 — 推測為民國 115 年
+    m = re.search(r"(?:沛|澤沛)?\s*(\d{1,2})\s*月", s)
+    if m:
+        mo = int(m.group(1))
+        if 1 <= mo <= 12:
+            return f"2026-{mo:02d}-01"
+    return fallback
+
+
 # ============================================================================
 # Dataclasses
 # ============================================================================
@@ -425,20 +449,32 @@ def calculate_zefeng_monthly(
         if first:
             m.x1_prev_balance = first[0].get("balance") or 0
 
+        # 預先抓 manual_annotation：判斷哪些「存現」是診所收入（x8）
+        # 規則：scope=診所 + form=存現 + account=澤豐&個人中信 + clinic=澤豐
+        # 比對 (entry_date, amount) 與當月中信入帳；description 含「11502」抽歸屬月
+        ann_cash = (
+            sb.table("manual_annotation")
+            .select("entry_date, amount, description")
+            .eq("scope", "診所").eq("form", "存現")
+            .eq("account", "澤豐&個人中信").eq("clinic_id", clinic_id)
+            .gte("entry_date", service_month).lt("entry_date", next_month)
+            .execute().data
+        )
+        ann_x8_map: dict = {
+            (r["entry_date"], int(r["amount"] or 0)): r for r in ann_cash
+        }
+
         for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
             amt = tx["amount"]
             if amt <= 0:
                 continue
             note = tx.get("note") or ""
-            cp = tx.get("counterparty") or ""
             channel = tx.get("channel") or ""
             summary = tx.get("summary") or ""
 
-            # 是否來自澤沛（用 cp 末段或 note 含「澤沛」）
+            # x6 / x5 / x7 — 用 note 標籤辨識（澤沛主動標記，足以唯一）
             note_n = _normalize(note)
-            is_from_zepei = cp.endswith(ZEPEI_CTBC_TAIL) or "澤沛" in note_n
-            kind = _zepei_settle_kind(note_n) if is_from_zepei else None
-
+            kind = _zepei_settle_kind(note_n)
             if kind == "x6_fengpei":
                 m.x6_fengpei_settle += amt
                 m.x6_items.append(_bank_item(
@@ -449,13 +485,20 @@ def calculate_zefeng_monthly(
                 # 屬周院長個人，澤豐不記（即使物理上入帳）
                 continue
 
-            # x8 現金存入（前月診所現金）— 排除澤沛來款
+            # x8 澤豐現金入帳：必須有 manual_annotation 對應才認列
+            # （澤豐&個人中信戶混了個人存款，無法靠摘要判斷主體）
             if "現金" in summary or "存款機" in channel:
-                if not is_from_zepei:
-                    m.x8_zefeng_cash_revenue += amt
-                    m.x8_items.append(_bank_item(
-                        tx, attribution_month=prev_m,
-                    ))
+                key = (tx.get("transaction_date"), int(amt))
+                ann = ann_x8_map.get(key)
+                if ann is None:
+                    continue  # 無註記 = 視為個人存款，不認列
+                attr = _extract_attr_month_from_desc(
+                    ann.get("description") or "", fallback=prev_m,
+                )
+                m.x8_zefeng_cash_revenue += amt
+                m.x8_items.append(_bank_item(
+                    tx, attribution_month=attr,
+                ))
             # 其他入帳（玉山轉入、個人款項等）一律不記
 
         # 月末餘額
@@ -496,7 +539,8 @@ def calculate_zefeng_monthly(
         .execute().data
     )
     for r in contract_zf:
-        amt = int(r.get("amount") or 0)
+        # int(round(...)) 防 excel 浮點誤差（73963.0 可能被存成 73962.99...）
+        amt = int(round(float(r.get("amount") or 0)))
         m.x12_zefeng_contract_expense += amt
         m.x12_items.append({
             "service_month": r.get("service_month"),

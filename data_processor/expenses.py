@@ -308,7 +308,9 @@ def parse_contract_expense(
                 "clinic_id": clinic_id,
                 "service_month": service_month,
                 "vendor": vendor,
-                "amount": round(amount, 2),
+                # 合約款都是整數 NTD；用 int(round(...)) 避免 excel 浮點誤差
+                # （如 73963.000000001 會被舊邏輯 round to 73963.00 但 int() 截成 73962）
+                "amount": int(round(amount)),
                 "note": None,
             })
 
