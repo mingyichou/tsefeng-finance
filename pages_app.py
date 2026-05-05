@@ -1171,14 +1171,21 @@ def _section_cash_expense():
         key=f"cash_exp_save_{clinic_choice}",
     ):
         try:
-            # 先清掉舊的「支票-」殘留（避免之前未分流時寫入的紀錄重複計算）
-            cleanup_resp = (
-                sb.table("cash_expense").delete()
-                .eq("clinic_id", clinic_id)
-                .like("description", "支票-%")
-                .execute()
+            # 先清掉舊的「支票」開頭殘留（共用 parse 端的 _CHECK_PREFIX_RE，
+            # 抓所有 dash 變形：半形 - / 全形 － / en/em dash / 空格 / 直接括號）
+            from data_processor.expenses import _CHECK_PREFIX_RE
+            existing = (
+                sb.table("cash_expense").select("id, description")
+                .eq("clinic_id", clinic_id).execute().data
             )
-            cleaned = len(cleanup_resp.data or [])
+            stale_ids = [
+                r["id"] for r in existing
+                if _CHECK_PREFIX_RE.match(r.get("description") or "")
+            ]
+            cleaned = 0
+            if stale_ids:
+                sb.table("cash_expense").delete().in_("id", stale_ids).execute()
+                cleaned = len(stale_ids)
             if cash_records:
                 sb.table("cash_expense").upsert(
                     cash_records, on_conflict="raw_row_hash",
