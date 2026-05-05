@@ -1165,40 +1165,65 @@ def _section_cash_expense():
                 use_container_width=True, height=300, hide_index=True,
             )
 
+    # 預先算出本檔涵蓋的月份範圍
+    cover_months = sorted({r["accrual_month"] for r in cash_records}) if cash_records else []
+    cover_chk_months = sorted({r["issue_month"] for r in check_records}) if check_records else []
+    if cover_months:
+        st.warning(
+            f"⚠️ 確認匯入會**整月覆蓋** {clinic_choice} 診所 cash_expense："
+            f"{cover_months[0][:7]} ~ {cover_months[-1][:7]}（共 {len(cover_months)} 個月）。"
+            f"原資料會先全部刪除再寫入，確保描述異動 / 支票分流變更都能完整反映。"
+        )
+
     if st.button(
         f"💾 確認匯入（現金 {len(cash_records)} + 支票 {len(check_records)}）",
         type="primary",
         key=f"cash_exp_save_{clinic_choice}",
     ):
         try:
-            # 先清掉舊的「支票」開頭殘留（共用 parse 端的 _CHECK_PREFIX_RE，
-            # 抓所有 dash 變形：半形 - / 全形 － / en/em dash / 空格 / 直接括號）
-            from data_processor.expenses import _CHECK_PREFIX_RE
-            existing = (
-                sb.table("cash_expense").select("id, description")
-                .eq("clinic_id", clinic_id).execute().data
-            )
-            stale_ids = [
-                r["id"] for r in existing
-                if _CHECK_PREFIX_RE.match(r.get("description") or "")
-            ]
-            cleaned = 0
-            if stale_ids:
-                sb.table("cash_expense").delete().in_("id", stale_ids).execute()
-                cleaned = len(stale_ids)
+            # ─── cash_expense 整月覆蓋：DELETE 涵蓋月份 → INSERT 新 records ───
+            cleaned_cash = 0
+            if cover_months:
+                del_resp = (
+                    sb.table("cash_expense").delete()
+                    .eq("clinic_id", clinic_id)
+                    .gte("accrual_month", cover_months[0])
+                    .lte("accrual_month", cover_months[-1])
+                    .execute()
+                )
+                cleaned_cash = len(del_resp.data or [])
             if cash_records:
-                sb.table("cash_expense").upsert(
-                    cash_records, on_conflict="raw_row_hash",
-                    ignore_duplicates=True,
-                ).execute()
+                sb.table("cash_expense").insert(cash_records).execute()
+
+            # ─── check_expense 兩家共用：清同月份範圍但不在新 records 中的舊 ───
+            cleaned_chk = 0
+            if cover_chk_months:
+                new_keys = {(r["issue_month"], r["vendor"], r["bank"]) for r in check_records}
+                old_chk = (
+                    sb.table("check_expense")
+                    .select("id, issue_month, vendor, bank")
+                    .gte("issue_month", cover_chk_months[0])
+                    .lte("issue_month", cover_chk_months[-1])
+                    .execute().data
+                )
+                stale_chk_ids = [
+                    r["id"] for r in old_chk
+                    if (r["issue_month"], r["vendor"], r["bank"]) not in new_keys
+                ]
+                if stale_chk_ids:
+                    sb.table("check_expense").delete().in_("id", stale_chk_ids).execute()
+                    cleaned_chk = len(stale_chk_ids)
             if check_records:
                 sb.table("check_expense").upsert(
                     check_records, on_conflict="issue_month,vendor,bank",
                 ).execute()
-            st.success(
-                f"✅ 寫入：現金 {len(cash_records)} 筆、支票 {len(check_records)} 筆"
-                + (f"（清掉舊支票殘留 {cleaned} 筆）" if cleaned else "")
-            )
+
+            msg = f"✅ 寫入：現金 {len(cash_records)} 筆、支票 {len(check_records)} 筆"
+            if cleaned_cash:
+                msg += f"（清掉舊現金 {cleaned_cash} 筆）"
+            if cleaned_chk:
+                msg += f"（清掉舊支票 {cleaned_chk} 筆）"
+            st.success(msg)
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
