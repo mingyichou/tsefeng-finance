@@ -315,7 +315,7 @@ def _render_data_health(sb, service_month: str):
     # 其他關鍵資料源
     def _count(table: str, filters: list[tuple[str, str, object]]) -> int:
         q = sb.table(table).select("id", count="exact")
-        for col, op, val in filters:
+        for op, col, val in filters:
             q = getattr(q, op)(col, val)
         return q.execute().count or 0
 
