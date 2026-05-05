@@ -78,16 +78,51 @@ def find_target_sheet(file_obj: IO) -> tuple[str, str]:
     return sn, service_month
 
 
+def list_sheets(file_obj: IO) -> list[tuple[str, str]]:
+    """
+    列出檔案內所有合法薪資 sheet（同月份「-更正」優先取代非更正版本）。
+    回傳 [(sheet_name, service_month_iso), ...]，按月份新到舊排序。
+    """
+    file_obj.seek(0)
+    xl = pd.ExcelFile(file_obj)
+    by_month: dict[tuple[int, int], tuple[bool, str]] = {}
+    for sn in xl.sheet_names:
+        m = SHEET_RE.match(sn)
+        if not m:
+            continue
+        roc_y = int(m.group(1))
+        roc_m = int(m.group(2))
+        corrected = bool(m.group(3))
+        cur = by_month.get((roc_y, roc_m))
+        if cur is None or (corrected and not cur[0]):
+            by_month[(roc_y, roc_m)] = (corrected, sn)
+    out = [
+        (sn, f"{y + 1911:04d}-{mo:02d}-01")
+        for (y, mo), (_, sn) in by_month.items()
+    ]
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+
 def parse_staff_salary(
     file_obj: IO,
     source_filename: str,
     default_clinic_id: int,
     clinic_short_to_id: dict[str, int],
+    target_sheet: str | None = None,
 ) -> tuple[str, list[dict]]:
     """
     解析員工薪資 xlsx → list[dict]（對應 staff_salary_summary）。
+    target_sheet=None 時自動偵測最新；指定 sheet 名稱則只解析該 sheet。
     """
-    sheet_name, service_month = find_target_sheet(file_obj)
+    if target_sheet is None:
+        sheet_name, service_month = find_target_sheet(file_obj)
+    else:
+        m = SHEET_RE.match(target_sheet)
+        if not m:
+            raise ValueError(f"sheet 名稱格式不符：{target_sheet}")
+        sheet_name = target_sheet
+        service_month = f"{int(m.group(1)) + 1911:04d}-{int(m.group(2)):02d}-01"
     file_obj.seek(0)
     df = pd.read_excel(file_obj, sheet_name=sheet_name, header=None)
 

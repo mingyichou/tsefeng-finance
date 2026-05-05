@@ -74,8 +74,11 @@ def _row_hash_cash(rec: dict) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
-_CHECK_PREFIX_RE = re.compile(r"^支票[-\s]")
-_CHECK_VENDOR_RE = re.compile(r"^支票[-\s]([^(（]+?)[(（]([^)）]*)[)）]")
+# 接受半形 -、全形 －、en dash –、em dash —、空格、直接接括號（「支票(中)」）
+_CHECK_PREFIX_RE = re.compile(r"^支票[\-‐-―－\s(（]")
+_CHECK_VENDOR_RE = re.compile(
+    r"^支票[\-‐-―－\s]*([^(（]*?)[(（]([^)）]*)[)）]"
+)
 
 
 def _parse_check_desc(desc: str) -> tuple[str, str, str]:

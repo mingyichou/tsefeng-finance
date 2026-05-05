@@ -359,6 +359,23 @@ def page_overview():
     ])
     st.dataframe(fz_ex_summary, use_container_width=True, hide_index=True)
 
+    # 缺資料提示（x9 / x13 都會抓 prev_month 的薪資）
+    from data_processor.monthly_pl import _prev_month
+    prev_m_str = _prev_month(service_month)[:7]
+    missing_msgs = []
+    if pl_fz.x9_offsite_staff_pay == 0:
+        missing_msgs.append(
+            f"⚠️ **x9 謝松坊薪資 = 0** — 可能 {prev_m_str} 員工薪資尚未匯入。"
+            f"請到「資料匯入區 → 員工薪資」上傳含 {prev_m_str} sheet 的薪資表。"
+        )
+    if pl_fz.x13_zhou_doctor_salary == 0:
+        missing_msgs.append(
+            f"⚠️ **x13 周院長薪資 = 0** — {prev_m_str} 周院長薪資尚未寫入 doctor_salary_monthly。"
+            f"請到「醫師薪資」頁選 {prev_m_str} 並按「💾 寫入」。"
+        )
+    for msg in missing_msgs:
+        st.warning(msg)
+
     if pl_fz.esun_outflow_items:
         with st.expander(f"📑 玉山出帳明細（{len(pl_fz.esun_outflow_items)} 筆）"):
             _show_items(pl_fz.esun_outflow_items, _BANK_COLS)
@@ -1359,14 +1376,13 @@ def _section_self_pay_pricing():
 
 
 def _section_staff_salary():
-    """員工薪資批次匯入（Sprint 2.8c）— 自動偵測最新 sheet + 跨診所代付辨識"""
-    from data_processor.staff_salary import parse_staff_salary
+    """員工薪資批次匯入（Sprint 2.8c）— 支援單月、選定月、全部月份"""
+    from data_processor.staff_salary import parse_staff_salary, list_sheets
 
-    st.subheader("👤 員工薪資（自動偵測最新月份 sheet）")
+    st.subheader("👤 員工薪資（多月 sheet）")
     st.caption(
-        "一個檔多個月 sheet。系統自動辨識最新月份；含「-更正」字尾優先採用。"
-        "抓員工總額 + 跨診所代付（影響豐沛金流）。"
-        "支援標題：「YYY年MM月薪資明細」、「YYY年MM月X薪資明細(Y代付)」。"
+        "一個檔多個月 sheet。可選擇：自動最新 / 指定月份 / 全部月份一次匯入。"
+        "同月份「-更正」優先採用。抓員工總額 + 跨診所代付（影響豐沛金流）。"
     )
 
     col1, col2 = st.columns([1, 4])
@@ -1391,16 +1407,42 @@ def _section_staff_salary():
     cid_to_short = {v: k for k, v in short_to_cid.items()}
     default_cid = short_to_cid[default_clinic]
 
+    # 列出檔內所有月份 sheet
+    try:
+        sheets = list_sheets(uploaded)
+    except Exception as e:
+        st.error(f"讀取檔內 sheet 失敗：{e}")
+        return
+
+    if not sheets:
+        st.error("檔案內找不到「薪資條XXX年XX月」格式的 sheet")
+        return
+
+    sheet_options = ["（自動最新）"] + [f"{sn}（{sm[:7]}）" for sn, sm in sheets]
+    st.markdown(f"**檔內共 {len(sheets)} 個月份 sheet** — 最新：{sheets[0][1][:7]}")
+    chosen = st.selectbox(
+        "解析範圍",
+        options=sheet_options,
+        key="staff_sheet_pick",
+        help="選「自動最新」= 只解析最新月份；選某 sheet = 只解析該月份",
+    )
+
+    if chosen == "（自動最新）":
+        target_sheet = None
+    else:
+        target_sheet = chosen.split("（")[0]
+
     try:
         sheet_name, records = parse_staff_salary(
-            uploaded, uploaded.name, default_cid, short_to_cid
+            uploaded, uploaded.name, default_cid, short_to_cid,
+            target_sheet=target_sheet,
         )
     except Exception as e:
         st.error(f"解析失敗：{e}")
         return
 
     st.success(
-        f"📋 自動偵測 sheet：**{sheet_name}**　|　解析 **{len(records)}** 位員工"
+        f"📋 已解析 sheet：**{sheet_name}**　|　**{len(records)}** 位員工"
     )
 
     if records:
@@ -1428,23 +1470,49 @@ def _section_staff_salary():
                 f"{owner} 應給 {payer} **NT {total:,} 元**"
             )
 
-    if st.button(
-        f"💾 確認匯入（{len(records)} 筆）",
-        type="primary",
-        key="staff_save",
-    ):
-        if not records:
-            st.warning("無可匯入資料")
-            return
-        try:
-            sb.table("staff_salary_summary").upsert(
-                records,
-                on_conflict="clinic_id,service_month,employee_label",
-            ).execute()
-            st.success(f"✅ 寫入 {len(records)} 筆")
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button(
+            f"💾 匯入此 sheet（{len(records)} 筆）",
+            type="primary",
+            key="staff_save",
+            disabled=not records,
+        ):
+            try:
+                sb.table("staff_salary_summary").upsert(
+                    records,
+                    on_conflict="clinic_id,service_month,employee_label",
+                ).execute()
+                st.success(f"✅ 寫入 {len(records)} 筆")
+                st.balloons()
+            except Exception as e:
+                st.error(f"寫入失敗：{e}")
+    with btn_col2:
+        if st.button(
+            f"📚 全部 {len(sheets)} 個月份一次匯入",
+            key="staff_save_all",
+            help="逐月解析所有 sheet 並 upsert。同 (clinic, service_month, employee) 會覆蓋。",
+        ):
+            total_written = 0
+            errors: list[str] = []
+            for sn, _sm in sheets:
+                try:
+                    _, recs = parse_staff_salary(
+                        uploaded, uploaded.name, default_cid, short_to_cid,
+                        target_sheet=sn,
+                    )
+                    if recs:
+                        sb.table("staff_salary_summary").upsert(
+                            recs,
+                            on_conflict="clinic_id,service_month,employee_label",
+                        ).execute()
+                        total_written += len(recs)
+                except Exception as e:
+                    errors.append(f"{sn}: {e}")
+            if errors:
+                st.warning(f"部分 sheet 失敗：\n" + "\n".join(errors))
+            st.success(f"✅ 全部月份共寫入 {total_written} 筆")
             st.balloons()
-        except Exception as e:
-            st.error(f"寫入失敗：{e}")
 
 
 def _section_manual_annotation():
