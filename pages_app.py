@@ -1954,9 +1954,13 @@ def _section_inventory_transfer():
                 {k: v for k, v in r.items() if k != "方向"}
                 for r in records
             ]
-            # inventory_transfer 沒 UNIQUE constraint — 用 INSERT
-            sb.table("inventory_transfer").insert(payload).execute()
-            st.success(f"✅ 寫入 {len(payload)} 筆")
+            # UNIQUE (transfer_month, from_clinic_id, to_clinic_id, item)
+            # 重複上傳會覆蓋同組鍵的 qty / unit_price / amount
+            sb.table("inventory_transfer").upsert(
+                payload,
+                on_conflict="transfer_month,from_clinic_id,to_clinic_id,item",
+            ).execute()
+            st.success(f"✅ 寫入 {len(payload)} 筆（同月+同方向+同品項會覆蓋舊值）")
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
