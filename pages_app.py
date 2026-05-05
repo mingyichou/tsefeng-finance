@@ -259,6 +259,133 @@ def page_dashboard():
 # ============================================================
 # 2. 收支總覽（Phase 4 月度損益）
 # ============================================================
+
+
+def _render_data_health(sb, service_month: str):
+    """
+    顯示該月份所有資料來源的筆數，0 筆會 ⚠️ 警告。
+    用途：跨月切換時，院長可一眼看出某月某帳戶/某資料源是否缺資料，
+          避免誤判為系統 bug。
+    """
+    from collections import Counter
+    from data_processor.monthly_pl import _next_month, _prev_month
+
+    next_m = _next_month(service_month)
+    prev_m = _prev_month(service_month)
+    sm_label = service_month[:7]
+    pm_label = prev_m[:7]
+
+    # 4 個關鍵銀行帳戶
+    accounts = (
+        sb.table("bank_accounts")
+        .select("id, clinic_id, bank, account_type, is_personal_mixed")
+        .execute().data
+    )
+    clinic_resp = sb.table("clinics").select("id, short_name").execute().data
+    cid_to_short = {c["id"]: c["short_name"] for c in clinic_resp}
+    fz_id = next((c["id"] for c in clinic_resp if c["short_name"] == "澤豐"), None)
+    fp_id = next((c["id"] for c in clinic_resp if c["short_name"] == "澤沛"), None)
+
+    # 一次撈本月所有 bank_transactions count by account_id
+    tx_rows = (
+        sb.table("bank_transactions").select("account_id")
+        .gte("transaction_date", service_month).lt("transaction_date", next_m)
+        .execute().data
+    )
+    tx_counts = Counter(r["account_id"] for r in tx_rows)
+
+    bank_table = []
+    issues: list[str] = []
+    for acc in accounts:
+        clinic = cid_to_short.get(acc["clinic_id"], "?")
+        bank = acc.get("bank", "?")
+        atype = acc.get("account_type", "?")
+        if acc.get("is_personal_mixed"):
+            atype = f"{atype}（混戶）"
+        n = tx_counts.get(acc["id"], 0)
+        bank_table.append({
+            "診所": clinic,
+            "戶別": f"{bank} {atype}",
+            f"{sm_label} 筆數": n,
+            "狀態": "✅" if n > 0 else "⚠️ 缺",
+        })
+        if n == 0:
+            issues.append(f"{clinic} {bank} {atype}：{sm_label} CSV 未上傳")
+
+    # 其他關鍵資料源
+    def _count(table: str, filters: list[tuple[str, str, object]]) -> int:
+        q = sb.table(table).select("id", count="exact")
+        for col, op, val in filters:
+            q = getattr(q, op)(col, val)
+        return q.execute().count or 0
+
+    other_rows = []
+    if fz_id:
+        n = _count("cash_expense", [("eq", "clinic_id", fz_id), ("eq", "accrual_month", service_month)])
+        other_rows.append({"資料源": "x3 澤豐現金支出 (cash_expense)", "月份": sm_label, "筆數": n,
+                           "狀態": "✅" if n > 0 else "⚠️ 缺"})
+        if n == 0:
+            issues.append(f"x3 cash_expense {sm_label} 缺資料：請上傳澤豐現金支出 xlsx")
+
+        n = _count("contract_expense", [("eq", "clinic_id", fz_id), ("eq", "service_month", service_month)])
+        other_rows.append({"資料源": "x12 澤豐合約支出 (contract_expense)", "月份": sm_label, "筆數": n,
+                           "狀態": "✅" if n > 0 else "⚠️ 缺"})
+        if n == 0:
+            issues.append(f"x12 contract_expense {sm_label} 缺資料：請上傳澤豐合約支出 xlsx")
+
+        # x9 謝松坊：staff_salary_summary 在 prev_m 是否有「謝松坊」
+        rows_x9 = (
+            sb.table("staff_salary_summary")
+            .select("id, employee_label")
+            .eq("clinic_id", fz_id).eq("service_month", prev_m)
+            .execute().data
+        )
+        n_x9 = sum(1 for r in rows_x9 if "謝松坊" in (r.get("employee_label") or ""))
+        other_rows.append({"資料源": f"x9 謝松坊薪資 ({pm_label} 服務月)", "月份": pm_label, "筆數": n_x9,
+                           "狀態": "✅" if n_x9 > 0 else "⚠️ 缺"})
+        if n_x9 == 0:
+            issues.append(f"x9 staff_salary_summary {pm_label} 沒謝松坊：請到員工薪資頁按「全部月份一次匯入」")
+
+        # x13 周院長：doctor_salary_monthly prev_m 是否有周明毅
+        zhou = sb.table("doctors").select("id").eq("name", "周明毅").execute().data
+        if zhou:
+            zhou_id = zhou[0]["id"]
+            n_x13 = _count("doctor_salary_monthly", [
+                ("eq", "doctor_id", zhou_id), ("eq", "service_month", prev_m),
+            ])
+            other_rows.append({"資料源": f"x13 周院長薪資 ({pm_label} 服務月)", "月份": pm_label, "筆數": n_x13,
+                               "狀態": "✅" if n_x13 > 0 else "⚠️ 缺"})
+            if n_x13 == 0:
+                issues.append(f"x13 doctor_salary_monthly {pm_label} 沒周院長：請到醫師薪資頁選 {pm_label} 並按「💾 寫入」")
+
+        # x8 manual_annotation：澤豐&個人中信「存現」標記
+        ann_rows = (
+            sb.table("manual_annotation").select("id, description")
+            .eq("scope", "診所").eq("form", "存現").eq("account", "澤豐&個人中信")
+            .eq("clinic_id", fz_id)
+            .gte("entry_date", service_month).lt("entry_date", next_m)
+            .execute().data
+        )
+        other_rows.append({"資料源": "x8 manual_annotation（澤豐存現標記）", "月份": sm_label,
+                           "筆數": len(ann_rows),
+                           "狀態": "✅" if len(ann_rows) > 0 else "ℹ️ 無"})
+        # x8 缺註記不一定是問題（該月沒存現），不放進 issues
+
+    with st.expander(
+        f"🩺 {sm_label} 資料完整度診斷"
+        + (f"（⚠️ {len(issues)} 項缺資料）" if issues else "（✅ 全到位）"),
+        expanded=bool(issues),
+    ):
+        st.markdown("**銀行交易（bank_transactions）：**")
+        st.dataframe(pd.DataFrame(bank_table), use_container_width=True, hide_index=True)
+        st.markdown("**其他資料源：**")
+        st.dataframe(pd.DataFrame(other_rows), use_container_width=True, hide_index=True)
+        if issues:
+            st.markdown("**⚠️ 待補資料清單：**")
+            for msg in issues:
+                st.markdown(f"- {msg}")
+
+
 def page_overview():
     st.title("💰 月度實帳收支總覽")
 
@@ -288,6 +415,11 @@ def page_overview():
     with st.spinner("計算中..."):
         pl_fz, pl_fp = calculate_both_clinics(sb, service_month)
         check = calculate_check_expense_month(sb, service_month)
+
+    # ════════════════════════════════════════════════════════
+    # 0. 資料完整度診斷（讓院長一眼看到該月缺什麼）
+    # ════════════════════════════════════════════════════════
+    _render_data_health(sb, service_month)
 
     # ════════════════════════════════════════════════════════
     # 1. 澤豐中醫診所實帳收支（總院，置頂）
@@ -358,23 +490,6 @@ def page_overview():
         {"項目": "x13 周院長薪資（兩院總和）", "小計": pl_fz.x13_zhou_doctor_salary, "歸屬": "前月"},
     ])
     st.dataframe(fz_ex_summary, use_container_width=True, hide_index=True)
-
-    # 缺資料提示（x9 / x13 都會抓 prev_month 的薪資）
-    from data_processor.monthly_pl import _prev_month
-    prev_m_str = _prev_month(service_month)[:7]
-    missing_msgs = []
-    if pl_fz.x9_offsite_staff_pay == 0:
-        missing_msgs.append(
-            f"⚠️ **x9 謝松坊薪資 = 0** — 可能 {prev_m_str} 員工薪資尚未匯入。"
-            f"請到「資料匯入區 → 員工薪資」上傳含 {prev_m_str} sheet 的薪資表。"
-        )
-    if pl_fz.x13_zhou_doctor_salary == 0:
-        missing_msgs.append(
-            f"⚠️ **x13 周院長薪資 = 0** — {prev_m_str} 周院長薪資尚未寫入 doctor_salary_monthly。"
-            f"請到「醫師薪資」頁選 {prev_m_str} 並按「💾 寫入」。"
-        )
-    for msg in missing_msgs:
-        st.warning(msg)
 
     if pl_fz.esun_outflow_items:
         with st.expander(f"📑 玉山出帳明細（{len(pl_fz.esun_outflow_items)} 筆）"):
