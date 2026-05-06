@@ -50,18 +50,22 @@ def _normalize(text: str) -> str:
 
 def _zepei_settle_kind(text: str) -> str | None:
     """
-    判斷澤沛中信出帳是哪一種固定 settle（保留分類用，**不**判斷月份）：
-      - x5_cash:    含「現金支出」
-      - x6_fengpei: 含「豐沛金流」或「沛 to 豐」（含全形ｔｏ）
-      - x7_contract: 含「合約」
+    判斷澤沛 ↔ 澤豐 之間的 3 筆固定 settle（用 note/summary 關鍵字，不判月份）：
+
+    院長 note 寫法多種變體，全部容忍：
+      - x6_fengpei  「豐沛金流」「沛豐金流」「澤沛金流」「沛to豐」「沛 to 豐」
+      - x5_cash    「現金支出」「現支」（如「澤沛１２月現支」）
+      - x7_contract 含「合約」
+
+    順序：先 x6（含「金流」字樣多種變體）→ x5（現金/現支）→ x7（合約）
     其他（房租、傳單等）回 None
     """
     if not text:
         return None
     s = _normalize(text)
-    if "豐沛金流" in s or "沛to豐" in s or "沛 to 豐" in s:
+    if any(k in s for k in ("豐沛金流", "沛豐金流", "澤沛金流", "沛to豐", "沛 to 豐")):
         return "x6_fengpei"
-    if "現金支出" in s:
+    if "現金支出" in s or "現支" in s:
         return "x5_cash"
     if "合約" in s:
         return "x7_contract"
@@ -205,6 +209,9 @@ class ZefengMonthly:
     x6_items: list = field(default_factory=list)
     x8_zefeng_cash_revenue: int = 0
     x8_items: list = field(default_factory=list)
+    # 中信「現金/存款機」入帳但沒 manual_annotation 對應的（視為個人存款，未認列 x8）
+    # — 用於診斷 UI 顯示，不入合計
+    x8_unmatched_items: list = field(default_factory=list)
 
     # 中信餘額（資訊用，不入合計）
     x1_prev_balance: int = 0
@@ -449,20 +456,36 @@ def calculate_zefeng_monthly(
         if first:
             m.x1_prev_balance = first[0].get("balance") or 0
 
-        # 預先抓 manual_annotation：判斷哪些「存現」是診所收入（x8）
-        # 規則：scope=診所 + form=存現 + account=澤豐&個人中信 + clinic=澤豐
-        # 比對 (entry_date, amount) 與當月中信入帳；description 含「11502」抽歸屬月
-        ann_cash = (
+        # 預先抓 manual_annotation：判斷哪些入帳是診所現金收入（x8）
+        # 規則：scope=診所 + form ∈ {存現, 轉入} + account=澤豐&個人中信
+        #  ・「存現」= 經由存款機/櫃台直接存進去
+        #  ・「轉入」= 從別的帳戶轉進這個帳戶（如周院長個人戶轉入做為現金存款）
+        # 比對 (entry_date, amount) 優先；同月份 amount 唯一時也接受 (退路)
+        # 抓 clinic_id=澤豐 與 clinic_id 是 NULL 的兩種，避免院長補 KEY 沒選診所被漏抓
+        ann_q1 = (
             sb.table("manual_annotation")
-            .select("entry_date, amount, description")
-            .eq("scope", "診所").eq("form", "存現")
+            .select("entry_date, amount, description, form, clinic_id")
+            .eq("scope", "診所").in_("form", ["存現", "轉入"])
             .eq("account", "澤豐&個人中信").eq("clinic_id", clinic_id)
             .gte("entry_date", service_month).lt("entry_date", next_month)
             .execute().data
         )
-        ann_x8_map: dict = {
+        ann_q2 = (
+            sb.table("manual_annotation")
+            .select("entry_date, amount, description, form, clinic_id")
+            .eq("scope", "診所").in_("form", ["存現", "轉入"])
+            .eq("account", "澤豐&個人中信").is_("clinic_id", "null")
+            .gte("entry_date", service_month).lt("entry_date", next_month)
+            .execute().data
+        )
+        ann_cash = ann_q1 + ann_q2
+        # 兩個比對 map：精準 (date, amount) 與寬鬆 amount-only
+        ann_by_date_amt: dict = {
             (r["entry_date"], int(r["amount"] or 0)): r for r in ann_cash
         }
+        ann_by_amt: dict = {}
+        for r in ann_cash:
+            ann_by_amt.setdefault(int(r["amount"] or 0), []).append(r)
 
         for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
             amt = tx["amount"]
@@ -488,10 +511,21 @@ def calculate_zefeng_monthly(
             # x8 澤豐現金入帳：必須有 manual_annotation 對應才認列
             # （澤豐&個人中信戶混了個人存款，無法靠摘要判斷主體）
             if "現金" in summary or "存款機" in channel:
-                key = (tx.get("transaction_date"), int(amt))
-                ann = ann_x8_map.get(key)
+                tx_date = tx.get("transaction_date")
+                amt_int = int(amt)
+                # 1. 精準匹配 (date, amount)
+                ann = ann_by_date_amt.get((tx_date, amt_int))
+                # 2. 退路:同月份 amount 唯一時也接受(包容 entry_date 跟 transaction_date 差幾天)
                 if ann is None:
-                    continue  # 無註記 = 視為個人存款，不認列
+                    candidates = ann_by_amt.get(amt_int, [])
+                    if len(candidates) == 1:
+                        ann = candidates[0]
+                if ann is None:
+                    # 視為個人存款,不認列;但記到 unmatched 供 UI 診斷顯示
+                    m.x8_unmatched_items.append(_bank_item(
+                        tx, attribution_month=None,
+                    ))
+                    continue
                 attr = _extract_attr_month_from_desc(
                     ann.get("description") or "", fallback=prev_m,
                 )

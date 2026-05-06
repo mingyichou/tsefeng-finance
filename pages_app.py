@@ -476,6 +476,18 @@ def page_overview():
     if pl_fz.x8_items:
         with st.expander(f"📑 x8 現金存入明細（{len(pl_fz.x8_items)} 筆，歸屬前月）"):
             _show_items(pl_fz.x8_items, _BANK_COLS)
+    if pl_fz.x8_unmatched_items:
+        with st.expander(
+            f"⚠️ 中信「現金/存款機」入帳但無 manual_annotation 對應"
+            f"（{len(pl_fz.x8_unmatched_items)} 筆，視為個人存款未認列 x8）"
+        ):
+            st.caption(
+                "若這幾筆其實是診所收入，請到「資料匯入區 → 金流補充備註」"
+                "新增記錄：scope=診所 / form=存現 / account=澤豐&個人中信 / "
+                "amount 與此處相符；description 寫「11XYY 澤豐現金收入」"
+                "（XYY=歸屬月）系統會自動抓歸屬月份。"
+            )
+            _show_items(pl_fz.x8_unmatched_items, _BANK_COLS)
     if pl_fz.x10_income_items:
         with st.expander(f"📑 x10 手 KEY 收入明細（{len(pl_fz.x10_income_items)} 筆）"):
             _show_items(pl_fz.x10_income_items)
