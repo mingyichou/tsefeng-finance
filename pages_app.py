@@ -753,6 +753,11 @@ def page_import():
 
     st.divider()
 
+    # ─── 科中進貨價目表（金流結算用）──────────────
+    _section_tcm_concentrate_pricing()
+
+    st.divider()
+
     # ─── 員工薪資（自動偵測最新 sheet）─────────────
     _section_staff_salary()
 
@@ -1557,6 +1562,106 @@ def _section_self_pay_pricing():
             sb.table("product_pricing").delete().neq("id", -1).execute()
             # 2. INSERT 新資料
             sb.table("product_pricing").insert(records).execute()
+            st.success(f"✅ 已清空舊資料並寫入 {len(records)} 筆")
+            st.balloons()
+        except Exception as e:
+            st.error(f"寫入失敗：{e}")
+
+
+def _section_tcm_concentrate_pricing():
+    """
+    科中進貨價目表 — 全表 single source of truth（澤豐澤沛金流結算用）
+
+    上傳邏輯：DELETE 全表 + INSERT 全部新資料
+    僅解析 sheet「科學中藥-複」+「科學中藥-單方」；廠商白名單：天一/港香蘭/莊松榮/科達/順天堂/仙豐
+    """
+    from data_processor.tcm_concentrate import parse_tcm_concentrate
+
+    st.subheader("🧪 科中進貨價目表（金流結算用，全表覆蓋）")
+    st.caption(
+        "🔄 **每次上傳會完全覆蓋舊資料**。僅解析「科學中藥-複」+「科學中藥-單方」"
+        "兩個 sheet。廠商白名單：天一/港香蘭/莊松榮/科達/順天堂/仙豐"
+        "（順天堂K裝、莊無 不參與計算）。供「澤豐澤沛金流結算」頁面試算用，"
+        "不影響月度 P&L 認列。"
+    )
+
+    sb = get_authed_client()
+
+    try:
+        existing_count = len(
+            sb.table("tcm_concentrate_pricing").select("id").execute().data or []
+        )
+        if existing_count:
+            st.info(f"📋 目前 DB 有 **{existing_count}** 筆")
+        else:
+            st.info("📋 目前 DB 為空")
+    except Exception as e:
+        st.warning(
+            f"讀取 DB 狀態失敗：{e}（請確認 tcm_concentrate_pricing 表已建立，"
+            "schema 見頁面下方說明）"
+        )
+
+    uploaded = st.file_uploader(
+        "上傳新版「@科中進貨價目表.xlsx」（取代既有資料）",
+        type=["xlsx"],
+        key="tcm_pricing_uploader",
+    )
+
+    from datetime import date
+    effective_month = date.today().replace(day=1).isoformat()
+
+    if not uploaded:
+        with st.expander("📐 首次使用：建表 SQL"):
+            st.code(
+                "CREATE TABLE IF NOT EXISTS tcm_concentrate_pricing (\n"
+                "  id SERIAL PRIMARY KEY,\n"
+                "  category TEXT NOT NULL CHECK (category IN ('複方','單方')),\n"
+                "  product_name TEXT NOT NULL,\n"
+                "  vendor TEXT NOT NULL,\n"
+                "  price NUMERIC(10,2) NOT NULL,\n"
+                "  effective_month DATE,\n"
+                "  source_filename TEXT,\n"
+                "  uploaded_at TIMESTAMPTZ DEFAULT NOW(),\n"
+                "  UNIQUE (category, product_name, vendor)\n"
+                ");",
+                language="sql",
+            )
+        return
+
+    try:
+        records = parse_tcm_concentrate(uploaded, uploaded.name, effective_month)
+    except Exception as e:
+        st.error(f"解析失敗：{e}")
+        return
+    if not records:
+        st.warning("無可匯入的資料（請檢查 sheet 名稱是否為「科學中藥-複」「科學中藥-單方」）")
+        return
+
+    df = pd.DataFrame(records)
+    st.success(f"✅ 解析 {len(records)} 筆")
+
+    by_cv = df.groupby(["category", "vendor"], as_index=False).size()
+    by_cv.columns = ["category", "廠商", "筆數"]
+    st.markdown("**按 (類別, 廠商) 彙總：**")
+    st.dataframe(by_cv, use_container_width=True, hide_index=True)
+
+    st.markdown("**逐筆預覽（前 200 筆）：**")
+    st.dataframe(
+        df[["category", "product_name", "vendor", "price"]].head(200),
+        use_container_width=True, height=300, hide_index=True,
+    )
+
+    st.warning(
+        "⚠️ 確認匯入會 **DELETE 整張 tcm_concentrate_pricing 表 + 重新 INSERT**。"
+    )
+
+    if st.button(
+        f"💾 確認覆蓋全表（{len(records)} 筆）",
+        type="primary", key="tcm_pricing_save_btn",
+    ):
+        try:
+            sb.table("tcm_concentrate_pricing").delete().neq("id", -1).execute()
+            sb.table("tcm_concentrate_pricing").insert(records).execute()
             st.success(f"✅ 已清空舊資料並寫入 {len(records)} 筆")
             st.balloons()
         except Exception as e:
@@ -3357,3 +3462,362 @@ def _settings_insurance_deductions(sb):
                 st.rerun()
             except Exception as e:
                 st.error(f"刪除失敗：{e}")
+
+
+# ============================================================
+# 6. 澤豐澤沛金流結算（Phase 4 試算插件）
+# ============================================================
+def page_alliance_settlement():
+    """
+    澤豐澤沛金流結算頁（試算插件，不影響月度 P&L）
+
+    結算 = 商品調貨試算 + 員工跨代付薪資 + 醫師跨支援薪資
+    淨額 > 0 → 沛 應付 豐；淨額 < 0 → 豐 應付 沛
+
+    P.S. 實際 x6（豐沛金流）認列仍以中信收付為主，本頁僅供院方安排
+    每月實際匯款金額參考。
+    """
+    from data_processor.inventory_pricing import (
+        compute_inventory_amounts, summarize,
+    )
+    from data_processor.salary import run_salary_calculation
+
+    st.title("🤝 澤豐澤沛金流結算")
+    st.info(
+        "ℹ️ **試算插件，不影響月度 P&L**。本頁將商品調貨、員工跨代付、"
+        "醫師跨支援的金流彙總成淨額，作為每月實際匯款的依據。"
+        "實際 x6（豐沛金流）認列仍以中信收付為基準。"
+    )
+
+    sb = get_authed_client()
+
+    # ─── 診所 id ───
+    clinics = {
+        c["short_name"]: c["id"]
+        for c in sb.table("clinics").select("id, short_name").execute().data
+    }
+    fz_id = clinics.get("澤豐")
+    fp_id = clinics.get("澤沛")
+    if not (fz_id and fp_id):
+        st.error("找不到澤豐/澤沛診所")
+        return
+
+    # ─── 月份候選（彙總三個來源）───
+    months_set: set[str] = set()
+    try:
+        for r in (sb.table("inventory_transfer")
+                    .select("transfer_month").execute().data or []):
+            months_set.add(r["transfer_month"])
+    except Exception:
+        pass
+    try:
+        for r in (sb.table("staff_salary_summary")
+                    .select("service_month").execute().data or []):
+            months_set.add(r["service_month"])
+    except Exception:
+        pass
+    try:
+        for r in (sb.table("doctor_visit_stats")
+                    .select("service_month").execute().data or []):
+            months_set.add(r["service_month"])
+    except Exception:
+        pass
+    months_sorted = sorted(months_set, reverse=True)
+    if not months_sorted:
+        st.warning("⚠️ 尚無資料可結算")
+        return
+
+    col1, _ = st.columns([2, 5])
+    with col1:
+        service_month = st.selectbox(
+            "結算月份", months_sorted,
+            format_func=lambda d: d[:7], key="settlement_month",
+        )
+
+    # ─────────────────────────────────────────────
+    # 1. 商品調貨試算
+    # ─────────────────────────────────────────────
+    st.subheader("🛒 商品調貨試算")
+
+    inv_rows = (
+        sb.table("inventory_transfer")
+        .select("transfer_month, from_clinic_id, to_clinic_id, item, qty")
+        .eq("transfer_month", service_month)
+        .execute().data
+    ) or []
+
+    if not inv_rows:
+        st.caption(f"⚠️ {service_month[:7]} 無調貨資料")
+        product_pei_to_feng = 0.0
+        product_feng_to_pei = 0.0
+        priced_items: list = []
+        unmatched: list = []
+    else:
+        try:
+            tcm_rows = (
+                sb.table("tcm_concentrate_pricing")
+                .select("category, vendor, product_name, price")
+                .execute().data
+            ) or []
+        except Exception as e:
+            st.warning(f"科中價目表讀取失敗（{e}）— 含廠商品項都會被列為未匹配")
+            tcm_rows = []
+        try:
+            pp_rows = (
+                sb.table("product_pricing")
+                .select("vendor, product_name, cost_price")
+                .execute().data
+            ) or []
+        except Exception as e:
+            st.warning(f"自費商品價目表讀取失敗（{e}）")
+            pp_rows = []
+
+        priced_items = compute_inventory_amounts(
+            inv_rows, tcm_rows, pp_rows, fz_id, fp_id
+        )
+        summary_inv = summarize(priced_items)
+        unmatched = summary_inv["unmatched"]
+
+        product_pei_to_feng = summary_inv["by_month_dir"].get(
+            (service_month, "沛PAY豐"), {"total": 0.0}
+        )["total"]
+        product_feng_to_pei = summary_inv["by_month_dir"].get(
+            (service_month, "豐PAY沛"), {"total": 0.0}
+        )["total"]
+
+        cols = st.columns(2)
+        with cols[0]:
+            st.metric("沛PAY豐 商品小計", f"${product_pei_to_feng:,.0f}")
+        with cols[1]:
+            st.metric("豐PAY沛 商品小計", f"${product_feng_to_pei:,.0f}")
+
+        with st.expander(f"📦 沛PAY豐 明細（澤豐 → 澤沛 商品調貨）"):
+            rows = [
+                {
+                    "品項": it.item,
+                    "qty": it.qty,
+                    "廠商": it.vendor or "—",
+                    "單價": it.unit_price,
+                    "比例": it.ratio,
+                    "金額": it.amount,
+                    "來源": it.source,
+                }
+                for it in priced_items if it.direction == "沛PAY豐"
+            ]
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows), use_container_width=True, hide_index=True
+                )
+            else:
+                st.caption("無資料")
+
+        with st.expander(f"📦 豐PAY沛 明細（澤沛 → 澤豐 商品調貨）"):
+            rows = [
+                {
+                    "品項": it.item,
+                    "qty": it.qty,
+                    "廠商": it.vendor or "—",
+                    "單價": it.unit_price,
+                    "比例": it.ratio,
+                    "金額": it.amount,
+                    "來源": it.source,
+                }
+                for it in priced_items if it.direction == "豐PAY沛"
+            ]
+            if rows:
+                st.dataframe(
+                    pd.DataFrame(rows), use_container_width=True, hide_index=True
+                )
+            else:
+                st.caption("無資料")
+
+        if unmatched:
+            with st.expander(
+                f"⚠️ 未匹配品項（{len(unmatched)} 筆，未計入金額）"
+            ):
+                st.caption(
+                    "原因：該品項在「自費商品成本&售價」或「科中進貨價目表」中找不到對應。"
+                    "請至「本月資料匯入區 → 自費商品/科中進貨價目」上傳最新表，或"
+                    "確認品項命名一致。"
+                )
+                rows = [
+                    {
+                        "方向": it.direction,
+                        "品項": it.item,
+                        "qty": it.qty,
+                        "原因": it.note,
+                    } for it in unmatched
+                ]
+                st.dataframe(
+                    pd.DataFrame(rows), use_container_width=True, hide_index=True
+                )
+
+    # ─────────────────────────────────────────────
+    # 2. 員工跨代付薪資
+    # ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("👥 員工跨代付薪資")
+    st.caption(
+        "來源：staff_salary_summary（paid_by_clinic_id IS NOT NULL）。"
+        "員工屬澤豐、澤沛代付 → 豐PAY沛；員工屬澤沛、澤豐代付 → 沛PAY豐。"
+    )
+
+    try:
+        ss_rows = (
+            sb.table("staff_salary_summary")
+            .select("clinic_id, paid_by_clinic_id, employee_label, gross_salary")
+            .eq("service_month", service_month)
+            .not_.is_("paid_by_clinic_id", "null")
+            .execute().data
+        ) or []
+    except Exception as e:
+        st.warning(f"員工薪資讀取失敗：{e}")
+        ss_rows = []
+
+    staff_pei_to_feng = 0.0  # 員工屬澤沛(clinic=fp), 澤豐墊付(paid_by=fz) → 沛PAY豐
+    staff_feng_to_pei = 0.0  # 員工屬澤豐(clinic=fz), 澤沛墊付(paid_by=fp) → 豐PAY沛
+    staff_detail = []
+    for r in ss_rows:
+        cid = r["clinic_id"]
+        pid = r["paid_by_clinic_id"]
+        amt = float(r.get("gross_salary") or 0)
+        if cid == fp_id and pid == fz_id:
+            staff_pei_to_feng += amt
+            direction = "沛PAY豐"
+        elif cid == fz_id and pid == fp_id:
+            staff_feng_to_pei += amt
+            direction = "豐PAY沛"
+        else:
+            continue
+        staff_detail.append({
+            "方向": direction,
+            "員工": r["employee_label"],
+            "歸屬診所": "澤豐" if cid == fz_id else "澤沛",
+            "代付方": "澤豐" if pid == fz_id else "澤沛",
+            "金額": amt,
+        })
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.metric("沛PAY豐 員工薪資", f"${staff_pei_to_feng:,.0f}")
+    with cols[1]:
+        st.metric("豐PAY沛 員工薪資", f"${staff_feng_to_pei:,.0f}")
+
+    if staff_detail:
+        with st.expander("👤 員工跨代付明細"):
+            st.dataframe(
+                pd.DataFrame(staff_detail),
+                use_container_width=True, hide_index=True,
+            )
+    else:
+        st.caption("⚠️ 無跨代付員工資料")
+
+    # ─────────────────────────────────────────────
+    # 3. 醫師跨支援薪資
+    # ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("🩺 醫師跨支援薪資")
+    st.caption(
+        "來源：醫師薪資計算結果。主聘澤豐到澤沛支援 → 沛PAY豐；"
+        "主聘澤沛到澤豐支援 → 豐PAY沛。（與「醫師薪資計算」頁的"
+        "「跨支援墊付」表完全一致）"
+    )
+
+    doctor_pei_to_feng = 0.0
+    doctor_feng_to_pei = 0.0
+    doctor_detail = []
+    try:
+        _, payslips = run_salary_calculation(sb, service_month)
+        for p in payslips:
+            if p.gross_support <= 0 or not p.support_clinic_id:
+                continue
+            amt = float(p.gross_support)
+            # 主聘=澤豐 (墊付方), 支援去=澤沛 → 看診診所=澤沛 應還 → 沛PAY豐
+            if p.main_clinic_id == fz_id and p.support_clinic_id == fp_id:
+                doctor_pei_to_feng += amt
+                direction = "沛PAY豐"
+            elif p.main_clinic_id == fp_id and p.support_clinic_id == fz_id:
+                doctor_feng_to_pei += amt
+                direction = "豐PAY沛"
+            else:
+                continue
+            doctor_detail.append({
+                "方向": direction,
+                "醫師": p.doctor_name,
+                "墊付方(主聘)": p.main_clinic_name,
+                "看診診所(應還)": p.support_clinic_name,
+                "金額": amt,
+            })
+    except Exception as e:
+        st.warning(f"醫師薪資計算失敗：{e}")
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.metric("沛PAY豐 醫師薪資", f"${doctor_pei_to_feng:,.0f}")
+    with cols[1]:
+        st.metric("豐PAY沛 醫師薪資", f"${doctor_feng_to_pei:,.0f}")
+
+    if doctor_detail:
+        with st.expander("🩺 醫師跨支援明細"):
+            st.dataframe(
+                pd.DataFrame(doctor_detail),
+                use_container_width=True, hide_index=True,
+            )
+    else:
+        st.caption("⚠️ 無跨支援醫師資料")
+
+    # ─────────────────────────────────────────────
+    # 4. 結算總覽
+    # ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("📊 結算總覽")
+
+    pei_to_feng_total = (
+        product_pei_to_feng + staff_pei_to_feng + doctor_pei_to_feng
+    )
+    feng_to_pei_total = (
+        product_feng_to_pei + staff_feng_to_pei + doctor_feng_to_pei
+    )
+    net = pei_to_feng_total - feng_to_pei_total
+
+    summary_df = pd.DataFrame([
+        {
+            "類別": "商品調貨",
+            "沛PAY豐": product_pei_to_feng,
+            "豐PAY沛": product_feng_to_pei,
+        },
+        {
+            "類別": "員工跨代付",
+            "沛PAY豐": staff_pei_to_feng,
+            "豐PAY沛": staff_feng_to_pei,
+        },
+        {
+            "類別": "醫師跨支援",
+            "沛PAY豐": doctor_pei_to_feng,
+            "豐PAY沛": doctor_feng_to_pei,
+        },
+        {
+            "類別": "🟦 合計",
+            "沛PAY豐": pei_to_feng_total,
+            "豐PAY沛": feng_to_pei_total,
+        },
+    ])
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("沛PAY豐 合計", f"${pei_to_feng_total:,.0f}")
+    with cols[1]:
+        st.metric("豐PAY沛 合計", f"${feng_to_pei_total:,.0f}")
+    with cols[2]:
+        if net > 0:
+            st.metric("🟢 淨額", f"${net:,.0f}", delta="澤沛 應付 澤豐")
+        elif net < 0:
+            st.metric("🟢 淨額", f"${abs(net):,.0f}", delta="澤豐 應付 澤沛")
+        else:
+            st.metric("🟢 淨額", "$0", delta="兩邊打平")
+
+    st.caption(
+        "💡 結算後實際匯款一筆於下個月初，匯款紀錄會出現在中信戶 → "
+        "由月度 P&L 自動認列為 x6（豐沛金流）。"
+    )

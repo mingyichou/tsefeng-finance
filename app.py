@@ -43,6 +43,7 @@ from pages_app import (
     page_overview,
     page_import,
     page_salary,
+    page_alliance_settlement,
     page_personal,
     page_settings,
 )
@@ -97,6 +98,7 @@ def render_main_app():
             "💰 收支總覽",
             "📥 本月資料匯入區",
             "💵 醫師薪資",
+            "🤝 澤豐澤沛金流結算",
             "💸 院長個人財富分析",
             "⚙️ 系統設定",
             "🚪 登出",
@@ -128,6 +130,8 @@ def render_main_app():
         page_import()
     elif choice == "💵 醫師薪資":
         page_salary()
+    elif choice == "🤝 澤豐澤沛金流結算":
+        page_alliance_settlement()
     elif choice == "💸 院長個人財富分析":
         page_personal()
     elif choice == "⚙️ 系統設定":
