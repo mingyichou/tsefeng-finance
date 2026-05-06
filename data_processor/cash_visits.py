@@ -116,7 +116,10 @@ def clinic_hint_from_filename(filename: str) -> str | None:
     # 11410短名（11410周醫師自費統計）
     if re.match(r"^\d{5}[周胡呂]醫師自費統計$", name):
         return "澤沛"
-    # 醫師完整名無前綴（如「呂敏盛醫師自費統計11503」）→ 慣例為澤豐
+    # YYYYMM 在前 + 醫師全名（11412周明毅醫師自費統計）→ 澤沛慣例
+    if re.match(r"^\d{5}(周明毅|呂敏盛|胡舒婷)醫師自費統計$", name):
+        return "澤沛"
+    # 醫師完整名無前綴 + YYYYMM 在後（如「呂敏盛醫師自費統計11503」）→ 慣例為澤豐
     if re.match(r"^(周明毅|呂敏盛|胡舒婷)醫師自費統計\d{5}$", name):
         return "澤豐"
     return None
@@ -150,6 +153,11 @@ def parse_filename(filename: str) -> dict:
     m = re.match(r"^(\d{5})(周|胡|呂)醫師自費統計$", name)
     if m:
         return _build_meta(_DOCTOR_SHORTHAND[m.group(2)], m.group(1))
+
+    # 模式 4: YYYYMM 在前 + 醫師全名 — 11412周明毅醫師自費統計
+    m = re.match(r"^(\d{5})(周明毅|呂敏盛|胡舒婷)醫師自費統計$", name)
+    if m:
+        return _build_meta(m.group(2), m.group(1))
 
     raise ValueError(f"檔名格式不符自費統計規則：{name}")
 
