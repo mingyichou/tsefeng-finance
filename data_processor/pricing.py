@@ -133,10 +133,16 @@ def parse_self_pay_otc(
     return records
 
 
-# ─── 自費藥粉&自費商品 sheet ─────────────────────────
+# ─── 自費藥粉&自費商品 sheet（11504 新格式）─────────────
+#
+# 新格式（院長 2026-05-07 調整）：
+#   上區 (R0-R9)：C0=品項, C1=廠商, C2=進價, C3=售價/G
+#   下方廠商區塊：
+#     R(n)   C0='大墩' / '駿賀' / '上賀' / '怡得' / '港香蘭' / '卡媚迪斯' / '羿嘉' / '水藥包'
+#     R(n+1) C1='進價'  (有時 C0 與 C1='進價' 同列)
+#     R(n+2..) C0=品項, C1=進價數值, C2=備註(可選)
 
 
-# 此 sheet 內常見的非品項標題列關鍵字
 _POWDER_SKIP_KEYWORDS = (
     "自費診限定", "自費處方", "保健食品",
 )
@@ -148,25 +154,40 @@ def parse_self_pay_powder(
     effective_month: str,
 ) -> list[dict]:
     """
-    解析「自費藥粉&自費商品」sheet（雙塊結構）：
-      左塊 C0-C5：品項 / 廠商 / 進價 / 單價(g/元) / 售價(g) / 備註
-      右塊 C8-C10：品項 / 單價 / 備註（vendor=大墩）
+    解析「自費藥粉&自費商品」sheet（新格式 2026-05）：
+      上區 C0-C3：品項 / 廠商 / 進價 / 售價(g)
+      下方廠商區塊：C0=品項, C1=進價, C2=備註(可選)；vendor 由區塊標題決定。
     """
     file_obj.seek(0)
     try:
         df = pd.read_excel(file_obj, sheet_name="自費藥粉&自費商品", header=None)
     except ValueError:
-        return []  # 該檔沒此 sheet（容錯）
+        return []
 
     records: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
-    # ─── 左塊 ───
+    # 第 0 列為表頭（C1='廠商' C2='進價' C3='售價/G'）；定位上區範圍 = 上區 + 下區的轉折
+    # 轉折判斷：第一個「整列 C0=text 但 C1 為空（廠商區塊標題）」之前都當上區
+    transition_row = df.shape[0]
     for r in range(1, df.shape[0]):
+        c0 = _norm_str(df.iloc[r, 0])
+        c1 = _norm_str(df.iloc[r, 1]) if df.shape[1] > 1 else None
+        c2 = _norm_str(df.iloc[r, 2]) if df.shape[1] > 2 else None
+        # 「廠商區塊標題列」格式：C0 有非數字 text + C1 空 + C2 空
+        # 或同列宣告: C0=vendor + C1='進價'
+        is_vendor_block_header = bool(
+            c0 and not c1 and not c2 and not _to_float(df.iloc[r, 0])
+        ) or (c0 and c1 == "進價")
+        if is_vendor_block_header:
+            transition_row = r
+            break
+
+    # ─── 上區：C0=品項, C1=廠商, C2=進價, C3=售價/G ───
+    for r in range(1, transition_row):
         product = _norm_str(df.iloc[r, 0])
         if not product:
             continue
-        # 跳過分類標題與日期分段
         if any(k in product for k in _POWDER_SKIP_KEYWORDS):
             continue
         if re.match(r"^\d{2,3}/\d{1,2}$", product):
@@ -177,11 +198,7 @@ def parse_self_pay_powder(
             continue
 
         cost = _to_float(df.iloc[r, 2]) if df.shape[1] > 2 else None
-        # C3 = 單價(g/元)、C4 = 售價(g)；以 C4 售價優先
-        sale_g = _to_float(df.iloc[r, 4]) if df.shape[1] > 4 else None
-        if sale_g is None and df.shape[1] > 3:
-            sale_g = _to_float(df.iloc[r, 3])
-        note = _norm_str(df.iloc[r, 5]) if df.shape[1] > 5 else None
+        sale_g = _to_float(df.iloc[r, 3]) if df.shape[1] > 3 else None
 
         if cost is None and sale_g is None:
             continue
@@ -197,81 +214,71 @@ def parse_self_pay_powder(
             "cost_price": round(cost, 2) if cost is not None else None,
             "sale_price": round(sale_g, 2) if sale_g is not None else None,
             "unit": "g",
-            "note": note,
+            "note": None,
         })
 
-    # ─── 右塊（C8-C10）vendor=大墩 ───
-    if df.shape[1] > 8:
-        for r in range(1, df.shape[0]):
-            product = _norm_str(df.iloc[r, 8])
-            if not product:
-                continue
-            if any(k in product for k in _POWDER_SKIP_KEYWORDS):
-                continue
-            sale = _to_float(df.iloc[r, 9]) if df.shape[1] > 9 else None
-            note = _norm_str(df.iloc[r, 10]) if df.shape[1] > 10 else None
-            if sale is None:
-                continue
-            key = ("大墩", product)
-            if key in seen:
-                continue
-            seen.add(key)
-            records.append({
-                "effective_month": effective_month,
-                "vendor": "大墩",
-                "product_name": product,
-                "cost_price": None,
-                "sale_price": round(sale, 2),
-                "unit": None,
-                "note": note,
-            })
-
-    # ─── 第三段：vendor 區塊（如水藥包/駿賀/上賀/卡媚迪斯…）───
-    # 結構：vendor 標題列（C0 有值 + 下一列 C1='單價'）→ 品項列（C0=品項, C1=單價）
-    in_block = False
+    # ─── 下方廠商區塊 ───
+    # 狀態機：current_block_vendor + in_block
     current_block_vendor: str | None = None
-    for r in range(1, df.shape[0]):
+    in_block = False
+
+    r = transition_row
+    while r < df.shape[0]:
         c0 = _norm_str(df.iloc[r, 0])
         c1_raw = df.iloc[r, 1] if df.shape[1] > 1 else None
         c1 = _norm_str(c1_raw)
         c2 = _norm_str(df.iloc[r, 2]) if df.shape[1] > 2 else None
 
-        # 偵測 vendor 標題列：C0 有值 + C1-C2 空 + 下一列 C1='單價'
-        next_c1 = (
-            _norm_str(df.iloc[r + 1, 1])
-            if r + 1 < df.shape[0] and df.shape[1] > 1
-            else None
-        )
-        if c0 and not c1 and not c2 and next_c1 == "單價":
+        # 偵測「同列宣告」：C0=vendor + C1='進價'
+        if c0 and c1 == "進價" and not _to_float(df.iloc[r, 0]):
             current_block_vendor = c0
-            in_block = False
-            continue
-
-        # 表頭列 C1='單價'（C0 空）
-        if c1 == "單價" and not c0:
             in_block = True
+            r += 1
             continue
 
-        # 區塊內品項列
+        # 偵測「分列宣告」：C0=vendor + C1/C2 空 + 下一列 C1='進價'
+        if c0 and not c1 and not c2 and not _to_float(df.iloc[r, 0]):
+            next_c1 = (
+                _norm_str(df.iloc[r + 1, 1])
+                if r + 1 < df.shape[0] and df.shape[1] > 1
+                else None
+            )
+            if next_c1 == "進價":
+                current_block_vendor = c0
+                in_block = False  # 等下一列的進價標頭啟動
+                r += 1
+                continue
+
+        # 進價標頭列（C0 空 + C1='進價'）：啟動 block
+        if not c0 and c1 == "進價":
+            in_block = True
+            r += 1
+            continue
+
+        # 區塊內品項列：C0=品項, C1=進價數值
         if in_block and current_block_vendor and c0:
-            sale = _to_float(c1_raw)
-            if sale is None:
-                # 遇到無價格資料的列（如備註）— 忽略不終止 block
+            cost = _to_float(c1_raw)
+            if cost is None:
+                # 無價格列（可能備註）— 跳過但不終止 block
+                r += 1
                 continue
             note = c2
             key = (current_block_vendor, c0)
             if key in seen:
+                r += 1
                 continue
             seen.add(key)
             records.append({
                 "effective_month": effective_month,
                 "vendor": current_block_vendor,
                 "product_name": c0,
-                "cost_price": None,
-                "sale_price": round(sale, 2),
+                "cost_price": round(cost, 2),
+                "sale_price": None,
                 "unit": None,
                 "note": note,
             })
+
+        r += 1
 
     return records
 
