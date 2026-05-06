@@ -1086,6 +1086,7 @@ def _section_cash_visits():
     from data_processor.cash_visits import (
         parse_cash_visits,
         parse_filename as parse_cash_filename,
+        clinic_hint_from_filename,
     )
 
     st.subheader("💰 醫師自費統計（批次）")
@@ -1128,6 +1129,8 @@ def _section_cash_visits():
     summaries: list[dict] = []
     errors: list[str] = []
 
+    mismatches: list[str] = []  # 檔名推測診所與選擇不一致的清單
+
     for f in uploaded_files:
         try:
             meta = parse_cash_filename(f.name)
@@ -1140,8 +1143,19 @@ def _section_cash_visits():
                 expected_doctor_name=doctor,
             )
             all_records.extend(recs)
+            hint = clinic_hint_from_filename(f.name)
+            if hint and hint != clinic_choice:
+                mismatch_flag = "❌ 不一致"
+                mismatches.append(f"{f.name}：檔名像是「{hint}」")
+            elif hint == clinic_choice:
+                mismatch_flag = "✅"
+            else:
+                mismatch_flag = "❓ 無法推測"
             summaries.append({
                 "檔名": f.name,
+                "推測診所": hint or "（無法推測）",
+                "你選": clinic_choice,
+                "對診所": mismatch_flag,
                 "醫師": doctor,
                 "服務月": meta["service_month"],
                 "筆數": totals["parsed_count"],
@@ -1172,6 +1186,20 @@ def _section_cash_visits():
             "請檢查後再決定是否匯入"
         )
 
+    # 診所不一致警告 + 強制確認 checkbox
+    confirm_mismatch = True
+    if mismatches:
+        st.error(
+            f"❌ **{len(mismatches)} 份檔名推測不屬於「{clinic_choice}」**：\n\n"
+            + "\n".join(f"- {m}" for m in mismatches)
+            + "\n\n"
+            f"**強烈建議**：取消勾選後，回上面把「診所」radio 改成正確的，再重選檔案。"
+        )
+        confirm_mismatch = st.checkbox(
+            "我確認真的要把這些檔案寫入「" + clinic_choice + "」（跨診所支援等特殊情境）",
+            key=f"cash_confirm_mismatch_{clinic_choice}",
+        )
+
     st.markdown(f"**全部資料筆數：{len(all_records)} 筆**（不含姓名/地址/電話）")
     if all_records:
         # 預覽前 10 筆（去敏感欄）
@@ -1188,6 +1216,7 @@ def _section_cash_visits():
         f"💾 確認匯入 {clinic_choice} 自費統計（{len(all_records)} 筆）",
         type="primary",
         key=f"cash_import_btn_{clinic_choice}",
+        disabled=not confirm_mismatch,
     ):
         _import_cash_records(sb, all_records)
 
