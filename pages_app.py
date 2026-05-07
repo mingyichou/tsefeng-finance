@@ -3535,6 +3535,74 @@ def page_alliance_settlement():
         )
 
     # ─────────────────────────────────────────────
+    # 0. DB 健康診斷
+    # ─────────────────────────────────────────────
+    def _safe_count(table_name: str, **filters) -> int | str:
+        try:
+            q = sb.table(table_name).select("*", count="exact")
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            resp = q.limit(1).execute()
+            return resp.count if resp.count is not None else len(resp.data or [])
+        except Exception as e:
+            return f"❌ {e!s:.40}"
+
+    inv_count = _safe_count("inventory_transfer", transfer_month=service_month)
+    pp_count = _safe_count("product_pricing")
+    tcm_count = _safe_count("tcm_concentrate_pricing")
+    ss_count = _safe_count("staff_salary_summary", service_month=service_month)
+
+    diag_rows = [
+        {
+            "資料來源": "inventory_transfer",
+            "範圍": f"{service_month[:7]}",
+            "筆數": inv_count,
+            "說明": "本月調貨明細（沛↔豐）",
+        },
+        {
+            "資料來源": "product_pricing",
+            "範圍": "全表",
+            "筆數": pp_count,
+            "說明": "自費商品成本（含廠商品項以外的 lookup）",
+        },
+        {
+            "資料來源": "tcm_concentrate_pricing",
+            "範圍": "全表",
+            "筆數": tcm_count,
+            "說明": "科中進貨價目（廠商品項 lookup）",
+        },
+        {
+            "資料來源": "staff_salary_summary",
+            "範圍": f"{service_month[:7]}",
+            "筆數": ss_count,
+            "說明": "員工薪資（含跨代付）",
+        },
+    ]
+    with st.expander("🩺 DB 健康診斷（先看這個）", expanded=False):
+        st.dataframe(
+            pd.DataFrame(diag_rows), use_container_width=True, hide_index=True
+        )
+        warnings = []
+        if isinstance(tcm_count, int) and tcm_count == 0:
+            warnings.append(
+                "⚠️ **科中進貨價目表為空**：所有含廠商的科中品項都會列為未匹配。"
+                "請至「📥 本月資料匯入區 → 科中進貨價目表」上傳。"
+            )
+        if isinstance(pp_count, int) and pp_count == 0:
+            warnings.append(
+                "⚠️ **自費商品成本表為空**：所有非廠商品項（護腰/膠囊/水藥等）"
+                "都會列為未匹配。請至「📥 本月資料匯入區 → 自費商品成本&售價」上傳。"
+            )
+        if isinstance(inv_count, int) and inv_count == 0:
+            warnings.append(
+                f"⚠️ **{service_month[:7]} 無調貨資料**：請至「調貨整理」上傳年度檔。"
+            )
+        for w in warnings:
+            st.warning(w)
+        if not warnings:
+            st.success("✅ 全部資料表皆有資料")
+
+    # ─────────────────────────────────────────────
     # 1. 商品調貨試算
     # ─────────────────────────────────────────────
     st.subheader("🛒 商品調貨試算")
