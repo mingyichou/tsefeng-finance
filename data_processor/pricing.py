@@ -217,60 +217,78 @@ def parse_self_pay_powder(
             "note": None,
         })
 
-    # ─── 下方廠商區塊 ───
-    # 狀態機：current_block_vendor + in_block
-    current_block_vendor: str | None = None
+    # ─── 下方廠商區塊（彈性 cost_col 偵測）───
+    #
+    # 處理三種 vendor 區塊格式：
+    #   A. 同列宣告：C0='大墩' C1='進價' [C2='備註']   → cost_col=1
+    #   B. 分列宣告：C0='上賀'\n C1='進價'              → cost_col=1
+    #   C. 多欄價：  C0='駿賀'\n C1='整袋價' C2='進價'  → cost_col=2
+    #              （駿賀區塊 11504 起新增「整袋價」欄；正規進價在 C2）
+
+    def _find_cost_col(r: int) -> int | None:
+        """在第 r 列尋找「進價」cell 所在的欄位 index；找不到回傳 None。"""
+        for c in range(1, min(df.shape[1], 6)):
+            if _norm_str(df.iloc[r, c]) == "進價":
+                return c
+        return None
+
+    current_vendor: str | None = None
+    cost_col: int = 1
     in_block = False
 
     r = transition_row
     while r < df.shape[0]:
         c0 = _norm_str(df.iloc[r, 0])
-        c1_raw = df.iloc[r, 1] if df.shape[1] > 1 else None
-        c1 = _norm_str(c1_raw)
-        c2 = _norm_str(df.iloc[r, 2]) if df.shape[1] > 2 else None
+        c0_is_number = _to_float(df.iloc[r, 0]) is not None
 
-        # 偵測「同列宣告」：C0=vendor + C1='進價'
-        if c0 and c1 == "進價" and not _to_float(df.iloc[r, 0]):
-            current_block_vendor = c0
-            in_block = True
+        cost_col_here = _find_cost_col(r)
+
+        if cost_col_here is not None:
+            # 標頭列：以本列「進價」位置為 cost_col
+            cost_col = cost_col_here
+            if c0 and not c0_is_number:
+                # 同列宣告：C0=vendor + 進價 header
+                current_vendor = c0
+            # 否則僅是 header（vendor 由前一列宣告）
+            in_block = bool(current_vendor)
             r += 1
             continue
 
-        # 偵測「分列宣告」：C0=vendor + C1/C2 空 + 下一列 C1='進價'
-        if c0 and not c1 and not c2 and not _to_float(df.iloc[r, 0]):
-            next_c1 = (
-                _norm_str(df.iloc[r + 1, 1])
-                if r + 1 < df.shape[0] and df.shape[1] > 1
-                else None
-            )
-            if next_c1 == "進價":
-                current_block_vendor = c0
-                in_block = False  # 等下一列的進價標頭啟動
+        # 沒有「進價」label 的列
+        if c0 and not c0_is_number:
+            # 檢查是否為純文字 vendor declaration（C1-C4 都不是數字）
+            is_text_only_row = True
+            for c in range(1, min(df.shape[1], 5)):
+                if _to_float(df.iloc[r, c]) is not None:
+                    is_text_only_row = False
+                    break
+            if is_text_only_row:
+                current_vendor = c0
+                in_block = False  # 等下一列 header
                 r += 1
                 continue
 
-        # 進價標頭列（C0 空 + C1='進價'）：啟動 block
-        if not c0 and c1 == "進價":
-            in_block = True
-            r += 1
-            continue
-
-        # 區塊內品項列：C0=品項, C1=進價數值
-        if in_block and current_block_vendor and c0:
-            cost = _to_float(c1_raw)
+        # 區塊內品項列：C0=品項，cost_col 處為價格數值
+        if in_block and current_vendor and c0:
+            cost = _to_float(df.iloc[r, cost_col]) if cost_col < df.shape[1] else None
             if cost is None:
                 # 無價格列（可能備註）— 跳過但不終止 block
                 r += 1
                 continue
-            note = c2
-            key = (current_block_vendor, c0)
+            # note 通常在 cost_col 之後一欄
+            note_col = cost_col + 1
+            note = (
+                _norm_str(df.iloc[r, note_col])
+                if note_col < df.shape[1] else None
+            )
+            key = (current_vendor, c0)
             if key in seen:
                 r += 1
                 continue
             seen.add(key)
             records.append({
                 "effective_month": effective_month,
-                "vendor": current_block_vendor,
+                "vendor": current_vendor,
                 "product_name": c0,
                 "cost_price": round(cost, 2),
                 "sale_price": None,
