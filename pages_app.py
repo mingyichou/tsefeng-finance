@@ -1495,11 +1495,13 @@ def _section_self_pay_pricing():
 
     sb = get_authed_client()
 
-    # 顯示目前 DB 狀態
+    # 顯示目前 DB 狀態（用 count=exact 取得真實筆數，不受 1000 上限影響）
     try:
-        existing_count = len(
-            sb.table("product_pricing").select("id").execute().data or []
+        resp = (
+            sb.table("product_pricing").select("id", count="exact")
+            .limit(1).execute()
         )
+        existing_count = resp.count if resp.count is not None else 0
         if existing_count:
             st.info(f"📋 目前 DB 有 **{existing_count}** 筆資料")
         else:
@@ -1588,11 +1590,24 @@ def _section_tcm_concentrate_pricing():
     sb = get_authed_client()
 
     try:
-        existing_count = len(
-            sb.table("tcm_concentrate_pricing").select("id").execute().data or []
+        # 用 count=exact 取得真實筆數（避免被 1000 列預設上限誤導）
+        resp = (
+            sb.table("tcm_concentrate_pricing").select("id", count="exact")
+            .limit(1).execute()
         )
+        existing_count = resp.count if resp.count is not None else 0
         if existing_count:
-            st.info(f"📋 目前 DB 有 **{existing_count}** 筆")
+            cat_resp = (
+                sb.table("tcm_concentrate_pricing")
+                .select("category", count="exact")
+                .eq("category", "複方").limit(1).execute()
+            )
+            fang_count = cat_resp.count if cat_resp.count is not None else 0
+            single_count = existing_count - fang_count
+            st.info(
+                f"📋 目前 DB 有 **{existing_count}** 筆 "
+                f"(複方 {fang_count} / 單方 {single_count})"
+            )
         else:
             st.info("📋 目前 DB 為空")
     except Exception as e:
@@ -3621,21 +3636,34 @@ def page_alliance_settlement():
         priced_items: list = []
         unmatched: list = []
     else:
+        # Supabase PostgREST 預設單次 SELECT 上限 1000 筆；
+        # tcm_concentrate_pricing 有 1300+ 筆 → 用 range 分頁全部取回。
+        def _fetch_all(table_name: str, cols: str, chunk: int = 1000):
+            out: list[dict] = []
+            offset = 0
+            while True:
+                resp = (
+                    sb.table(table_name).select(cols)
+                    .range(offset, offset + chunk - 1).execute()
+                )
+                rows = resp.data or []
+                out.extend(rows)
+                if len(rows) < chunk:
+                    break
+                offset += chunk
+            return out
+
         try:
-            tcm_rows = (
-                sb.table("tcm_concentrate_pricing")
-                .select("category, vendor, product_name, price")
-                .execute().data
-            ) or []
+            tcm_rows = _fetch_all(
+                "tcm_concentrate_pricing", "category, vendor, product_name, price"
+            )
         except Exception as e:
             st.warning(f"科中價目表讀取失敗（{e}）— 含廠商品項都會被列為未匹配")
             tcm_rows = []
         try:
-            pp_rows = (
-                sb.table("product_pricing")
-                .select("vendor, product_name, cost_price")
-                .execute().data
-            ) or []
+            pp_rows = _fetch_all(
+                "product_pricing", "vendor, product_name, cost_price"
+            )
         except Exception as e:
             st.warning(f"自費商品價目表讀取失敗（{e}）")
             pp_rows = []
