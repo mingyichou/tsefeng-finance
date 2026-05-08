@@ -1121,8 +1121,8 @@ def _section_cash_visits():
         )
     with col2:
         uploaded_files = st.file_uploader(
-            f"上傳 {clinic_choice} 醫師自費統計（多份 xlsx）",
-            type=["xlsx"],
+            f"上傳 {clinic_choice} 醫師自費統計（多份 xlsx/xls）",
+            type=["xlsx", "xls"],
             accept_multiple_files=True,
             key=f"cash_uploader_{clinic_choice}",
         )
