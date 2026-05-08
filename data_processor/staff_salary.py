@@ -32,11 +32,14 @@ import pandas as pd
 SHEET_RE = re.compile(r"^薪資條(\d{3})年(\d{1,2})月(-更正)?$")
 
 # 標題（含「薪資明細」「薪資計算」皆視為區塊邊界）
-# group 3=owner、group 4=payer；無代付則 None
+# group 3=owner、group 4=payer；皆可選
+# 支援兩種代付寫法：
+#   1. 「XXX年XX月澤豐薪資明細(澤沛代付)」 — 完整 owner+payer
+#   2. 「XXX年XX月薪資明細(澤豐代付)」     — 省略 owner（=檔案 default 診所）
 # 「薪資計算」雖非員工最終區塊但可分區，用於正確切割員工範圍
 TITLE_RE = re.compile(
     r"(\d{3})年(\d{1,2})月.*?"
-    r"(?:(澤豐|澤沛)薪資明細\((澤豐|澤沛)代付\)|薪資明細|薪資計算)"
+    r"(?:(澤豐|澤沛)?薪資明細(?:\((澤豐|澤沛)代付\))?|薪資計算)"
 )
 # 「薪資計算」型標題（左欄常見，配合右欄代付區塊出現）— 不產出 records
 SECTION_ONLY_RE = re.compile(r"(\d{3})年(\d{1,2})月.*?薪資計算")
@@ -150,11 +153,15 @@ def parse_staff_salary(
                 and (t_y, t_m) == (target_roc_y, target_roc_m)
             )
             is_section_only = bool(SECTION_ONLY_RE.search(s))
+            owner = m.group(3)        # 可能 None
+            payer = m.group(4)        # 可能 None
+            # is_daifu: 有 (XX代付) 即視為跨代付，owner 可省略
+            is_daifu = bool(payer)
             titles.append({
                 "r": r, "c": c,
-                "owner": m.group(3),
-                "payer": m.group(4),
-                "is_daifu": bool(m.group(3) and m.group(4)),
+                "owner": owner,
+                "payer": payer,
+                "is_daifu": is_daifu,
                 "is_target": is_target,
                 "skip_record": is_section_only or not is_target,
             })
@@ -195,10 +202,18 @@ def parse_staff_salary(
 
         # 決定 clinic / paid_by
         if title["is_daifu"]:
-            clinic_id = clinic_short_to_id.get(title["owner"])
-            paid_by_id = clinic_short_to_id.get(title["payer"])
+            # owner 可能省略（如「薪資明細(澤豐代付)」）→ 取 default
+            owner = title["owner"]
+            payer = title["payer"]
+            clinic_id = (
+                clinic_short_to_id.get(owner) if owner else default_clinic_id
+            )
+            paid_by_id = clinic_short_to_id.get(payer)
             if clinic_id is None or paid_by_id is None:
                 continue
+            # 若 owner = payer（自付而非代付）退回普通歸屬
+            if clinic_id == paid_by_id:
+                paid_by_id = None
         else:
             clinic_id = default_clinic_id
             paid_by_id = None
