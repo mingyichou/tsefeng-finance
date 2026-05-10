@@ -714,6 +714,84 @@ def _section_doctor_personal_compare(sb):
     else:
         st.info("該月份無產值/成本資料")
 
+    # ─── 圖 4：合理門診量（5 階段堆疊）───────────────
+    st.subheader("📊 合理門診量（五階段堆疊）")
+    st.caption(
+        "下→上：1-30 / 31-50 / 51-70 / 71-150 / 151-1000 人次。"
+        "支援醫師欄位 = 各正職「補支援醫師數」歸給該診所支援醫師（從末階段往前扣）。"
+    )
+    try:
+        cap_rows = (sb.table("doctor_capacity_stage").select("*")
+                    .eq("service_month", sel_m).execute().data)
+    except Exception as e:
+        cap_rows = []
+        st.warning(f"合理門診量資料載入失敗（表可能未建立）：{e}")
+
+    if not cap_rows:
+        st.info(f"{sel_m[:7]} 尚無合理門診量資料；請至「📥 本月資料匯入 → 合理門診量」上傳")
+    else:
+        cap_idx = {(r["clinic_id"], r["doctor_id"]): r for r in cap_rows}
+        STAGE_NAMES = ["1-30", "31-50", "51-70", "71-150", "151-1000"]
+        STAGE_COLORS = ["#4B0082", "#6A5ACD", "#9370DB", "#BA55D3", "#DDA0DD"]
+        rows4: list[dict] = []
+
+        def _add_cap(scope: str, name: str, stages: list[int]):
+            if sum(stages) == 0:
+                return
+            for i, stg in enumerate(stages):
+                rows4.append({
+                    "分組": scope, "醫師": name,
+                    "顯示": f"{SCOPE_PREFIX[scope]} {name}",
+                    "排序": {"澤豐": 1, "澤沛": 2, "全院": 3}[scope],
+                    "階段": STAGE_NAMES[i],
+                    "階段序": i,
+                    "人次": int(stg),
+                })
+
+        def _stages_of(c_id: int, d_id: int) -> list[int]:
+            r = cap_idx.get((c_id, d_id))
+            if not r:
+                return [0] * 5
+            return [r.get(f"stage{i+1}") or 0 for i in range(5)]
+
+        for name in fz_doctors:
+            _add_cap("澤豐", name, _stages_of(fz_id, name_to_did[name]))
+        for name in fp_doctors:
+            _add_cap("澤沛", name, _stages_of(fp_id, name_to_did[name]))
+        for name in all_doctors:
+            d_id = name_to_did[name]
+            both = [a + b for a, b in zip(
+                _stages_of(fz_id, d_id), _stages_of(fp_id, d_id))]
+            _add_cap("全院", name, both)
+
+        if rows4:
+            df4 = pd.DataFrame(rows4)
+            order4 = (df4[["顯示", "排序", "醫師"]].drop_duplicates()
+                      .sort_values(["排序", "醫師"])["顯示"].tolist())
+            ch4 = alt.Chart(df4).mark_bar().encode(
+                x=alt.X("顯示:N", sort=order4,
+                        axis=alt.Axis(labelAngle=-30, title=None)),
+                y=alt.Y("人次:Q", stack="zero"),
+                color=alt.Color("階段:N",
+                    scale=alt.Scale(domain=STAGE_NAMES, range=STAGE_COLORS),
+                    sort=STAGE_NAMES,
+                ),
+                order=alt.Order("階段序:Q", sort="ascending"),
+                tooltip=["分組", "醫師", "階段",
+                        alt.Tooltip("人次:Q", format=",")],
+            ).properties(height=400)
+            st.altair_chart(ch4, use_container_width=True)
+
+            with st.expander("📋 合理門診量明細", expanded=False):
+                wide = (df4.pivot_table(
+                    index=["分組", "醫師"], columns="階段",
+                    values="人次", aggfunc="sum", fill_value=0)
+                    .reindex(columns=STAGE_NAMES).reset_index())
+                wide["合計"] = wide[STAGE_NAMES].sum(axis=1)
+                st.dataframe(wide, use_container_width=True, hide_index=True)
+        else:
+            st.info("該月份合理門診量全為 0")
+
 
 # ============================================================
 # 2. 收支總覽（Phase 4 月度損益）
@@ -1190,6 +1268,11 @@ def page_import():
 
     st.divider()
 
+    # ─── 合理門診量（批次）──────────────────────────
+    _section_capacity_quota()
+
+    st.divider()
+
     # ─── 現金支出 ────────────────────────────────────
     _section_cash_expense()
 
@@ -1234,7 +1317,6 @@ def page_import():
     st.divider()
     st.markdown("**🚧 其他資料來源（待實作）：**")
     st.markdown("""
-    - 合理門診量
     - 員工薪資表、@科中進貨價目表
     - 自費商品其他 sheets（自費藥粉、金流計算表）
     """)
@@ -3051,6 +3133,141 @@ def _import_visit_records(
             st.code(e)
     elif doctor_records or clinic_rates:
         st.balloons()
+
+
+def _section_capacity_quota():
+    """合理門診量批次上傳（11503+）"""
+    from data_processor.capacity_quota import (
+        parse_filename as parse_cq_filename,
+        parse_capacity_quota,
+    )
+
+    st.subheader("📊 合理門診量（批次）")
+    st.caption(
+        "檔名範例：『11503澤豐合理門診量.xlsx』。"
+        "5 階段(1-30 / 31-50 / 51-70 / 71-150 / 151-1000)。"
+        "「補支援醫師數」從末階段往前扣，被扣量自動歸給該診所支援醫師"
+        "（從醫師主檔 role='support' 配置抓）。"
+    )
+
+    uploaded_files = st.file_uploader(
+        "上傳一份或多份 xlsx",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="cq_uploader",
+    )
+    if not uploaded_files:
+        return
+
+    sb = get_authed_client()
+    clinics_resp = sb.table("clinics").select("id, short_name").execute()
+    short_to_cid = {c["short_name"]: c["id"] for c in clinics_resp.data}
+    cid_to_short = {c["id"]: c["short_name"] for c in clinics_resp.data}
+
+    doctors_resp = sb.table("doctors").select("id, name").execute()
+    name_to_did = {d["name"]: d["id"] for d in doctors_resp.data}
+    did_to_name = {d["id"]: d["name"] for d in doctors_resp.data}
+
+    # 該診所支援醫師（role='support'）
+    dc_resp = (sb.table("doctor_clinic")
+               .select("clinic_id, doctor_id, role")
+               .eq("role", "support").execute())
+    support_by_clinic: dict[int, list[int]] = {}
+    for r in dc_resp.data:
+        support_by_clinic.setdefault(r["clinic_id"], []).append(r["doctor_id"])
+
+    all_records: list[dict] = []
+    summaries: list[dict] = []
+    errors: list[str] = []
+    months_per_clinic: set[tuple[int, str]] = set()
+
+    for f in uploaded_files:
+        try:
+            meta = parse_cq_filename(f.name)
+            cid = short_to_cid.get(meta["clinic_short"])
+            if cid is None:
+                raise ValueError(f"檔名診所 {meta['clinic_short']} 不在 clinics 表")
+            sup_list = support_by_clinic.get(cid, [])
+            sup_did = sup_list[0] if sup_list else None
+            sup_warn = (
+                f"⚠️ 該診所有 {len(sup_list)} 位 role='support'，先取 "
+                f"{did_to_name.get(sup_list[0], '?')}"
+                if len(sup_list) > 1 else
+                "⚠️ 該診所未配置 role='support' 支援醫師，被扣量無法歸屬"
+                if not sup_list else None
+            )
+            recs, info = parse_capacity_quota(
+                f, f.name, cid, name_to_did, sup_did,
+            )
+            all_records.extend(recs)
+            months_per_clinic.add((cid, info["service_month"]))
+            row_count = sum(1 for r in recs if not r.get("is_support"))
+            sup_count = sum(1 for r in recs if r.get("is_support"))
+            summaries.append({
+                "檔名": f.name,
+                "診所": meta["clinic_short"],
+                "服務月": info["service_month"],
+                "正職醫師": row_count,
+                "支援醫師 row": sup_count,
+                "補支援總數": info["total_offset"],
+                "支援歸屬": did_to_name.get(sup_did) if sup_did else "—",
+                "未識別": ",".join(info.get("unknown_doctors") or []) or "—",
+                "備註": sup_warn or "",
+            })
+        except Exception as e:
+            errors.append(f"{f.name}：{e}")
+
+    if errors:
+        st.error("部分檔案解析失敗：")
+        for e in errors:
+            st.code(e)
+    if not summaries:
+        return
+
+    st.markdown("**檔案彙整：**")
+    st.dataframe(pd.DataFrame(summaries), use_container_width=True, hide_index=True)
+
+    if all_records:
+        preview = pd.DataFrame(all_records).copy()
+        preview["診所"] = preview["clinic_id"].map(cid_to_short)
+        preview["醫師"] = preview["doctor_id"].map(did_to_name)
+        preview["角色"] = preview["is_support"].map({True: "支援", False: "主聘"})
+        cols = [
+            "service_month", "診所", "醫師", "角色",
+            "stage1", "stage2", "stage3", "stage4", "stage5",
+            "support_offset",
+        ]
+        st.markdown("**醫師資料預覽：**")
+        st.dataframe(preview[cols], use_container_width=True, hide_index=True)
+
+    if st.button(
+        f"💾 確認匯入（{len(all_records)} 筆，月份覆蓋）",
+        type="primary",
+        key="cq_import_btn",
+    ):
+        _import_capacity_quota(sb, all_records, months_per_clinic)
+
+
+def _import_capacity_quota(
+    sb,
+    records: list[dict],
+    months_per_clinic: set[tuple[int, str]],
+):
+    """月份覆蓋寫入 doctor_capacity_stage：先 DELETE 再 INSERT。"""
+    if not records:
+        return
+    try:
+        # 先刪除涉及的 (clinic_id, service_month) 既有列
+        for cid, sm in months_per_clinic:
+            sb.table("doctor_capacity_stage").delete().eq(
+                "clinic_id", cid
+            ).eq("service_month", sm).execute()
+        # 再 insert
+        sb.table("doctor_capacity_stage").insert(records).execute()
+        st.success(f"✅ 寫入 {len(records)} 筆，覆蓋 {len(months_per_clinic)} 個 (診所×月)")
+        st.balloons()
+    except Exception as e:
+        st.error(f"寫入失敗：{e}")
 
 
 def _import_cash_records(sb, records: list[dict]):
