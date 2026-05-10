@@ -258,8 +258,21 @@ def page_dashboard():
 
 
 # ─── 醫師業績比較區塊（dashboard 下半部）────────────────────
+def _nurse_head_count(avg_visits: float) -> int:
+    """依當月該醫師健保平均人次判定護理師&助理人數。
+    ≤ 10 → 1；10 < x ≤ 15 → 2；15 < x ≤ 30 → 3；> 30 → 4
+    """
+    if avg_visits <= 10:
+        return 1
+    if avg_visits <= 15:
+        return 2
+    if avg_visits <= 30:
+        return 3
+    return 4
+
+
 def _get_nurse_cost_params(sb) -> tuple[float, float]:
-    """讀 system_settings 取護理師月薪與月診數；若表/列不存在用預設 35000/40。"""
+    """讀 system_settings 取護理師&助理平均薪資、月上班診數；表/列不存在用預設 35000/40。"""
     try:
         rows = (
             sb.table("system_settings")
@@ -479,23 +492,38 @@ def _section_doctor_personal_compare(sb):
 
     # ─── 圖 3：產值估算 vs 成本 ─────────────────
     nurse_salary, nurse_sessions = _get_nurse_cost_params(sb)
-    nurse_per_session = nurse_salary / nurse_sessions if nurse_sessions else 0
-    st.subheader("⚖️ 醫師產值估算 vs 成本（醫師薪資 + 護理師成本）")
+    base_per_session = nurse_salary / nurse_sessions if nurse_sessions else 0
+    st.subheader("⚖️ 醫師產值估算 vs 成本（醫師薪資 + 護理師&助理成本）")
     st.caption(
-        f"護理師單診成本 = {nurse_salary:,.0f} / {nurse_sessions:,.0f} = "
-        f"{nurse_per_session:,.0f} 元/診（可在「⚙️ 系統設定」→「成本參數」調整）"
+        f"護理師&助理成本 = 平均薪資({nurse_salary:,.0f}) / 月上班診數({nurse_sessions:,.0f}) "
+        f"× 該醫師當月診數 × **人數**\n\n"
+        f"人數依當月**該醫師**健保平均人次階梯：≤10 → 1；11–15 → 2；16–30 → 3；>30 → 4"
+        f"（可在「⚙️ 系統設定 → 成本參數」調整薪資/診數）"
     )
 
     rows3: list[dict] = []
-    def _entry(scope: str, name: str, prod: int, salary: int, sess: int):
-        nurse_cost = round(sess * nurse_per_session)
+
+    def _nurse_cost_per_clinic(c_id: int, d_id: int) -> tuple[int, int, float, int]:
+        """單一 (clinic, doctor) 的護理師&助理成本。
+        回傳 (cost, sessions, avg_visits, head_count)
+        """
+        v = visit_idx.get((c_id, d_id))
+        if not v:
+            return 0, 0, 0.0, 0
+        sess = v.get("sessions_total") or 0
+        nhi = v.get("nhi_visits_total") or 0
+        avg = (nhi / sess) if sess else 0.0
+        count = _nurse_head_count(avg)
+        return round(base_per_session * sess * count), sess, avg, count
+
+    def _entry(scope: str, name: str, prod: int, salary: int, nurse_cost: int):
         rows3.append({
             "分組": scope, "醫師": name,
             "顯示": f"{scope[0]} {name}",
             "排序": {"澤豐": 1, "澤沛": 2, "全院": 3}[scope],
             "產值": int(prod),
             "醫師薪資": int(salary),
-            "護理師成本": int(nurse_cost),
+            "護理師&助理成本": int(nurse_cost),
             "成本合計": int(salary + nurse_cost),
         })
 
@@ -504,15 +532,15 @@ def _section_doctor_personal_compare(sb):
         prod = _compute_productivity(out_idx.get((fz_id, d_id)),
                                       cash_idx.get((fz_id, d_id)), "澤豐")
         sal = _salary_gross(sal_idx.get((fz_id, d_id)))
-        sess = (visit_idx.get((fz_id, d_id)) or {}).get("sessions_total") or 0
-        _entry("澤豐", name, prod, sal, sess)
+        nurse_c, _, _, _ = _nurse_cost_per_clinic(fz_id, d_id)
+        _entry("澤豐", name, prod, sal, nurse_c)
     for name in fp_doctors:
         d_id = name_to_did[name]
         prod = _compute_productivity(out_idx.get((fp_id, d_id)),
                                       cash_idx.get((fp_id, d_id)), "澤沛")
         sal = _salary_gross(sal_idx.get((fp_id, d_id)))
-        sess = (visit_idx.get((fp_id, d_id)) or {}).get("sessions_total") or 0
-        _entry("澤沛", name, prod, sal, sess)
+        nurse_c, _, _, _ = _nurse_cost_per_clinic(fp_id, d_id)
+        _entry("澤沛", name, prod, sal, nurse_c)
     for name in all_doctors:
         d_id = name_to_did[name]
         prod_sum = (
@@ -523,19 +551,20 @@ def _section_doctor_personal_compare(sb):
         )
         sal_sum = (_salary_gross(sal_idx.get((fz_id, d_id)))
                    + _salary_gross(sal_idx.get((fp_id, d_id))))
-        sess_sum = sum((visit_idx.get((c, d_id)) or {}).get("sessions_total") or 0
-                       for c in (fz_id, fp_id))
-        _entry("全院", name, prod_sum, sal_sum, sess_sum)
+        # 全院護理師成本 = 兩院各自算後加總（人數依各院當月平均人次獨立判定）
+        nurse_sum = (_nurse_cost_per_clinic(fz_id, d_id)[0]
+                     + _nurse_cost_per_clinic(fp_id, d_id)[0])
+        _entry("全院", name, prod_sum, sal_sum, nurse_sum)
 
     if rows3:
         df3 = pd.DataFrame(rows3)
-        # long format：每位醫師 3 個 row（產值 / 薪資 / 護理師），用 類型 區分左右兩柱
-        prod_part = df3.assign(類型="產值",  細項="產值",
+        # long format：每位醫師 3 個 row（產值 / 薪資 / 護理師&助理），類型分左右兩柱
+        prod_part = df3.assign(類型="產值", 細項="產值",
                                金額=df3["產值"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
-        sal_part = df3.assign(類型="成本",  細項="醫師薪資",
-                               金額=df3["醫師薪資"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
-        nur_part = df3.assign(類型="成本",  細項="護理師成本",
-                               金額=df3["護理師成本"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
+        sal_part = df3.assign(類型="成本", 細項="醫師薪資",
+                              金額=df3["醫師薪資"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
+        nur_part = df3.assign(類型="成本", 細項="護理師&助理成本",
+                              金額=df3["護理師&助理成本"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
         long3 = pd.concat([prod_part, sal_part, nur_part], ignore_index=True)
         order3 = df3.sort_values(["排序","醫師"])["顯示"].tolist()
 
@@ -544,7 +573,7 @@ def _section_doctor_personal_compare(sb):
             xOffset=alt.XOffset("類型:N", sort=["產值", "成本"]),
             y=alt.Y("金額:Q", stack="zero"),
             color=alt.Color("細項:N", scale=alt.Scale(
-                domain=["產值", "醫師薪資", "護理師成本"],
+                domain=["產值", "醫師薪資", "護理師&助理成本"],
                 range=["#6A5ACD", "#3CB371", "#FFA07A"],
             )),
             tooltip=["分組", "醫師", "細項", alt.Tooltip("金額:Q", format=",")],
@@ -552,11 +581,31 @@ def _section_doctor_personal_compare(sb):
         st.altair_chart(ch3, use_container_width=True)
 
         with st.expander("📋 產值/成本明細表", expanded=False):
-            view = df3[["分組", "醫師", "產值", "醫師薪資", "護理師成本", "成本合計"]].copy()
+            view = df3[["分組", "醫師", "產值", "醫師薪資", "護理師&助理成本", "成本合計"]].copy()
             view["產值-成本"] = view["產值"] - view["成本合計"]
-            for c in ("產值", "醫師薪資", "護理師成本", "成本合計", "產值-成本"):
+            for c in ("產值", "醫師薪資", "護理師&助理成本", "成本合計", "產值-成本"):
                 view[c] = view[c].map(lambda v: f"{v:,}")
             st.dataframe(view, use_container_width=True, hide_index=True)
+
+        # 護理師人數判定明細（透明化）
+        with st.expander("👩‍⚕️ 護理師&助理人數判定（依平均人次階梯）", expanded=False):
+            head_rows = []
+            for c_id, c_short in [(fz_id, "澤豐"), (fp_id, "澤沛")]:
+                for name in (fz_doctors if c_short == "澤豐" else fp_doctors):
+                    d_id = name_to_did[name]
+                    cost, sess, avg, count = _nurse_cost_per_clinic(c_id, d_id)
+                    if sess == 0 and cost == 0:
+                        continue
+                    head_rows.append({
+                        "診所": c_short, "醫師": name,
+                        "診數": sess,
+                        "平均人次": round(avg, 2),
+                        "人數": count,
+                        "成本": f"{cost:,}",
+                    })
+            if head_rows:
+                st.dataframe(pd.DataFrame(head_rows),
+                             use_container_width=True, hide_index=True)
     else:
         st.info("該月份無產值/成本資料")
 
@@ -3788,11 +3837,12 @@ def _settings_insurance_deductions(sb):
 
 
 def _settings_cost_params(sb):
-    """成本參數（system_settings）：護理師月薪、月診數，給產值估算用。"""
+    """成本參數（system_settings）：護理師&助理平均薪資、月上班診數，給產值估算用。"""
     st.subheader("成本參數")
     st.caption(
-        "供「業績儀表板 → 醫師個人業績比較 → 產值估算 vs 成本」計算用。"
-        "護理師單診成本 = 月薪 / 月診數。"
+        "供「業績儀表板 → 醫師個人業績比較 → 產值估算 vs 成本」計算用。\n\n"
+        "護理師&助理成本 = 平均薪資 / 月上班診數 × 該醫師當月診數 × **人數**\n\n"
+        "人數依當月該醫師健保平均人次階梯：≤10→1；11–15→2；16–30→3；>30→4"
     )
 
     try:
@@ -3810,14 +3860,15 @@ def _settings_cost_params(sb):
     cur = {r["key"]: r for r in rows}
     cur_salary = float((cur.get("nurse_monthly_salary") or {}).get("value", 35000))
     cur_sessions = float((cur.get("nurse_monthly_sessions") or {}).get("value", 40))
+    base_per_session = (cur_salary / cur_sessions) if cur_sessions else 0
 
     if not st.session_state.get("edit_mode"):
         col1, col2, col3 = st.columns(3)
-        col1.metric("護理師月薪", f"NT${cur_salary:,.0f}")
+        col1.metric("護理師&助理平均薪資", f"NT${cur_salary:,.0f}")
         col2.metric("月上班診數", f"{cur_sessions:,.0f}")
         col3.metric(
-            "單診成本",
-            f"NT${cur_salary / cur_sessions:,.0f}" if cur_sessions else "—",
+            "基準單診成本（×人數前）",
+            f"NT${base_per_session:,.0f}" if cur_sessions else "—",
         )
         st.info("⚠️ 唯讀模式。如需修改，請啟用左下「編輯模式」。")
         return
@@ -3827,17 +3878,17 @@ def _settings_cost_params(sb):
         c1, c2 = st.columns(2)
         with c1:
             new_salary = st.number_input(
-                "護理師月薪", min_value=0, step=1000,
+                "護理師&助理平均薪資", min_value=0, step=1000,
                 value=int(cur_salary),
             )
         with c2:
             new_sessions = st.number_input(
-                "護理師月上班診數", min_value=1, step=1,
+                "月上班診數", min_value=1, step=1,
                 value=int(cur_sessions),
             )
         st.caption(
-            f"預覽：單診成本 = {new_salary:,} / {new_sessions} = "
-            f"{new_salary / new_sessions:,.0f} 元/診"
+            f"預覽：基準單診成本 = {new_salary:,} / {new_sessions} = "
+            f"{new_salary / new_sessions:,.0f} 元/診（最後 ×人數）"
             if new_sessions else "預覽：診數需 > 0"
         )
         if st.form_submit_button("💾 儲存", type="primary"):
@@ -3845,9 +3896,9 @@ def _settings_cost_params(sb):
                 sb.table("system_settings").upsert(
                     [
                         {"key": "nurse_monthly_salary",   "value": new_salary,
-                         "description": "護理師月薪（產值估算用）"},
+                         "description": "護理師&助理平均薪資（產值估算用）"},
                         {"key": "nurse_monthly_sessions", "value": new_sessions,
-                         "description": "護理師月上班診數（產值估算用）"},
+                         "description": "月上班診數（產值估算用）"},
                     ],
                     on_conflict="key",
                 ).execute()
