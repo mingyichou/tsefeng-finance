@@ -408,8 +408,11 @@ def _section_doctor_personal_compare(sb):
     visit_idx = {(r["clinic_id"], r["doctor_id"]): r for r in visit_rows}
     sal_idx = {(r["clinic_id"], r["doctor_id"]): r for r in salary_rows}
 
-    # 各院醫師清單（以該月出現於 outpatient 或 visit_stats 為憑）
-    keys_present = set(out_idx.keys()) | set(visit_idx.keys())
+    # 各院醫師清單（union 四源；確保支援醫師也被列入：他可能只有 salary/visit 而無 outpatient）
+    keys_present = (
+        set(out_idx.keys()) | set(visit_idx.keys())
+        | set(sal_idx.keys()) | set(cash_idx.keys())
+    )
     fz_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present if c_id == fz_id})
     fp_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present if c_id == fp_id})
     all_doctors = sorted(set(fz_doctors) | set(fp_doctors))
@@ -474,18 +477,21 @@ def _section_doctor_personal_compare(sb):
         return (c.get("cash_total_excl_reg") if c else 0) or 0
 
     for name in fz_doctors:
+        amt = _cash_total(fz_id, name_to_did[name])
+        if amt == 0: continue
         rows2.append({"分組": "澤豐", "醫師": name, "排序": 1,
-                      "顯示": f"豐 {name}",
-                      "金額": _cash_total(fz_id, name_to_did[name])})
+                      "顯示": f"豐 {name}", "金額": amt})
     for name in fp_doctors:
+        amt = _cash_total(fp_id, name_to_did[name])
+        if amt == 0: continue
         rows2.append({"分組": "澤沛", "醫師": name, "排序": 2,
-                      "顯示": f"沛 {name}",
-                      "金額": _cash_total(fp_id, name_to_did[name])})
+                      "顯示": f"沛 {name}", "金額": amt})
     for name in all_doctors:
         d_id = name_to_did[name]
+        total = _cash_total(fz_id, d_id) + _cash_total(fp_id, d_id)
+        if total == 0: continue
         rows2.append({"分組": "全院", "醫師": name, "排序": 3,
-                      "顯示": f"全 {name}",
-                      "金額": _cash_total(fz_id, d_id) + _cash_total(fp_id, d_id)})
+                      "顯示": f"全 {name}", "金額": total})
     _render_grouped_bar(rows2, "金額", ",", "💰 自費銷售額（醫師自費統計「自費合計」總計列；不含掛號費）")
 
     # ─── 圖 3：產值估算 vs 成本 ─────────────────
@@ -531,6 +537,8 @@ def _section_doctor_personal_compare(sb):
                                       cash_idx.get((fz_id, d_id)), "澤豐")
         sal = _salary_gross(sal_idx.get((fz_id, d_id)))
         nurse_c, _, _, _ = _nurse_cost_per_clinic(fz_id, d_id)
+        if prod == 0 and sal == 0 and nurse_c == 0:
+            continue
         _entry("澤豐", name, prod, sal, nurse_c)
     for name in fp_doctors:
         d_id = name_to_did[name]
@@ -538,6 +546,8 @@ def _section_doctor_personal_compare(sb):
                                       cash_idx.get((fp_id, d_id)), "澤沛")
         sal = _salary_gross(sal_idx.get((fp_id, d_id)))
         nurse_c, _, _, _ = _nurse_cost_per_clinic(fp_id, d_id)
+        if prod == 0 and sal == 0 and nurse_c == 0:
+            continue
         _entry("澤沛", name, prod, sal, nurse_c)
     for name in all_doctors:
         d_id = name_to_did[name]
@@ -552,6 +562,8 @@ def _section_doctor_personal_compare(sb):
         # 全院護理師成本 = 兩院各自算後加總（人數依各院當月平均人次獨立判定）
         nurse_sum = (_nurse_cost_per_clinic(fz_id, d_id)[0]
                      + _nurse_cost_per_clinic(fp_id, d_id)[0])
+        if prod_sum == 0 and sal_sum == 0 and nurse_sum == 0:
+            continue
         _entry("全院", name, prod_sum, sal_sum, nurse_sum)
 
     if rows3:
