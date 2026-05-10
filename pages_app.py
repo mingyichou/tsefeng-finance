@@ -25,6 +25,7 @@ def page_dashboard():
         outpatient = sb.table("doctor_outpatient_summary").select("*").execute().data
         cash_monthly = sb.table("doctor_cash_monthly").select("*").execute().data
         visit_stats = sb.table("doctor_visit_stats").select("*").execute().data
+        clinic_rates = sb.table("clinic_visit_rates").select("*").execute().data
     except Exception as e:
         st.error(f"資料庫讀取失敗：{e}")
         return
@@ -187,6 +188,53 @@ def page_dashboard():
             tooltip=["月份", "診所", "類別", alt.Tooltip("金額:Q", format=",")],
         ).properties(height=350)
         st.altair_chart(bar2, use_container_width=True)
+
+    # ─── 初診人數 & 初診率分析 ───
+    st.divider()
+    st.subheader("🆕 初診人數 & 初診率分析")
+    rates_df = pd.DataFrame(clinic_rates) if clinic_rates else pd.DataFrame()
+    if rates_df.empty:
+        st.info("尚無 clinic_visit_rates 資料（健保人數+初診統計表）")
+    else:
+        rates_f = rates_df[rates_df["service_month"].isin(sel_months)].copy()
+        if clinic_filter != "全部":
+            cid = next(c["id"] for c in clinics_data if c["short_name"] == clinic_filter)
+            rates_f = rates_f[rates_f["clinic_id"] == cid]
+        if rates_f.empty:
+            st.info("該篩選條件下無初診資料")
+        else:
+            rates_f["診所"] = rates_f["clinic_id"].map(cid_to_short)
+            rates_f["月份"] = rates_f["service_month"].str[:7]
+            rates_f["初診率(%)"] = (
+                pd.to_numeric(rates_f["first_visit_rate"], errors="coerce") * 100
+            ).round(2)
+            rates_f["初診人數"] = pd.to_numeric(
+                rates_f["first_visit_count"], errors="coerce"
+            ).fillna(0).astype(int)
+
+            c_left, c_right = st.columns(2)
+            with c_left:
+                ch_count = alt.Chart(rates_f).mark_bar().encode(
+                    x=alt.X("月份:N", sort="ascending"),
+                    y=alt.Y("初診人數:Q"),
+                    color=alt.Color("診所:N",
+                        scale=alt.Scale(range=["#6A5ACD", "#FFA07A"])),
+                    xOffset="診所:N",
+                    tooltip=["月份", "診所",
+                            alt.Tooltip("初診人數:Q", format=",")],
+                ).properties(height=320, title="初診人數")
+                st.altair_chart(ch_count, use_container_width=True)
+            with c_right:
+                ch_rate = alt.Chart(rates_f).mark_bar().encode(
+                    x=alt.X("月份:N", sort="ascending"),
+                    y=alt.Y("初診率(%):Q"),
+                    color=alt.Color("診所:N",
+                        scale=alt.Scale(range=["#6A5ACD", "#FFA07A"])),
+                    xOffset="診所:N",
+                    tooltip=["月份", "診所",
+                            alt.Tooltip("初診率(%):Q", format=".2f")],
+                ).properties(height=320, title="初診率 (%)")
+                st.altair_chart(ch_rate, use_container_width=True)
 
     # ─── 看診結構（健保人次分布）───
     st.divider()
