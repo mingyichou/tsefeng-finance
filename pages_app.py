@@ -289,51 +289,71 @@ def _get_nurse_cost_params(sb) -> tuple[float, float]:
         return 35000.0, 40.0
 
 
-def _compute_productivity(
-    out_row: dict, cash_row: dict | None, clinic_short: str
-) -> int:
-    """醫師產值估算公式（澤豐/澤沛兩套）。
+def _productivity_breakdown(
+    out_row: dict | None, cash_row: dict | None, clinic_short: str
+) -> dict:
+    """醫師產值估算公式拆解（澤豐/澤沛兩套）。回傳所有中間值。
 
     澤豐：(診察費 + 內科費*0.2 + 處(內+xx)*0.3 + 純xx*0.5 + 調劑費)*0.9
-         + 掛號費 + 自費(內服+外用+保養+飲片)*0.3 + 自費(針+傷+脫)*0.5
+         + 掛號費 + 自費(內服+外用+保養+飲片)*0.3 + 自費(針+傷+脫)*0.4
          + 自費(檢驗)*0.8 + 自費(診察) + 自費(其他)
     澤沛：(診察費 + 藥費*0.2 + 處置費*0.5 + 調劑費)*0.9 + 同上自費部分
     """
     g = lambda d, k: (d.get(k) or 0) if d else 0
+    consult_nhi = g(out_row, "nhi_consult_fee")
+    drug_nhi = g(out_row, "nhi_drug_fee")
+    dispense_nhi = g(out_row, "nhi_dispense_fee")
     if clinic_short == "澤豐":
-        nhi_part = (
-            g(out_row, "nhi_consult_fee")
-            + g(out_row, "nhi_drug_fee") * 0.2
-            + g(out_row, "nhi_combo_treatment") * 0.3
-            + g(out_row, "nhi_pure_treatment") * 0.5
-            + g(out_row, "nhi_dispense_fee")
-        ) * 0.9
+        combo = g(out_row, "nhi_combo_treatment")
+        pure = g(out_row, "nhi_pure_treatment")
+        treatment_single = 0
+        nhi_pre = (consult_nhi + drug_nhi * 0.2
+                   + combo * 0.3 + pure * 0.5 + dispense_nhi)
     else:  # 澤沛
-        nhi_part = (
-            g(out_row, "nhi_consult_fee")
-            + g(out_row, "nhi_drug_fee") * 0.2
-            + g(out_row, "nhi_treatment_fee") * 0.5
-            + g(out_row, "nhi_dispense_fee")
-        ) * 0.9
+        combo = pure = 0
+        treatment_single = g(out_row, "nhi_treatment_fee")
+        nhi_pre = (consult_nhi + drug_nhi * 0.2
+                   + treatment_single * 0.5 + dispense_nhi)
+    nhi_part = nhi_pre * 0.9
     reg = g(out_row, "registration_fee")
     drug_sum = (
-        g(cash_row, "internal_drug")
-        + g(cash_row, "external_drug")
-        + g(cash_row, "wellness")
-        + g(cash_row, "herb_decoction")
+        g(cash_row, "internal_drug") + g(cash_row, "external_drug")
+        + g(cash_row, "wellness") + g(cash_row, "herb_decoction")
     )
     acu_sum = (
-        g(cash_row, "acupuncture")
-        + g(cash_row, "trauma")
-        + g(cash_row, "dislocation")
+        g(cash_row, "acupuncture") + g(cash_row, "trauma") + g(cash_row, "dislocation")
     )
+    cash_lab = g(cash_row, "lab")
+    cash_consult = g(cash_row, "consult")
+    cash_other = g(cash_row, "other")
     cash_part = (
-        drug_sum * 0.3 + acu_sum * 0.5
-        + g(cash_row, "lab") * 0.8
-        + g(cash_row, "consult")
-        + g(cash_row, "other")
+        drug_sum * 0.3 + acu_sum * 0.4
+        + cash_lab * 0.8 + cash_consult + cash_other
     )
-    return round(nhi_part + reg + cash_part)
+    return {
+        "診察費": consult_nhi,
+        "內科費(藥費)": drug_nhi,
+        "處(內+xx)" if clinic_short == "澤豐" else "處置費":
+            combo if clinic_short == "澤豐" else treatment_single,
+        "純xx": pure,  # 澤沛恆 0
+        "調劑費": dispense_nhi,
+        "健保小計": int(round(nhi_pre)),
+        "健保*0.9": int(round(nhi_part)),
+        "掛號費": reg,
+        "自費藥粉4項": drug_sum,
+        "自費針傷脫": acu_sum,
+        "自費檢驗": cash_lab,
+        "自費診察": cash_consult,
+        "自費其他": cash_other,
+        "自費小計": int(round(cash_part)),
+        "產值合計": int(round(nhi_part + reg + cash_part)),
+    }
+
+
+def _compute_productivity(
+    out_row: dict | None, cash_row: dict | None, clinic_short: str
+) -> int:
+    return _productivity_breakdown(out_row, cash_row, clinic_short)["產值合計"]
 
 
 def _salary_gross(sal_row: dict | None) -> int:
@@ -603,6 +623,26 @@ def _section_doctor_personal_compare(sb):
             for c in ("產值", "醫師薪資", "護理師&助理成本", "成本合計", "產值-成本"):
                 view[c] = view[c].map(lambda v: f"{v:,}")
             st.dataframe(view, use_container_width=True, hide_index=True)
+
+        # 產值估算逐項拆解（對齊手算用）
+        with st.expander("🔬 產值估算分項拆解（對照手算）", expanded=False):
+            st.caption(
+                "公式：(健保項目)×0.9 + 掛號費 + 自費藥粉×0.3 + 自費針傷脫×0.4 + "
+                "自費檢驗×0.8 + 自費診察 + 自費其他"
+            )
+            bd_rows = []
+            for c_id, c_short in [(fz_id, "澤豐"), (fp_id, "澤沛")]:
+                for name in (fz_doctors if c_short == "澤豐" else fp_doctors):
+                    d_id = name_to_did[name]
+                    o = out_idx.get((c_id, d_id))
+                    c = cash_idx.get((c_id, d_id))
+                    if not o and not c:
+                        continue
+                    bd = _productivity_breakdown(o, c, c_short)
+                    bd_rows.append({"分組": c_short, "醫師": name, **bd})
+            if bd_rows:
+                st.dataframe(pd.DataFrame(bd_rows),
+                             use_container_width=True, hide_index=True)
 
         # 護理師人數判定明細（透明化）
         with st.expander("👩‍⚕️ 護理師&助理人數判定（依平均人次階梯）", expanded=False):
