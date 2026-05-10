@@ -213,37 +213,36 @@ def page_dashboard():
                 rates_f["first_visit_count"], errors="coerce"
             ).fillna(0).astype(int)
 
-            # 每個診所一張小圖；左半=澤豐、右半=澤沛
-            sub_charts = []
-            for c_short in ["澤豐", "澤沛"]:
-                sub = rates_f[rates_f["診所"] == c_short].sort_values("月份")
-                if sub.empty:
-                    continue
-                bar_count = alt.Chart(sub).mark_bar(
-                    xOffset=-14, width=24, color="#6A5ACD",
-                ).encode(
-                    x=alt.X("月份:N", sort="ascending", title=None),
-                    y=alt.Y("初診人數:Q",
-                            axis=alt.Axis(title="初診人數", titleColor="#6A5ACD")),
-                    tooltip=["月份", alt.Tooltip("初診人數:Q", format=",")],
-                )
-                bar_rate = alt.Chart(sub).mark_bar(
-                    xOffset=14, width=24, color="#FFA07A",
-                ).encode(
-                    x=alt.X("月份:N", sort="ascending", title=None),
-                    y=alt.Y("初診率(%):Q",
-                            axis=alt.Axis(title="初診率(%)", titleColor="#FFA07A",
-                                          orient="right")),
-                    tooltip=["月份", alt.Tooltip("初診率(%):Q", format=".2f")],
-                )
-                sub_chart = alt.layer(bar_count, bar_rate).resolve_scale(
-                    y="independent"
-                ).properties(title=c_short, height=320)
-                sub_charts.append(sub_chart)
-
-            if sub_charts:
-                combined = alt.hconcat(*sub_charts).resolve_scale(color="independent")
-                st.altair_chart(combined, use_container_width=True)
+            # 左半=澤豐、右半=澤沛 各一張獨立 chart（用 st.columns 分欄；hconcat 在
+            # use_container_width=True 下無法均分，會把每張圖壓到 150px 左右）
+            cols = st.columns(2)
+            for i, c_short in enumerate(["澤豐", "澤沛"]):
+                with cols[i]:
+                    sub = rates_f[rates_f["診所"] == c_short].sort_values("月份")
+                    if sub.empty:
+                        st.info(f"{c_short}：該期間無初診資料")
+                        continue
+                    bar_count = alt.Chart(sub).mark_bar(
+                        xOffset=-18, width=32, color="#6A5ACD",
+                    ).encode(
+                        x=alt.X("月份:N", sort="ascending", title=None),
+                        y=alt.Y("初診人數:Q",
+                                axis=alt.Axis(title="初診人數", titleColor="#6A5ACD")),
+                        tooltip=["月份", alt.Tooltip("初診人數:Q", format=",")],
+                    )
+                    bar_rate = alt.Chart(sub).mark_bar(
+                        xOffset=18, width=32, color="#FFA07A",
+                    ).encode(
+                        x=alt.X("月份:N", sort="ascending", title=None),
+                        y=alt.Y("初診率(%):Q",
+                                axis=alt.Axis(title="初診率(%)",
+                                              titleColor="#FFA07A", orient="right")),
+                        tooltip=["月份", alt.Tooltip("初診率(%):Q", format=".2f")],
+                    )
+                    sub_chart = alt.layer(bar_count, bar_rate).resolve_scale(
+                        y="independent"
+                    ).properties(title=c_short, height=340)
+                    st.altair_chart(sub_chart, use_container_width=True)
 
     # ─── 看診結構（健保人次分布）───
     st.divider()

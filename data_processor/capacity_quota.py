@@ -39,7 +39,7 @@ from typing import IO
 import pandas as pd
 
 
-FILENAME_RE = re.compile(r"^(\d{5})(澤豐|澤沛)合理門診量\.xlsx$")
+FILENAME_RE = re.compile(r"^(\d{5})(澤豐|澤沛)合[理裡]門診量\.xlsx$")
 # 檔上是「專任醫生」（非「醫師」）；醫師代號可能 D12179 / D121791297 等格式
 DOCTOR_RE = re.compile(r"專任醫[師生][:：]\s*(\S+?)\s+[A-Za-z]\d+")
 SUPPORT_OFFSET_RE = re.compile(r"補支援醫[師生]?數[:：]\s*(\d+)")
