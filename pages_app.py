@@ -466,29 +466,27 @@ def _section_doctor_personal_compare(sb):
     _render_grouped_bar(rows1, "平均人次", ".2f", "📈 健保平均人次（健保總人次 / 診次）")
 
     # ─── 圖 2：自費銷售額 ─────────────────────
+    # 來源：doctor_cash_monthly.cash_total_excl_reg
+    #   = 醫師自費統計檔「自費合計」C17 總計列（不含掛號費，兩家統一）
     rows2 = []
-    def _self_pay_amt(o: dict | None, clinic_short: str) -> int:
-        if not o: return 0
-        amt = (o.get("cash_internal") or 0) + (o.get("cash_acupuncture") or 0)
-        if clinic_short == "澤沛":
-            amt -= (o.get("cash_discount") or 0)
-        return amt
+    def _cash_total(c_id: int, d_id: int) -> int:
+        c = cash_idx.get((c_id, d_id))
+        return (c.get("cash_total_excl_reg") if c else 0) or 0
 
     for name in fz_doctors:
         rows2.append({"分組": "澤豐", "醫師": name, "排序": 1,
                       "顯示": f"豐 {name}",
-                      "金額": _self_pay_amt(out_idx.get((fz_id, name_to_did[name])), "澤豐")})
+                      "金額": _cash_total(fz_id, name_to_did[name])})
     for name in fp_doctors:
         rows2.append({"分組": "澤沛", "醫師": name, "排序": 2,
                       "顯示": f"沛 {name}",
-                      "金額": _self_pay_amt(out_idx.get((fp_id, name_to_did[name])), "澤沛")})
+                      "金額": _cash_total(fp_id, name_to_did[name])})
     for name in all_doctors:
         d_id = name_to_did[name]
-        total = (_self_pay_amt(out_idx.get((fz_id, d_id)), "澤豐")
-                 + _self_pay_amt(out_idx.get((fp_id, d_id)), "澤沛"))
         rows2.append({"分組": "全院", "醫師": name, "排序": 3,
-                      "顯示": f"全 {name}", "金額": total})
-    _render_grouped_bar(rows2, "金額", ",", "💰 自費銷售額（澤豐：內+針傷脫；澤沛：內+針傷脫-折扣）")
+                      "顯示": f"全 {name}",
+                      "金額": _cash_total(fz_id, d_id) + _cash_total(fp_id, d_id)})
+    _render_grouped_bar(rows2, "金額", ",", "💰 自費銷售額（醫師自費統計「自費合計」總計列；不含掛號費）")
 
     # ─── 圖 3：產值估算 vs 成本 ─────────────────
     nurse_salary, nurse_sessions = _get_nurse_cost_params(sb)
