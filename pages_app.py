@@ -386,6 +386,7 @@ def _section_doctor_personal_compare(sb):
     try:
         clinics_data = sb.table("clinics").select("id, short_name").execute().data
         doctors_data = sb.table("doctors").select("id, name").execute().data
+        dc_rows = sb.table("doctor_clinic").select("clinic_id, doctor_id").execute().data
         out_rows = (sb.table("doctor_outpatient_summary").select("*")
                     .eq("service_month", sel_m).execute().data)
         cash_rows = (sb.table("doctor_cash_monthly").select("*")
@@ -408,13 +409,18 @@ def _section_doctor_personal_compare(sb):
     visit_idx = {(r["clinic_id"], r["doctor_id"]): r for r in visit_rows}
     sal_idx = {(r["clinic_id"], r["doctor_id"]): r for r in salary_rows}
 
-    # 各院醫師清單（union 四源；確保支援醫師也被列入：他可能只有 salary/visit 而無 outpatient）
+    # 各院醫師清單：以 doctor_clinic 表配置為基準（含 role='support' 跨院支援），
+    # 再 union 4 個資料源做保險。這樣支援醫師即使本月某 source 缺也會出現。
+    dc_pairs = {(r["clinic_id"], r["doctor_id"]) for r in dc_rows}
     keys_present = (
-        set(out_idx.keys()) | set(visit_idx.keys())
+        dc_pairs
+        | set(out_idx.keys()) | set(visit_idx.keys())
         | set(sal_idx.keys()) | set(cash_idx.keys())
     )
-    fz_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present if c_id == fz_id})
-    fp_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present if c_id == fp_id})
+    fz_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present
+                         if c_id == fz_id and d_id in did_to_name})
+    fp_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present
+                         if c_id == fp_id and d_id in did_to_name})
     all_doctors = sorted(set(fz_doctors) | set(fp_doctors))
 
     if not (fz_doctors or fp_doctors):
@@ -520,10 +526,11 @@ def _section_doctor_personal_compare(sb):
         count = _nurse_head_count(avg)
         return round(base_per_session * sess * count), sess, avg, count
 
+    SCOPE_PREFIX = {"澤豐": "豐", "澤沛": "沛", "全院": "全"}
     def _entry(scope: str, name: str, prod: int, salary: int, nurse_cost: int):
         rows3.append({
             "分組": scope, "醫師": name,
-            "顯示": f"{scope[0]} {name}",
+            "顯示": f"{SCOPE_PREFIX[scope]} {name}",
             "排序": {"澤豐": 1, "澤沛": 2, "全院": 3}[scope],
             "產值": int(prod),
             "醫師薪資": int(salary),
