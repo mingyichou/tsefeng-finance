@@ -250,10 +250,315 @@ def page_dashboard():
             "acu_complex_mid_count": "中複針", "acu_complex_high_count": "高複針",
             "a91_count": "A91",
         })
-        st.dataframe(
-            detail.sort_values(["月份", "診所", "醫師"]),
-            use_container_width=True, hide_index=True,
+        detail = detail.sort_values(["月份", "診所", "醫師"])
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+
+    # ─── 醫師個人業績比較（下半部，獨立月份選擇器 + 兩院強制顯示）───
+    _section_doctor_personal_compare(sb)
+
+
+# ─── 醫師業績比較區塊（dashboard 下半部）────────────────────
+def _get_nurse_cost_params(sb) -> tuple[float, float]:
+    """讀 system_settings 取護理師月薪與月診數；若表/列不存在用預設 35000/40。"""
+    try:
+        rows = (
+            sb.table("system_settings")
+            .select("key, value")
+            .in_("key", ["nurse_monthly_salary", "nurse_monthly_sessions"])
+            .execute().data
         )
+        d = {r["key"]: float(r["value"]) for r in rows}
+        return (
+            d.get("nurse_monthly_salary", 35000.0),
+            d.get("nurse_monthly_sessions", 40.0),
+        )
+    except Exception:
+        return 35000.0, 40.0
+
+
+def _compute_productivity(
+    out_row: dict, cash_row: dict | None, clinic_short: str
+) -> int:
+    """醫師產值估算公式（澤豐/澤沛兩套）。
+
+    澤豐：(診察費 + 內科費*0.2 + 處(內+xx)*0.3 + 純xx*0.5 + 調劑費)*0.9
+         + 掛號費 + 自費(內服+外用+保養+飲片)*0.3 + 自費(針+傷+脫)*0.5
+         + 自費(檢驗)*0.8 + 自費(診察) + 自費(其他)
+    澤沛：(診察費 + 藥費*0.2 + 處置費*0.5 + 調劑費)*0.9 + 同上自費部分
+    """
+    g = lambda d, k: (d.get(k) or 0) if d else 0
+    if clinic_short == "澤豐":
+        nhi_part = (
+            g(out_row, "nhi_consult_fee")
+            + g(out_row, "nhi_drug_fee") * 0.2
+            + g(out_row, "nhi_combo_treatment") * 0.3
+            + g(out_row, "nhi_pure_treatment") * 0.5
+            + g(out_row, "nhi_dispense_fee")
+        ) * 0.9
+    else:  # 澤沛
+        nhi_part = (
+            g(out_row, "nhi_consult_fee")
+            + g(out_row, "nhi_drug_fee") * 0.2
+            + g(out_row, "nhi_treatment_fee") * 0.5
+            + g(out_row, "nhi_dispense_fee")
+        ) * 0.9
+    reg = g(out_row, "registration_fee")
+    drug_sum = (
+        g(cash_row, "internal_drug")
+        + g(cash_row, "external_drug")
+        + g(cash_row, "wellness")
+        + g(cash_row, "herb_decoction")
+    )
+    acu_sum = (
+        g(cash_row, "acupuncture")
+        + g(cash_row, "trauma")
+        + g(cash_row, "dislocation")
+    )
+    cash_part = (
+        drug_sum * 0.3 + acu_sum * 0.5
+        + g(cash_row, "lab") * 0.8
+        + g(cash_row, "consult")
+        + g(cash_row, "other")
+    )
+    return round(nhi_part + reg + cash_part)
+
+
+def _salary_gross(sal_row: dict | None) -> int:
+    """從 doctor_salary_monthly row 還原應付總額（gross），不含勞健保扣除。"""
+    if not sal_row:
+        return 0
+    return (
+        (sal_row.get("director_allowance") or 0)
+        + (sal_row.get("session_pay") or 0)
+        + (sal_row.get("commission_total") or 0)
+        + (sal_row.get("bonus_total") or 0)
+        + (sal_row.get("acu_complex_bonus") or 0)
+        + (sal_row.get("a91_bonus") or 0)
+    )
+
+
+def _section_doctor_personal_compare(sb):
+    """醫師個人業績比較（單月，兩院強制顯示，全院 = 醫師跨院加總）"""
+    import altair as alt
+
+    st.divider()
+    st.header("👨‍⚕️ 醫師個人業績比較")
+    st.caption(
+        "本區塊與上半部的「診所」「月份」篩選**獨立**："
+        "永遠兩院都顯示；月份單選；「全院」= 醫師跨院加總。"
+    )
+
+    # 月份來源：outpatient + visit_stats
+    try:
+        m_out = [r["service_month"] for r in
+                 sb.table("doctor_outpatient_summary").select("service_month").execute().data]
+        m_vis = [r["service_month"] for r in
+                 sb.table("doctor_visit_stats").select("service_month").execute().data]
+    except Exception as e:
+        st.error(f"月份載入失敗：{e}")
+        return
+    months = sorted(set(m_out + m_vis), reverse=True)
+    if not months:
+        st.info("尚無資料")
+        return
+
+    sel_m = st.selectbox(
+        "月份（單選）",
+        options=months,
+        format_func=lambda d: d[:7],
+        key="dash_doc_compare_month",
+    )
+
+    # 撈該月所有資料
+    try:
+        clinics_data = sb.table("clinics").select("id, short_name").execute().data
+        doctors_data = sb.table("doctors").select("id, name").execute().data
+        out_rows = (sb.table("doctor_outpatient_summary").select("*")
+                    .eq("service_month", sel_m).execute().data)
+        cash_rows = (sb.table("doctor_cash_monthly").select("*")
+                     .eq("service_month", sel_m).execute().data)
+        visit_rows = (sb.table("doctor_visit_stats").select("*")
+                      .eq("service_month", sel_m).execute().data)
+        salary_rows = (sb.table("doctor_salary_monthly").select("*")
+                       .eq("service_month", sel_m).execute().data)
+    except Exception as e:
+        st.error(f"資料載入失敗：{e}")
+        return
+
+    did_to_name = {d["id"]: d["name"] for d in doctors_data}
+    name_to_did = {d["name"]: d["id"] for d in doctors_data}
+    fz_id = next((c["id"] for c in clinics_data if c["short_name"] == "澤豐"), None)
+    fp_id = next((c["id"] for c in clinics_data if c["short_name"] == "澤沛"), None)
+
+    out_idx = {(r["clinic_id"], r["doctor_id"]): r for r in out_rows}
+    cash_idx = {(r["clinic_id"], r["doctor_id"]): r for r in cash_rows}
+    visit_idx = {(r["clinic_id"], r["doctor_id"]): r for r in visit_rows}
+    sal_idx = {(r["clinic_id"], r["doctor_id"]): r for r in salary_rows}
+
+    # 各院醫師清單（以該月出現於 outpatient 或 visit_stats 為憑）
+    keys_present = set(out_idx.keys()) | set(visit_idx.keys())
+    fz_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present if c_id == fz_id})
+    fp_doctors = sorted({did_to_name[d_id] for (c_id, d_id) in keys_present if c_id == fp_id})
+    all_doctors = sorted(set(fz_doctors) | set(fp_doctors))
+
+    if not (fz_doctors or fp_doctors):
+        st.info(f"{sel_m[:7]} 尚無門診統計或健保人數資料")
+        return
+
+    GROUP_COLOR = alt.Scale(
+        domain=["澤豐", "澤沛", "全院"],
+        range=["#6A5ACD", "#FFA07A", "#3CB371"],
+    )
+
+    def _render_grouped_bar(rows: list[dict], y_col: str, y_fmt: str, title: str):
+        """通用：3 段（澤豐/澤沛/全院）柱狀圖。rows 須含 顯示/分組/醫師/排序/{y_col}"""
+        if not rows:
+            st.info(f"{title}：該月份無資料")
+            return
+        df = pd.DataFrame(rows)
+        order = df.sort_values(["排序", "醫師"])["顯示"].tolist()
+        ch = alt.Chart(df).mark_bar().encode(
+            x=alt.X("顯示:N", sort=order, axis=alt.Axis(labelAngle=-30, title=None)),
+            y=alt.Y(f"{y_col}:Q"),
+            color=alt.Color("分組:N", scale=GROUP_COLOR),
+            tooltip=["分組", "醫師", alt.Tooltip(f"{y_col}:Q", format=y_fmt)],
+        ).properties(height=320, title=title)
+        st.altair_chart(ch, use_container_width=True)
+
+    # ─── 圖 1：健保平均人次 ─────────────────────
+    rows1 = []
+    for name in fz_doctors:
+        v = visit_idx.get((fz_id, name_to_did[name]))
+        if not v: continue
+        nhi, s = (v.get("nhi_visits_total") or 0), (v.get("sessions_total") or 0)
+        rows1.append({"分組": "澤豐", "醫師": name, "排序": 1,
+                      "顯示": f"豐 {name}",
+                      "平均人次": round(nhi/s, 2) if s else 0})
+    for name in fp_doctors:
+        v = visit_idx.get((fp_id, name_to_did[name]))
+        if not v: continue
+        nhi, s = (v.get("nhi_visits_total") or 0), (v.get("sessions_total") or 0)
+        rows1.append({"分組": "澤沛", "醫師": name, "排序": 2,
+                      "顯示": f"沛 {name}",
+                      "平均人次": round(nhi/s, 2) if s else 0})
+    for name in all_doctors:
+        d_id = name_to_did[name]
+        nhi_sum = sum((visit_idx.get((c, d_id)) or {}).get("nhi_visits_total") or 0
+                      for c in (fz_id, fp_id))
+        s_sum = sum((visit_idx.get((c, d_id)) or {}).get("sessions_total") or 0
+                    for c in (fz_id, fp_id))
+        rows1.append({"分組": "全院", "醫師": name, "排序": 3,
+                      "顯示": f"全 {name}",
+                      "平均人次": round(nhi_sum/s_sum, 2) if s_sum else 0})
+    _render_grouped_bar(rows1, "平均人次", ".2f", "📈 健保平均人次（健保總人次 / 診次）")
+
+    # ─── 圖 2：自費銷售額 ─────────────────────
+    rows2 = []
+    def _self_pay_amt(o: dict | None, clinic_short: str) -> int:
+        if not o: return 0
+        amt = (o.get("cash_internal") or 0) + (o.get("cash_acupuncture") or 0)
+        if clinic_short == "澤沛":
+            amt -= (o.get("cash_discount") or 0)
+        return amt
+
+    for name in fz_doctors:
+        rows2.append({"分組": "澤豐", "醫師": name, "排序": 1,
+                      "顯示": f"豐 {name}",
+                      "金額": _self_pay_amt(out_idx.get((fz_id, name_to_did[name])), "澤豐")})
+    for name in fp_doctors:
+        rows2.append({"分組": "澤沛", "醫師": name, "排序": 2,
+                      "顯示": f"沛 {name}",
+                      "金額": _self_pay_amt(out_idx.get((fp_id, name_to_did[name])), "澤沛")})
+    for name in all_doctors:
+        d_id = name_to_did[name]
+        total = (_self_pay_amt(out_idx.get((fz_id, d_id)), "澤豐")
+                 + _self_pay_amt(out_idx.get((fp_id, d_id)), "澤沛"))
+        rows2.append({"分組": "全院", "醫師": name, "排序": 3,
+                      "顯示": f"全 {name}", "金額": total})
+    _render_grouped_bar(rows2, "金額", ",", "💰 自費銷售額（澤豐：內+針傷脫；澤沛：內+針傷脫-折扣）")
+
+    # ─── 圖 3：產值估算 vs 成本 ─────────────────
+    nurse_salary, nurse_sessions = _get_nurse_cost_params(sb)
+    nurse_per_session = nurse_salary / nurse_sessions if nurse_sessions else 0
+    st.subheader("⚖️ 醫師產值估算 vs 成本（醫師薪資 + 護理師成本）")
+    st.caption(
+        f"護理師單診成本 = {nurse_salary:,.0f} / {nurse_sessions:,.0f} = "
+        f"{nurse_per_session:,.0f} 元/診（可在「⚙️ 系統設定」→「成本參數」調整）"
+    )
+
+    rows3: list[dict] = []
+    def _entry(scope: str, name: str, prod: int, salary: int, sess: int):
+        nurse_cost = round(sess * nurse_per_session)
+        rows3.append({
+            "分組": scope, "醫師": name,
+            "顯示": f"{scope[0]} {name}",
+            "排序": {"澤豐": 1, "澤沛": 2, "全院": 3}[scope],
+            "產值": int(prod),
+            "醫師薪資": int(salary),
+            "護理師成本": int(nurse_cost),
+            "成本合計": int(salary + nurse_cost),
+        })
+
+    for name in fz_doctors:
+        d_id = name_to_did[name]
+        prod = _compute_productivity(out_idx.get((fz_id, d_id)),
+                                      cash_idx.get((fz_id, d_id)), "澤豐")
+        sal = _salary_gross(sal_idx.get((fz_id, d_id)))
+        sess = (visit_idx.get((fz_id, d_id)) or {}).get("sessions_total") or 0
+        _entry("澤豐", name, prod, sal, sess)
+    for name in fp_doctors:
+        d_id = name_to_did[name]
+        prod = _compute_productivity(out_idx.get((fp_id, d_id)),
+                                      cash_idx.get((fp_id, d_id)), "澤沛")
+        sal = _salary_gross(sal_idx.get((fp_id, d_id)))
+        sess = (visit_idx.get((fp_id, d_id)) or {}).get("sessions_total") or 0
+        _entry("澤沛", name, prod, sal, sess)
+    for name in all_doctors:
+        d_id = name_to_did[name]
+        prod_sum = (
+            _compute_productivity(out_idx.get((fz_id, d_id)),
+                                   cash_idx.get((fz_id, d_id)), "澤豐")
+            + _compute_productivity(out_idx.get((fp_id, d_id)),
+                                     cash_idx.get((fp_id, d_id)), "澤沛")
+        )
+        sal_sum = (_salary_gross(sal_idx.get((fz_id, d_id)))
+                   + _salary_gross(sal_idx.get((fp_id, d_id))))
+        sess_sum = sum((visit_idx.get((c, d_id)) or {}).get("sessions_total") or 0
+                       for c in (fz_id, fp_id))
+        _entry("全院", name, prod_sum, sal_sum, sess_sum)
+
+    if rows3:
+        df3 = pd.DataFrame(rows3)
+        # long format：每位醫師 3 個 row（產值 / 薪資 / 護理師），用 類型 區分左右兩柱
+        prod_part = df3.assign(類型="產值",  細項="產值",
+                               金額=df3["產值"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
+        sal_part = df3.assign(類型="成本",  細項="醫師薪資",
+                               金額=df3["醫師薪資"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
+        nur_part = df3.assign(類型="成本",  細項="護理師成本",
+                               金額=df3["護理師成本"])[["顯示","分組","醫師","排序","類型","細項","金額"]]
+        long3 = pd.concat([prod_part, sal_part, nur_part], ignore_index=True)
+        order3 = df3.sort_values(["排序","醫師"])["顯示"].tolist()
+
+        ch3 = alt.Chart(long3).mark_bar().encode(
+            x=alt.X("顯示:N", sort=order3, axis=alt.Axis(labelAngle=-30, title=None)),
+            xOffset=alt.XOffset("類型:N", sort=["產值", "成本"]),
+            y=alt.Y("金額:Q", stack="zero"),
+            color=alt.Color("細項:N", scale=alt.Scale(
+                domain=["產值", "醫師薪資", "護理師成本"],
+                range=["#6A5ACD", "#3CB371", "#FFA07A"],
+            )),
+            tooltip=["分組", "醫師", "細項", alt.Tooltip("金額:Q", format=",")],
+        ).properties(height=420)
+        st.altair_chart(ch3, use_container_width=True)
+
+        with st.expander("📋 產值/成本明細表", expanded=False):
+            view = df3[["分組", "醫師", "產值", "醫師薪資", "護理師成本", "成本合計"]].copy()
+            view["產值-成本"] = view["產值"] - view["成本合計"]
+            for c in ("產值", "醫師薪資", "護理師成本", "成本合計", "產值-成本"):
+                view[c] = view[c].map(lambda v: f"{v:,}")
+            st.dataframe(view, use_container_width=True, hide_index=True)
+    else:
+        st.info("該月份無產值/成本資料")
 
 
 # ============================================================
@@ -3273,8 +3578,8 @@ def page_settings():
 
     sb = get_authed_client()
 
-    tab1, tab2, tab_ins, tab3 = st.tabs(
-        ["白名單使用者", "醫師主檔", "勞健保扣除額", "系統資訊"]
+    tab1, tab2, tab_ins, tab_cost, tab3 = st.tabs(
+        ["白名單使用者", "醫師主檔", "勞健保扣除額", "成本參數", "系統資訊"]
     )
 
     with tab1:
@@ -3317,6 +3622,9 @@ def page_settings():
 
     with tab_ins:
         _settings_insurance_deductions(sb)
+
+    with tab_cost:
+        _settings_cost_params(sb)
 
     with tab3:
         st.subheader("系統資訊")
@@ -3477,6 +3785,76 @@ def _settings_insurance_deductions(sb):
                 st.rerun()
             except Exception as e:
                 st.error(f"刪除失敗：{e}")
+
+
+def _settings_cost_params(sb):
+    """成本參數（system_settings）：護理師月薪、月診數，給產值估算用。"""
+    st.subheader("成本參數")
+    st.caption(
+        "供「業績儀表板 → 醫師個人業績比較 → 產值估算 vs 成本」計算用。"
+        "護理師單診成本 = 月薪 / 月診數。"
+    )
+
+    try:
+        rows = (
+            sb.table("system_settings")
+            .select("key, value, description, updated_at")
+            .in_("key", ["nurse_monthly_salary", "nurse_monthly_sessions"])
+            .execute().data
+        )
+    except Exception as e:
+        st.error(f"讀取失敗：{e}")
+        st.info("請先在 Supabase 執行 system_settings 的 CREATE TABLE migration。")
+        return
+
+    cur = {r["key"]: r for r in rows}
+    cur_salary = float((cur.get("nurse_monthly_salary") or {}).get("value", 35000))
+    cur_sessions = float((cur.get("nurse_monthly_sessions") or {}).get("value", 40))
+
+    if not st.session_state.get("edit_mode"):
+        col1, col2, col3 = st.columns(3)
+        col1.metric("護理師月薪", f"NT${cur_salary:,.0f}")
+        col2.metric("月上班診數", f"{cur_sessions:,.0f}")
+        col3.metric(
+            "單診成本",
+            f"NT${cur_salary / cur_sessions:,.0f}" if cur_sessions else "—",
+        )
+        st.info("⚠️ 唯讀模式。如需修改，請啟用左下「編輯模式」。")
+        return
+
+    st.divider()
+    with st.form("cost_params_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            new_salary = st.number_input(
+                "護理師月薪", min_value=0, step=1000,
+                value=int(cur_salary),
+            )
+        with c2:
+            new_sessions = st.number_input(
+                "護理師月上班診數", min_value=1, step=1,
+                value=int(cur_sessions),
+            )
+        st.caption(
+            f"預覽：單診成本 = {new_salary:,} / {new_sessions} = "
+            f"{new_salary / new_sessions:,.0f} 元/診"
+            if new_sessions else "預覽：診數需 > 0"
+        )
+        if st.form_submit_button("💾 儲存", type="primary"):
+            try:
+                sb.table("system_settings").upsert(
+                    [
+                        {"key": "nurse_monthly_salary",   "value": new_salary,
+                         "description": "護理師月薪（產值估算用）"},
+                        {"key": "nurse_monthly_sessions", "value": new_sessions,
+                         "description": "護理師月上班診數（產值估算用）"},
+                    ],
+                    on_conflict="key",
+                ).execute()
+                st.success("✅ 已儲存")
+                st.rerun()
+            except Exception as e:
+                st.error(f"儲存失敗：{e}")
 
 
 # ============================================================

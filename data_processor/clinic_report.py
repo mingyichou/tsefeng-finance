@@ -167,21 +167,30 @@ def parse_fz_main(
             unknown.append(name)
             continue
 
-        treatment_fee = sum(
+        # 拆兩群：「處(內+xx)」4 欄 → combo；「純xx」4 欄 → pure
+        # 用於醫師產值估算（澤豐：combo*0.3 + pure*0.5）
+        combo_treatment = sum(
             _to_int(df.iloc[r, FZ_COLS[k]]) for k in (
                 "處(內+傷)", "處(內+針)", "處(內+電)", "處(內+脫)",
+            )
+        )
+        pure_treatment = sum(
+            _to_int(df.iloc[r, FZ_COLS[k]]) for k in (
                 "純傷科", "純針灸", "純電針", "純脫臼",
             )
         )
+        treatment_fee = combo_treatment + pure_treatment
 
         records.append({
             "clinic_id": clinic_id,
             "doctor_id": name_to_doctor_id[name],
             "service_month": meta["service_month"],
-            "nhi_consult_fee":   _to_int(df.iloc[r, FZ_COLS["診察費"]]),
-            "nhi_drug_fee":      _to_int(df.iloc[r, FZ_COLS["內科費"]]),
-            "nhi_dispense_fee":  _to_int(df.iloc[r, FZ_COLS["調劑費"]]),
-            "nhi_treatment_fee": treatment_fee,
+            "nhi_consult_fee":     _to_int(df.iloc[r, FZ_COLS["診察費"]]),
+            "nhi_drug_fee":        _to_int(df.iloc[r, FZ_COLS["內科費"]]),
+            "nhi_dispense_fee":    _to_int(df.iloc[r, FZ_COLS["調劑費"]]),
+            "nhi_treatment_fee":   treatment_fee,
+            "nhi_combo_treatment": combo_treatment,
+            "nhi_pure_treatment":  pure_treatment,
             "nhi_lab_fee":       _to_int(df.iloc[r, FZ_COLS["檢驗費"]]),
             "nhi_total_points":  _to_int(df.iloc[r, FZ_COLS["申報合計"]]),
             "cash_internal":     _to_int(df.iloc[r, FZ_COLS["自費(內科)"]]),
