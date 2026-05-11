@@ -1281,6 +1281,7 @@ def page_monthly_pl():
     for clinic_short in ("澤豐", "澤沛"):
         st.subheader(f"🏥 {clinic_short} 月度損益")
         _render_pl_table(by_clinic_month, clinic_short, sel_months)
+        _render_pl_breakdown(by_clinic_month, clinic_short, sel_months)
 
 
 def _fmt_amt(v) -> str:
@@ -1308,10 +1309,10 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
         rows.append(row | {"_highlight": highlight, "_section": section})
 
     # === 收入面 ===
-    _row("A 健保收入(總點數)", lambda p: p.nhi_points, section="收入")
-    _row("A 暫付成數 %",
+    _row("A 健保收入(總點數) [資訊]", lambda p: p.nhi_points, section="收入")
+    _row("A 暫付成數 % [資訊]",
          lambda p: f"{p.nhi_ratio_pct:.1f}%" if p.nhi_ratio_pct else "—")
-    _row("A 點值",
+    _row("A 點值 [資訊]",
          lambda p: f"{p.nhi_point_value:.4f}" if p.nhi_point_value else "—")
     _row("B 健保醫療給付", lambda p: p.b_nhi_paid)
     cash_label = (
@@ -1320,10 +1321,10 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
     )
     _row(cash_label, lambda p: p.c_cash_revenue)
     if clinic_short == "澤豐":
-        _row("D 傳統整復推拿收入(只記帳)", lambda p: p.d_massage)
+        _row("D 傳統整復推拿收入 [資訊,已含於C]", lambda p: p.d_massage)
         _row("E 澤沛金流匯入", lambda p: p.e_zepei_inflow)
     _row("F 其餘收入", lambda p: p.f_other_income)
-    _row("G 總收入", lambda p: p.g_total_income, highlight=True)
+    _row("G 總收入 = B+C+E+F", lambda p: p.g_total_income, highlight=True)
 
     # === 支出面 ===
     _row("H 醫師薪資", lambda p: p.h_doctor, section="支出")
@@ -1340,9 +1341,10 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
     _row("M 其餘支出", lambda p: p.m_other_expense)
     _row("N 總支出A(含合約)", lambda p: p.n_total_expense_a)
     _row("O 盈餘A = G - N", lambda p: p.o_profit_a, highlight=True)
-    _row("P 支票支出", lambda p: p.p_check)
-    _row("Q 總支出B(含支票)", lambda p: p.q_total_expense_b)
-    _row("R 盈餘B = G - Q", lambda p: p.r_profit_b, highlight=True)
+    if clinic_short == "澤豐":
+        _row("P 支票支出", lambda p: p.p_check)
+        _row("Q 總支出B(含支票)", lambda p: p.q_total_expense_b)
+        _row("R 盈餘B = G - Q", lambda p: p.r_profit_b, highlight=True)
 
     # 渲染：分離 highlight 標記欄位後做樣式
     df = pd.DataFrame([
@@ -1367,6 +1369,46 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
 
     styled = df.style.apply(_style_row, axis=1)
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _render_pl_breakdown(by_clinic_month: dict, clinic_short: str,
+                         months: list[str]) -> None:
+    """各月薪資/收入分項明細（debug 用，預設摺疊）。"""
+    with st.expander(f"🔍 {clinic_short} 各月明細（驗證來源）"):
+        # 月份 selector
+        sel = st.selectbox(
+            f"{clinic_short} 月份", months,
+            format_func=lambda d: d[:7],
+            key=f"breakdown_{clinic_short}",
+        )
+        pl = by_clinic_month.get((clinic_short, sel))
+        if not pl:
+            st.info("該月份無資料")
+            return
+
+        sections = [
+            ("H 醫師薪資", pl.doctor_salary_items),
+            ("H 護理師&助理薪資", pl.nurse_salary_items),
+            ("H 編制外人員薪資", pl.external_salary_items),
+            ("B 健保醫療給付", pl.nhi_paid_items),
+            ("C 現金總收入", pl.cash_revenue_items),
+            ("D 傳統整復推拿", pl.massage_items),
+            ("E 澤沛金流匯入", pl.zepei_inflow_items),
+            ("F 其餘收入", pl.other_income_items),
+            ("I 現金支出", pl.cash_expense_items),
+            ("J 澤沛金流支出", pl.zepei_outflow_items),
+            ("K 合約支出", pl.contract_items),
+            ("L 房租支出", pl.rent_items),
+            ("M 其餘支出", pl.other_expense_items),
+            ("P 支票支出", pl.check_items),
+        ]
+        for title, items in sections:
+            if not items:
+                continue
+            sub = pd.DataFrame(items)
+            sub_sum = sum(int(it.get("amount") or 0) for it in items)
+            st.markdown(f"**{title}** — 合計 NT$ {sub_sum:,}（{len(items)} 筆）")
+            st.dataframe(sub, use_container_width=True, hide_index=True)
 
 
 # ============================================================

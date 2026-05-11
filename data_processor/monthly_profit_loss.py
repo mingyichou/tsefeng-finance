@@ -65,7 +65,7 @@ DEFAULT_EXTERNAL_NAMES = ["謝松坊"]
 DEFAULT_ZHOU_ACCOUNTS = ["0668979072975", "137540125004"]
 
 # 判斷玉山轉帳是否為「薪資」項：摘要列表
-SALARY_SUMMARY_KEYWORDS = ("薪資轉帳", "薪資")
+SALARY_SUMMARY_KEYWORDS = ("薪資轉帳",)
 
 
 # ─── 日期 / 月份工具 ──────────────────────────────────────
@@ -232,8 +232,8 @@ class ClinicMonthlyPL:
 
     @property
     def g_total_income(self) -> int:
-        """總收入 = B + C + D + E + F（A 是點數，不入合計）"""
-        return (self.b_nhi_paid + self.c_cash_revenue + self.d_massage
+        """總收入 = B + C + E + F（D 已含於 C，A 是點數不入合計）"""
+        return (self.b_nhi_paid + self.c_cash_revenue
                 + self.e_zepei_inflow + self.f_other_income)
 
     @property
@@ -568,7 +568,26 @@ def _compute_expense(
                 })
 
     # H a 其他醫師 + H b 護理師&助理：
-    # 看 N+1 月玉山 outflow，summary='薪資轉帳' 或 含「薪資」
+    # 玉山 csv 備註是「整批薪轉」(不含醫師名)。醫師姓名來自 manual_annotation 對照。
+    # 演算法：玉山 outflow 摘要=薪資轉帳 → 依 (date, amount) 配 manual_annotation
+    # （scope=診所, form=轉出, account=本院玉山） → 從 description 找醫師姓名。
+    yusan_acc_name = "澤豐玉山" if is_zefeng else "澤沛玉山"
+    ann_salary_rows = (
+        sb.table("manual_annotation")
+        .select("entry_date, amount, account, form, scope, "
+                "description, category")
+        .eq("scope", "診所").eq("form", "轉出").eq("account", yusan_acc_name)
+        .gte("entry_date", next_m)
+        .lt("entry_date", _month_offset(next_m, 1))
+        .execute().data
+    )
+    ann_salary_rows = [
+        r for r in ann_salary_rows if r.get("category") != "memo_only"
+    ]
+    ann_by_key: dict[tuple, dict] = {
+        (r["entry_date"], int(r["amount"] or 0)): r for r in ann_salary_rows
+    }
+
     if esun_id:
         for tx in _fetch_bank_tx(sb, esun_id, next_m):
             amt = tx.get("amount") or 0
@@ -576,31 +595,35 @@ def _compute_expense(
                 continue
             summary = tx.get("summary") or ""
             cp = tx.get("counterparty") or ""
-            memo = tx.get("memo_month") or ""
             # 院長個人轉帳排除
             if _is_zhou_personal(cp, zhou_accounts):
                 continue
             # 必須是薪資項
             if not any(k in summary for k in SALARY_SUMMARY_KEYWORDS):
                 continue
-            attr = _extract_attr_month_from_memo(memo, fallback=sm)
+            amount_abs = -int(amt)
+            # 配對 manual_annotation 取 description
+            tx_date = tx.get("transaction_date")
+            ann = ann_by_key.get((tx_date, amount_abs))
+            desc = (ann.get("description") or "") if ann else ""
+            # attribution：description 內 YYYMM 優先；無則 入帳月 - 1
+            attr = _extract_attr_month_from_memo(desc, fallback=sm)
             if attr != sm:
                 continue
-            # 是否含醫師姓名（排除周明毅，已從 doctor_salary_monthly 算）
-            doctor_hit = _has_doctor_name(memo, doctor_names)
-            amount_abs = -int(amt)
+            # 醫師姓名識別
+            doctor_hit = _has_doctor_name(desc, doctor_names)
             if doctor_hit and doctor_hit != "周明毅":
                 pl.doctor_salary_items.append({
                     "doctor": doctor_hit,
-                    "transaction_date": tx.get("transaction_date"),
-                    "memo": memo,
+                    "transaction_date": tx_date,
+                    "annotation": desc,
                     "amount": amount_abs,
-                    "source": "玉山轉帳",
+                    "source": "玉山轉帳+備註",
                 })
             elif not doctor_hit:
                 pl.nurse_salary_items.append({
-                    "transaction_date": tx.get("transaction_date"),
-                    "memo": memo,
+                    "transaction_date": tx_date,
+                    "annotation": desc,
                     "counterparty": cp,
                     "amount": amount_abs,
                     "source": "玉山轉帳",
