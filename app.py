@@ -41,6 +41,7 @@ from auth import (
 from pages_app import (
     page_dashboard,
     page_overview,
+    page_monthly_pl,
     page_import,
     page_salary,
     page_alliance_settlement,
@@ -96,6 +97,7 @@ def render_main_app():
         menu_items = [
             "📊 業績與財務儀表板",
             "💰 月度實帳金流分析",
+            "📈 月度損益分析",
             "📥 本月資料匯入區",
             "💵 醫師薪資",
             "🤝 澤豐澤沛金流結算",
@@ -126,6 +128,8 @@ def render_main_app():
         page_dashboard()
     elif choice == "💰 月度實帳金流分析":
         page_overview()
+    elif choice == "📈 月度損益分析":
+        page_monthly_pl()
     elif choice == "📥 本月資料匯入區":
         page_import()
     elif choice == "💵 醫師薪資":

@@ -1233,6 +1233,143 @@ def page_overview():
 
 
 # ============================================================
+# 2b. 月度損益分析（Phase 4b 會計精神損益）
+# ============================================================
+def page_monthly_pl():
+    st.title("📈 月度損益分析")
+
+    from data_processor.monthly_profit_loss import (
+        calculate_both_pl, list_available_months,
+    )
+
+    st.caption(
+        "🧾 **會計精神**：N 月「歸屬」的款項記在 N 月（與「月度實帳金流分析」不同）。"
+        "支付通常延後（4 月轉出歸 3 月），健保給付以備註月份為準，"
+        "整復推拿用『只記帳』條目獨立統計。"
+    )
+
+    sb = get_authed_client()
+    months = list_available_months(sb)
+    if not months:
+        st.warning("⚠️ 尚無可分析的月份資料")
+        return
+
+    default_n = min(6, len(months))
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        chosen_n = st.slider(
+            "顯示最近幾個月", min_value=1, max_value=min(12, len(months)),
+            value=default_n,
+        )
+    with col2:
+        st.metric("資料月份數", len(months))
+
+    sel_months = months[:chosen_n]  # 最新在前
+
+    # 計算
+    by_clinic_month: dict[tuple[str, str], any] = {}
+    with st.spinner(f"計算 {chosen_n} 個月 × 2 診所..."):
+        for sm in sel_months:
+            try:
+                pl_fz, pl_fp = calculate_both_pl(sb, sm)
+                by_clinic_month[("澤豐", sm)] = pl_fz
+                by_clinic_month[("澤沛", sm)] = pl_fp
+            except Exception as e:
+                st.error(f"{sm} 計算失敗：{e}")
+
+    # 每家診所一張表
+    for clinic_short in ("澤豐", "澤沛"):
+        st.subheader(f"🏥 {clinic_short} 月度損益")
+        _render_pl_table(by_clinic_month, clinic_short, sel_months)
+
+
+def _fmt_amt(v) -> str:
+    if v is None:
+        return "—"
+    try:
+        v = int(v)
+    except (ValueError, TypeError):
+        return str(v)
+    return f"{v:,}"
+
+
+def _render_pl_table(by_clinic_month: dict, clinic_short: str,
+                     months: list[str]) -> None:
+    """渲染 P&L 大表：rows=項目, cols=月份。"""
+    # 收入面 rows
+    rows: list[dict] = []
+
+    def _row(label: str, getter, *, highlight: bool = False,
+             section: str | None = None) -> None:
+        row = {"項目": label}
+        for sm in months:
+            pl = by_clinic_month.get((clinic_short, sm))
+            row[sm[:7]] = getter(pl) if pl else None
+        rows.append(row | {"_highlight": highlight, "_section": section})
+
+    # === 收入面 ===
+    _row("A 健保收入(總點數)", lambda p: p.nhi_points, section="收入")
+    _row("A 暫付成數 %",
+         lambda p: f"{p.nhi_ratio_pct:.1f}%" if p.nhi_ratio_pct else "—")
+    _row("A 點值",
+         lambda p: f"{p.nhi_point_value:.4f}" if p.nhi_point_value else "—")
+    _row("B 健保醫療給付", lambda p: p.b_nhi_paid)
+    cash_label = (
+        "C 現金總收入(含掛號費、整復)" if clinic_short == "澤豐"
+        else "C 現金總收入(含掛號費)"
+    )
+    _row(cash_label, lambda p: p.c_cash_revenue)
+    if clinic_short == "澤豐":
+        _row("D 傳統整復推拿收入(只記帳)", lambda p: p.d_massage)
+        _row("E 澤沛金流匯入", lambda p: p.e_zepei_inflow)
+    _row("F 其餘收入", lambda p: p.f_other_income)
+    _row("G 總收入", lambda p: p.g_total_income, highlight=True)
+
+    # === 支出面 ===
+    _row("H 醫師薪資", lambda p: p.h_doctor, section="支出")
+    _row("H 護理師&助理薪資", lambda p: p.h_nurse)
+    if clinic_short == "澤豐":
+        _row("H 編制外人員薪資", lambda p: p.h_external)
+    _row("H 薪資支出合計", lambda p: p.h_salary_total)
+    _row("I 現金支出", lambda p: p.i_cash_expense)
+    if clinic_short == "澤沛":
+        _row("J 澤沛金流支出", lambda p: p.j_zepei_outflow)
+    _row("K 合約支出", lambda p: p.k_contract)
+    if clinic_short == "澤沛":
+        _row("L 房租支出", lambda p: p.l_rent)
+    _row("M 其餘支出", lambda p: p.m_other_expense)
+    _row("N 總支出A(含合約)", lambda p: p.n_total_expense_a)
+    _row("O 盈餘A = G - N", lambda p: p.o_profit_a, highlight=True)
+    _row("P 支票支出", lambda p: p.p_check)
+    _row("Q 總支出B(含支票)", lambda p: p.q_total_expense_b)
+    _row("R 盈餘B = G - Q", lambda p: p.r_profit_b, highlight=True)
+
+    # 渲染：分離 highlight 標記欄位後做樣式
+    df = pd.DataFrame([
+        {k: v for k, v in r.items() if not k.startswith("_")} for r in rows
+    ])
+    highlight_idx = {i for i, r in enumerate(rows) if r.get("_highlight")}
+
+    # 格式化金額欄
+    month_cols = [sm[:7] for sm in months]
+    for c in month_cols:
+        df[c] = df[c].apply(
+            lambda v: _fmt_amt(v) if not isinstance(v, str) else v
+        )
+
+    # 用 pandas Styler 做凸顯
+    def _style_row(row):
+        if row.name in highlight_idx:
+            return [
+                "background-color: #FFF8DC; font-weight: 700; color: #B8860B"
+            ] * len(row)
+        return [""] * len(row)
+
+    styled = df.style.apply(_style_row, axis=1)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+# ============================================================
 # 3. 本月資料匯入（Phase 2）
 # ============================================================
 def page_import():
