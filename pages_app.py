@@ -802,7 +802,7 @@ def _section_doctor_personal_compare(sb):
 
 
 # ============================================================
-# 2. 收支總覽（Phase 4 月度損益）
+# 2. 月度實帳金流分析（Phase 4 實帳金流）
 # ============================================================
 
 
@@ -932,7 +932,7 @@ def _render_data_health(sb, service_month: str):
 
 
 def page_overview():
-    st.title("💰 月度實帳收支總覽")
+    st.title("💰 月度實帳金流分析")
 
     from data_processor.monthly_pl import (
         calculate_both_clinics, calculate_check_expense_month,

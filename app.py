@@ -124,7 +124,7 @@ def render_main_app():
         sign_out()
     elif choice == "📊 業績與財務儀表板":
         page_dashboard()
-    elif choice == "💰 收支總覽":
+    elif choice == "💰 月度實帳金流分析":
         page_overview()
     elif choice == "📥 本月資料匯入區":
         page_import()
