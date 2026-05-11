@@ -2372,13 +2372,26 @@ def _section_staff_salary():
             st.balloons()
 
 
+_ANN_CATEGORY_LABELS = {
+    None: "純備註（影響金流辨識）",
+    "memo_only": "🟡 只記帳（不影響金流，只進月度損益分析）",
+    "capital_injection": "🔴 股東注資（排除於月度損益分析收入）",
+}
+_ANN_CATEGORY_OPTIONS = list(_ANN_CATEGORY_LABELS.values())
+_ANN_CATEGORY_BY_LABEL = {v: k for k, v in _ANN_CATEGORY_LABELS.items()}
+
+
 def _section_manual_annotation():
     """金流補充備註 — 補齊銀行帳戶/帳本未記載的說明（CRUD）"""
     st.subheader("📝 手 KEY：金流補充備註")
     st.caption(
         "用於補齊銀行帳戶/帳本中未記載的備註說明。"
         "例：某筆轉帳實際是「個人借款還款」、某筆存現是「投資收益」。"
-        "可隨時查詢/修改/刪除。"
+        "可隨時查詢/修改/刪除。\n\n"
+        "💡 **分類**：\n"
+        "- **純備註** — 預設值，會影響金流辨識（如澤豐現金入帳的對應說明）。\n"
+        "- **只記帳** — 不參與任何金流核對，只在「月度損益分析」獨立統計（例：傳統整復推拿收入）。\n"
+        "- **股東注資** — 對應澤沛中信實際入帳，但不算經營收入；在「月度損益分析」收入欄會被排除。"
     )
 
     if st.session_state.pop("_ann_just_saved", None):
@@ -2405,7 +2418,13 @@ def _section_manual_annotation():
     if rows:
         df = pd.DataFrame(rows)
         df["診所"] = df["clinic_id"].map(cid_to_short).fillna("—")
-        cols = ["id", "entry_date", "scope", "form", "account",
+        if "category" in df.columns:
+            df["分類"] = df["category"].map(
+                {"memo_only": "🟡 只記帳", "capital_injection": "🔴 股東注資"}
+            ).fillna("純備註")
+        else:
+            df["分類"] = "純備註"
+        cols = ["id", "entry_date", "分類", "scope", "form", "account",
                 "amount", "診所", "description"]
         present = [c for c in cols if c in df.columns]
         st.markdown(f"**現有 {len(rows)} 筆：**")
@@ -2494,10 +2513,21 @@ def _section_manual_annotation():
             help="僅四個帳戶可選，用於核對帳簿備註",
         )
 
+    cur_category = sel.get("category") if sel else None
+    cur_cat_label = _ANN_CATEGORY_LABELS.get(cur_category, _ANN_CATEGORY_OPTIONS[0])
+    category_label = st.selectbox(
+        "分類（決定條目用途）",
+        options=_ANN_CATEGORY_OPTIONS,
+        index=_ANN_CATEGORY_OPTIONS.index(cur_cat_label),
+        key="ann_category",
+        help="只記帳：不影響金流辨識，僅供月度損益分析統計；股東注資：澤沛實際入帳但排除於月度損益分析收入",
+    )
+    category = _ANN_CATEGORY_BY_LABEL[category_label]
+
     description = st.text_area(
         "備註說明",
         value=sel.get("description") or "" if sel else "",
-        placeholder="例：個人借款還款、廠商紅利、退費...",
+        placeholder="例：個人借款還款、廠商紅利、退費、傳統整復推拿收入、股東○○○注資...",
         key="ann_desc",
     )
 
@@ -2518,6 +2548,7 @@ def _section_manual_annotation():
                 "amount": int(amount),
                 "account": account or None,
                 "description": description,
+                "category": category,
             }
             try:
                 if is_edit and sid:
@@ -3957,8 +3988,9 @@ def page_settings():
 
     sb = get_authed_client()
 
-    tab1, tab2, tab_ins, tab_cost, tab3 = st.tabs(
-        ["白名單使用者", "醫師主檔", "勞健保扣除額", "成本參數", "系統資訊"]
+    tab1, tab2, tab_ins, tab_cost, tab_pl, tab3 = st.tabs(
+        ["白名單使用者", "醫師主檔", "勞健保扣除額", "成本參數",
+         "損益分析名單", "系統資訊"]
     )
 
     with tab1:
@@ -4004,6 +4036,9 @@ def page_settings():
 
     with tab_cost:
         _settings_cost_params(sb)
+
+    with tab_pl:
+        _settings_pl_lists(sb)
 
     with tab3:
         st.subheader("系統資訊")
@@ -4164,6 +4199,108 @@ def _settings_insurance_deductions(sb):
                 st.rerun()
             except Exception as e:
                 st.error(f"刪除失敗：{e}")
+
+
+def _read_settings_json(sb, key: str, default):
+    """讀 system_settings.value 並嘗試 JSON 解析；失敗回 default。"""
+    import json
+    try:
+        rows = (
+            sb.table("system_settings").select("value")
+            .eq("key", key).limit(1).execute().data
+        )
+    except Exception:
+        return default
+    if not rows:
+        return default
+    v = rows[0].get("value")
+    if v is None:
+        return default
+    if isinstance(v, (list, dict)):
+        return v
+    try:
+        return json.loads(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _settings_pl_lists(sb):
+    """月度損益分析所需的名單 / 帳號設定（system_settings）。"""
+    import json
+    st.subheader("月度損益分析 — 名單與帳號")
+    st.caption(
+        "供「月度損益分析」薪資分流、院長個人帳號排除用。\n\n"
+        "- **醫師名單**：玉山薪資轉帳 / `staff_salary_summary` 內出現的姓名屬於這些 → 計入「醫師薪資」\n"
+        "- **編制外人員名單**：例如澤豐謝松坊 → 計入「編制外人員薪資」\n"
+        "- 其餘未列入兩名單者 → 計入「護理師&助理薪資」\n"
+        "- **院長個人帳號末段**：玉山轉到這些帳號的支出視為院長個人，不計診所支出"
+    )
+
+    cur_doctors = _read_settings_json(
+        sb, "doctor_names", ["周明毅", "呂敏盛", "胡舒婷"]
+    )
+    cur_external = _read_settings_json(sb, "external_staff_names", ["謝松坊"])
+    cur_accounts = _read_settings_json(
+        sb, "zhou_personal_accounts",
+        ["0668979072975", "137540125004"],
+    )
+
+    if not st.session_state.get("edit_mode"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**醫師名單**")
+            st.write(cur_doctors or "—")
+            st.markdown("**編制外人員名單**")
+            st.write(cur_external or "—")
+        with col2:
+            st.markdown("**院長個人帳號（末段）**")
+            st.write(cur_accounts or "—")
+        st.info("⚠️ 唯讀模式。如需修改，請啟用左下「編輯模式」。")
+        return
+
+    st.divider()
+    with st.form("pl_lists_form"):
+        st.markdown("每行一個項目；空行會被忽略。")
+        c1, c2 = st.columns(2)
+        with c1:
+            doctors_txt = st.text_area(
+                "醫師名單", value="\n".join(cur_doctors), height=120,
+            )
+            external_txt = st.text_area(
+                "編制外人員名單", value="\n".join(cur_external), height=120,
+            )
+        with c2:
+            accounts_txt = st.text_area(
+                "院長個人帳號（末段）", value="\n".join(cur_accounts), height=120,
+                help="比對玉山 counterparty 末段。例：0668979072975、137540125004",
+            )
+        if st.form_submit_button("💾 儲存", type="primary"):
+            def _to_list(s: str) -> list[str]:
+                return [
+                    line.strip() for line in s.splitlines() if line.strip()
+                ]
+            try:
+                sb.table("system_settings").upsert(
+                    [
+                        {"key": "doctor_names",
+                         "value": json.dumps(_to_list(doctors_txt),
+                                             ensure_ascii=False),
+                         "description": "月度損益分析-醫師名單"},
+                        {"key": "external_staff_names",
+                         "value": json.dumps(_to_list(external_txt),
+                                             ensure_ascii=False),
+                         "description": "月度損益分析-編制外人員名單"},
+                        {"key": "zhou_personal_accounts",
+                         "value": json.dumps(_to_list(accounts_txt),
+                                             ensure_ascii=False),
+                         "description": "院長個人帳號末段（玉山轉出排除）"},
+                    ],
+                    on_conflict="key",
+                ).execute()
+                st.success("✅ 已儲存")
+                st.rerun()
+            except Exception as e:
+                st.error(f"儲存失敗：{e}")
 
 
 def _settings_cost_params(sb):
