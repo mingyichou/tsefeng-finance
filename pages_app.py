@@ -1273,12 +1273,14 @@ def page_monthly_pl():
     with col2:
         st.metric("資料月份數", len(months))
 
-    sel_months = months[:chosen_n]  # 最新在前
+    sel_months = months[:chosen_n]  # 表格用：最新在前
+    chart_months = months[:min(12, len(months))]  # 圖表用：固定取近 12 月
+    compute_months = sorted(set(sel_months) | set(chart_months), reverse=True)
 
     # 計算
     by_clinic_month: dict[tuple[str, str], any] = {}
-    with st.spinner(f"計算 {chosen_n} 個月 × 2 診所..."):
-        for sm in sel_months:
+    with st.spinner(f"計算 {len(compute_months)} 個月 × 2 診所..."):
+        for sm in compute_months:
             try:
                 pl_fz, pl_fp = calculate_both_pl(sb, sm)
                 by_clinic_month[("澤豐", sm)] = pl_fz
@@ -1286,10 +1288,11 @@ def page_monthly_pl():
             except Exception as e:
                 st.error(f"{sm} 計算失敗：{e}")
 
-    # 每家診所一張表
+    # 每家診所一張表 + 比較柱狀圖
     for clinic_short in ("澤豐", "澤沛"):
         st.subheader(f"🏥 {clinic_short} 月度損益")
         _render_pl_table(by_clinic_month, clinic_short, sel_months)
+        _render_pl_charts(by_clinic_month, clinic_short, chart_months)
         _render_pl_breakdown(by_clinic_month, clinic_short, sel_months)
 
 
@@ -1378,6 +1381,71 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
 
     styled = df.style.apply(_style_row, axis=1)
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _render_pl_charts(by_clinic_month: dict, clinic_short: str,
+                      chart_months: list[str]) -> None:
+    """近 12 個月 G(總收入)/O(盈餘A) 柱狀圖；排除嚴重不完整月份。"""
+    import altair as alt
+
+    rows = []
+    excluded: list[str] = []
+    for sm in chart_months:
+        pl = by_clinic_month.get((clinic_short, sm))
+        if not pl:
+            continue
+        # 完整門檻：總收入 G > 0 且 薪資合計 H > 0
+        # (任一為 0 即視為當月資料尚未齊全，例：剛上傳到 N+1 月薪資但 N 月健保未撥)
+        if pl.g_total_income <= 0 or pl.h_salary_total <= 0:
+            excluded.append(sm[:7])
+            continue
+        rows.append({
+            "月份": sm[:7],
+            "總收入 G": pl.g_total_income,
+            "盈餘 O": pl.o_profit_a,
+        })
+
+    if not rows:
+        st.info(f"{clinic_short}：近 12 個月內無資料完整的月份可比較")
+        return
+
+    df = pd.DataFrame(rows).sort_values("月份")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        chart_g = alt.Chart(df).mark_bar(color="#4A90E2", size=28).encode(
+            x=alt.X("月份:N", sort="ascending", title=None),
+            y=alt.Y("總收入 G:Q", title="總收入 G (NT$)"),
+            tooltip=[
+                "月份", alt.Tooltip("總收入 G:Q", format=","),
+            ],
+        ).properties(
+            title=f"{clinic_short} 總收入 G 近 12 月",
+            height=320,
+        )
+        st.altair_chart(chart_g, use_container_width=True)
+    with col2:
+        chart_o = alt.Chart(df).mark_bar(size=28).encode(
+            x=alt.X("月份:N", sort="ascending", title=None),
+            y=alt.Y("盈餘 O:Q", title="盈餘 O (NT$)"),
+            color=alt.condition(
+                "datum['盈餘 O'] >= 0",
+                alt.value("#5CB85C"),
+                alt.value("#D9534F"),
+            ),
+            tooltip=[
+                "月份", alt.Tooltip("盈餘 O:Q", format=","),
+            ],
+        ).properties(
+            title=f"{clinic_short} 盈餘 O 近 12 月（綠正紅負）",
+            height=320,
+        )
+        st.altair_chart(chart_o, use_container_width=True)
+
+    if excluded:
+        st.caption(
+            f"⚠️ 已排除資料不完整月份（G 或 H 為 0）：{', '.join(sorted(excluded))}"
+        )
 
 
 def _render_pl_breakdown(by_clinic_month: dict, clinic_short: str,
