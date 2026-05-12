@@ -8,6 +8,15 @@ import pandas as pd
 from db import get_authed_client
 
 
+# 全系統服務月份下限（民國 115 年 1 月 = 2026-01）：114-12 及更早資料不完整，不顯示
+MIN_SERVICE_MONTH = "2026-01-01"
+
+
+def _filter_min_month(months):
+    """過濾掉早於 MIN_SERVICE_MONTH 的月份。接受 list[str] / set[str] 等可疊代物件。"""
+    return [m for m in months if m and m >= MIN_SERVICE_MONTH]
+
+
 # ============================================================
 # 1. 業績儀表板（Phase 3）
 # ============================================================
@@ -42,11 +51,11 @@ def page_dashboard():
     cash_df = pd.DataFrame(cash_monthly) if cash_monthly else pd.DataFrame()
     visit_df = pd.DataFrame(visit_stats) if visit_stats else pd.DataFrame()
 
-    all_months = sorted(set(
+    all_months = sorted(_filter_min_month(set(
         list(out_df["service_month"].unique() if not out_df.empty else [])
         + list(cash_df["service_month"].unique() if not cash_df.empty else [])
         + list(visit_df["service_month"].unique() if not visit_df.empty else [])
-    ), reverse=True)
+    )), reverse=True)
     if not all_months:
         st.warning("⚠️ 尚無資料")
         return
@@ -446,7 +455,7 @@ def _section_doctor_personal_compare(sb):
     except Exception as e:
         st.error(f"月份載入失敗：{e}")
         return
-    months = sorted(set(m_out + m_vis), reverse=True)
+    months = sorted(_filter_min_month(set(m_out + m_vis)), reverse=True)
     if not months:
         st.info("尚無資料")
         return
@@ -3584,7 +3593,10 @@ def page_salary():
         .order("service_month", desc=True)
         .execute()
     )
-    months_set = sorted({r["service_month"] for r in months_resp.data}, reverse=True)
+    months_set = sorted(
+        _filter_min_month({r["service_month"] for r in months_resp.data}),
+        reverse=True,
+    )
     if not months_set:
         st.warning("⚠️ 尚無資料，請先到「本月資料匯入」上傳。")
         return
@@ -4612,7 +4624,7 @@ def page_alliance_settlement():
             months_set.add(r["service_month"])
     except Exception:
         pass
-    months_sorted = sorted(months_set, reverse=True)
+    months_sorted = sorted(_filter_min_month(months_set), reverse=True)
     if not months_sorted:
         st.warning("⚠️ 尚無資料可結算")
         return

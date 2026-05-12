@@ -692,8 +692,11 @@ def calculate_both_clinics(sb, service_month: str):
     return pl_fz, pl_fp
 
 
+MIN_SERVICE_MONTH = "2026-01-01"
+
+
 def list_available_months(sb) -> list[str]:
-    """掃 bank_transactions 找有資料的月份"""
+    """掃 bank_transactions 找有資料的月份（過濾掉 < 2026-01）"""
     months: set[str] = set()
     try:
         rows = sb.table("bank_transactions").select("transaction_date").execute().data
@@ -703,4 +706,7 @@ def list_available_months(sb) -> list[str]:
                 months.add(d[:7] + "-01")
     except Exception:
         pass
-    return sorted(months, reverse=True)
+    return sorted(
+        (m for m in months if m >= MIN_SERVICE_MONTH),
+        reverse=True,
+    )

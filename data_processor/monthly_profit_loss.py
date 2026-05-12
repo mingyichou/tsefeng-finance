@@ -60,6 +60,8 @@ from datetime import date
 
 
 # ─── 常數 / 預設名單 ──────────────────────────────────────
+MIN_SERVICE_MONTH = "2026-01-01"  # 系統下限：民國 115 年 1 月
+
 DEFAULT_DOCTOR_NAMES = ["周明毅", "呂敏盛", "胡舒婷"]
 DEFAULT_EXTERNAL_NAMES = ["謝松坊"]
 DEFAULT_ZHOU_ACCOUNTS = ["0668979072975", "137540125004"]
@@ -876,7 +878,7 @@ def calculate_both_pl(
 
 
 def list_available_months(sb) -> list[str]:
-    """聚合多個來源的可用月份。"""
+    """聚合多個來源的可用月份（過濾掉 < MIN_SERVICE_MONTH）。"""
     months: set[str] = set()
     try:
         for r in (sb.table("bank_transactions")
@@ -894,4 +896,7 @@ def list_available_months(sb) -> list[str]:
                 months.add(sm)
     except Exception:
         pass
-    return sorted(months, reverse=True)
+    return sorted(
+        (m for m in months if m >= MIN_SERVICE_MONTH),
+        reverse=True,
+    )
