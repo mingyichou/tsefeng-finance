@@ -438,7 +438,7 @@ def _compute_revenue(
         memo_rows = (
             sb.table("manual_annotation")
             .select("entry_date, amount, description, clinic_id")
-            .eq("category", "memo_only")
+            .eq("category", "memo_only").eq("scope", "診所")
             .gte("entry_date", sm).lt("entry_date", next_m)
             .execute().data
         )

@@ -4222,21 +4222,187 @@ def _visit_field(component, field_name: str) -> int:
 def page_personal():
     st.title("💸 院長個人財富分析")
 
-    if not st.session_state.get("edit_mode", False):
-        st.warning("⚠️ 唯讀模式。可檢視歷史透支報表，但無法編輯本月公式變數。")
+    from data_processor.personal_finance import (
+        calculate_zhou_monthly, list_available_months,
+    )
+    import altair as alt
+
+    st.caption(
+        "🧾 **反推法**：澤豐&個人中信戶混合診所/院長/澤沛代墊，"
+        "用 期初餘額+流入-已知診所流出-期末餘額 反推院長個人提領。"
+        "輔以澤豐玉山轉到院長個人帳號(n2)。"
+    )
+
+    sb = get_authed_client()
+    months = list_available_months(sb)
+    if not months:
+        st.warning("⚠️ 尚無中信交易資料")
+        return
+
+    col1, col2 = st.columns([2, 5])
+    with col1:
+        sel_month = st.selectbox(
+            "月份", months, format_func=lambda d: d[:7],
+            key="personal_month",
+        )
+
+    with st.spinner("計算中..."):
+        try:
+            z = calculate_zhou_monthly(sb, sel_month)
+        except Exception as e:
+            st.error(f"計算失敗：{e}")
+            return
+
+    # ─── KPI ───
+    st.divider()
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("周院長收入 (x13)", f"NT$ {z.x13_zhou_salary:,}")
+    k2.metric("總支出 N (n1+n2)", f"NT$ {z.total_expense:,}")
+    k3.metric("私人支出 (N-支票)", f"NT$ {z.private_expense:,}")
+    k4.metric("透支 (花到診所營收)",
+              f"NT$ {z.overdraft:,}",
+              delta=("⚠️ 超支" if z.overdraft > 0 else "✅ 結餘"),
+              delta_color="inverse")
+
+    # ─── 1. 周院長收入 (x13) ───
+    st.divider()
+    st.subheader("① 周院長收入 (x13 周明毅看診薪資)")
+    if z.x13_items:
+        df = pd.DataFrame(z.x13_items)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown(f"**合計 NT$ {z.x13_zhou_salary:,}**")
     else:
-        st.success("✅ 編輯模式啟用中")
+        st.info("該月份 doctor_salary_monthly 無 周明毅 資料 — 請先到「💵 醫師薪資」頁計算寫入")
 
-    st.info("🚧 開發中（Phase 5：11 變數 + 動用診所盈餘金額計算）")
+    # ─── 2. 周院長支出（含支票）N = n1 + n2 ───
+    st.divider()
+    st.subheader("② 周院長支出（含支票）N = n1 + n2")
+    st.markdown(
+        f"### 🏦 n1（澤豐中信戶）= **NT$ {z.n1:,}**"
+    )
+    n1_rows = [
+        ("x1  N 月初餘額", z.x1_prev_balance, "+"),
+        ("x2  健保戶→中信轉入", z.x2_clinic_transfer_in, "+"),
+        ("x3  澤豐現金支出", z.x3_zefeng_cash_expense, "−"),
+        ("x4  澤沛現金支出代墊（N+1 反推）", z.x4_zepei_cash_advance, "−"),
+        ("x5  澤沛還現金代墊（前月）", z.x5_zepei_cash_repay, "+"),
+        ("x6  豐沛金流入帳", z.x6_fengpei_in, "+"),
+        ("x7  澤沛合約還款入帳", z.x7_zepei_contract_in, "+"),
+        ("x8  澤豐現金存入", z.x8_zefeng_cash_in, "+"),
+        ("x9  編制外人力薪資（謝松坊）", z.x9_external_staff_salary, "−"),
+        ("x10 手KEY 非常規 net", z.x10_manual_net, "+"),
+        ("x12 澤豐合約支出", z.x12_zefeng_contract_expense, "−"),
+        ("x11 N 月底餘額", z.x11_current_balance, "−"),
+    ]
+    n1_df = pd.DataFrame(
+        [{"變數": k, "金額": v, "符號": s} for k, v, s in n1_rows]
+    )
+    n1_df["金額"] = n1_df["金額"].apply(lambda v: f"{v:,}")
+    st.dataframe(n1_df, use_container_width=True, hide_index=True)
 
-    st.markdown("**本頁將顯示：**")
-    st.markdown("""
-    - 月度 11 個透支變數（x1~x11）的明細
-    - n1（中信戶個人支出）、n2（玉山戶個人支出）
-    - **動用診所盈餘金額** = N - C - S
-    - 12 個月趨勢折線圖
-    - 公式檢視：每個變數可點開看原始資料來源
-    """)
+    st.markdown(
+        f"### 🏦 n2（澤豐玉山→院長個人帳號）= **NT$ {z.n2:,}**"
+    )
+    if z.n2_items:
+        st.dataframe(
+            pd.DataFrame(z.n2_items),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("該月無玉山→院長個人帳號的轉出")
+    st.markdown(f"### 💸 **N 總支出 = NT$ {z.total_expense:,}**")
+
+    # ─── 3. 周院長私人支出 = N - 支票 ───
+    st.divider()
+    st.subheader("③ 周院長私人支出 = N − 支票支出 P")
+    st.markdown(
+        f"#### 🎫 支票支出 P = **NT$ {z.p_check_total:,}**　"
+        "（兩家銀行支票總額）"
+    )
+    if z.p_check_items:
+        st.dataframe(
+            pd.DataFrame(z.p_check_items),
+            use_container_width=True, hide_index=True,
+        )
+    st.markdown(
+        f"#### ✅ 周院長私人支出 = "
+        f"{z.total_expense:,} − {z.p_check_total:,} = "
+        f"**NT$ {z.private_expense:,}**"
+    )
+
+    # ─── 4. 周院長支出手KEY紀錄 ───
+    st.divider()
+    st.subheader("④ 周院長支出手 KEY 紀錄（屬性=個人 + 分類=只記帳）")
+    if z.personal_memo_items:
+        df = pd.DataFrame(z.personal_memo_items)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        total_memo = sum(int(it.get("amount") or 0) for it in z.personal_memo_items)
+        st.caption(f"合計 NT$ {total_memo:,}（僅為大筆開支備註，不入 N 計算）")
+    else:
+        st.info(
+            "尚無紀錄。需於「📥 本月資料匯入區 → 📝 手 KEY：金流補充備註」"
+            "新增屬性=個人、分類=🟡 只記帳 的條目"
+        )
+
+    # ─── 5. 周院長透支 ───
+    st.divider()
+    st.subheader("⑤ 周院長透支（花費到澤豐的營收）")
+    st.markdown(
+        f"#### 透支 = 私人支出 − 院長收入 = "
+        f"{z.private_expense:,} − {z.x13_zhou_salary:,} = "
+        f"**NT$ {z.overdraft:,}**"
+    )
+    if z.overdraft > 0:
+        st.error(
+            f"⚠️ 本月院長私人支出超過薪資收入 NT$ {z.overdraft:,}，"
+            "等同動用診所盈餘"
+        )
+    else:
+        st.success(f"✅ 本月私人收支結餘 NT$ {-z.overdraft:,}")
+
+    # ─── 趨勢圖（近 12 月） ───
+    st.divider()
+    st.subheader("📊 近 12 個月趨勢")
+    chart_months = months[:min(12, len(months))]
+    trend_rows = []
+    with st.spinner("計算近 12 個月..."):
+        for sm in chart_months:
+            try:
+                if sm == sel_month:
+                    zz = z  # 重用
+                else:
+                    zz = calculate_zhou_monthly(sb, sm)
+                # 完整門檻：x13 > 0 且 x11 > 0
+                if zz.x13_zhou_salary <= 0 or zz.x11_current_balance <= 0:
+                    continue
+                trend_rows.append({
+                    "月份": sm[:7],
+                    "收入 (x13)": zz.x13_zhou_salary,
+                    "私人支出": zz.private_expense,
+                    "透支": zz.overdraft,
+                })
+            except Exception:
+                continue
+
+    if not trend_rows:
+        st.info("近 12 個月內無資料完整的月份")
+    else:
+        tdf = pd.DataFrame(trend_rows).sort_values("月份")
+        long = tdf.melt(id_vars=["月份"], var_name="項目", value_name="金額")
+        chart = alt.Chart(long).mark_bar(size=18).encode(
+            x=alt.X("月份:N", sort="ascending"),
+            y=alt.Y("金額:Q", title="NT$"),
+            color=alt.Color(
+                "項目:N",
+                scale=alt.Scale(
+                    domain=["收入 (x13)", "私人支出", "透支"],
+                    range=["#5CB85C", "#4A90E2", "#D9534F"],
+                ),
+            ),
+            xOffset="項目:N",
+            tooltip=["月份", "項目", alt.Tooltip("金額:Q", format=",")],
+        ).properties(height=340)
+        st.altair_chart(chart, use_container_width=True)
 
 
 # ============================================================
