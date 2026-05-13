@@ -48,8 +48,9 @@ from datetime import date
 
 XIE_SONGFANG_KEYWORDS = ("謝松坊",)  # 編制外人力
 
-# 澤豐玉山健保戶 帳號末段（用以區分 中信↔健保戶 vs 中信↔院長個人玉山）
-ZEFENG_ESUN_TAIL = "0347940007803"
+# 玉山帳號末段（中信 csv 對方欄位是純數字，需用末段比對而非字串「玉山」）
+ZEFENG_ESUN_TAIL = "0347940007803"        # 澤豐玉山健保戶
+ZHOU_PERSONAL_ESUN_TAIL = "0668979072975"  # 院長個人玉山
 
 
 def _next_month(month: str) -> str:
@@ -290,25 +291,28 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
             # 若 N 月無交易，沿用 x1
             z.x11_current_balance = z.x1_prev_balance
 
-    # x2 雙向：
-    #   inflow  → x2 (loose: 任何玉山往來；formula 需要全收為平衡項)
-    #   outflow → x2' (tight: 僅中信→澤豐玉山健保戶 0347940007803)
-    #             中信→院長個人玉山 (0668979072975) 不算 x2'，留在 n1
-    #             因為院長個人玉山 ↔ 中信 是院長自己帳戶之間移轉
+    # x2 雙向（用對方帳號末段比對，因中信 csv 沒「玉山」字串）：
+    #   inflow  → x2 (loose: 對方=澤豐玉山健保戶 或 院長個人玉山；
+    #               formula 需收齊全部玉山相關 inflow 為平衡項)
+    #   outflow → x2' (tight: 僅對方=澤豐玉山健保戶 0347940007803，
+    #               視為院長補貼診所，扣回總和)
+    #               對方=院長個人玉山 0668979072975 不算 x2'，留 n1
+    yusan_tails = [
+        ZEFENG_ESUN_TAIL.lstrip("0"),
+        ZHOU_PERSONAL_ESUN_TAIL.lstrip("0"),
+    ]
+    zefeng_tail = ZEFENG_ESUN_TAIL.lstrip("0")
     for tx in n_tx:
         amt = tx.get("amount") or 0
-        summary = tx.get("summary") or ""
-        note = tx.get("note") or ""
         cp = tx.get("counterparty") or ""
-        if not ("玉山" in summary or "玉山" in note or "玉山" in cp):
+        cp_digits = _digits_only(cp)
+        if not any(t and t in cp_digits for t in yusan_tails):
             continue
         if amt > 0:
             z.x2_clinic_transfer_in += int(amt)
             z.x2_items.append(_to_item(tx))
         elif amt < 0:
-            # 只有對方是澤豐玉山健保戶 才算院長補貼 clinic
-            cp_digits = _digits_only(cp)
-            if ZEFENG_ESUN_TAIL.lstrip("0") in cp_digits:
+            if zefeng_tail and zefeng_tail in cp_digits:
                 z.x2_personal_subsidy_out += -int(amt)
                 z.x2_out_items.append(_to_item(tx))
             # else: 中信→院長個人玉山 → 留在 n1 (未分類 outflow 自動歸 personal misc)
