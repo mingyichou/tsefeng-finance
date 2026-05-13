@@ -4296,18 +4296,20 @@ def page_personal():
         f"### 🏦 n1（澤豐中信戶）= **NT$ {z.n1:,}**"
     )
     n1_rows = [
-        ("x1  N 月初餘額", z.x1_prev_balance, "+"),
-        ("x2  健保戶→中信轉入", z.x2_clinic_transfer_in, "+"),
-        ("x3  澤豐現金支出", z.x3_zefeng_cash_expense, "−"),
-        ("x4  澤沛現金支出代墊（N+1 反推）", z.x4_zepei_cash_advance, "−"),
-        ("x5  澤沛還現金代墊（前月）", z.x5_zepei_cash_repay, "+"),
-        ("x6  豐沛金流入帳", z.x6_fengpei_in, "+"),
-        ("x7  澤沛合約還款入帳", z.x7_zepei_contract_in, "+"),
-        ("x8  澤豐現金存入", z.x8_zefeng_cash_in, "+"),
-        ("x9  編制外人力薪資（謝松坊）", z.x9_external_staff_salary, "−"),
-        ("x10 手KEY 非常規 net", z.x10_manual_net, "+"),
-        ("x12 澤豐合約支出", z.x12_zefeng_contract_expense, "−"),
-        ("x11 N 月底餘額", z.x11_current_balance, "−"),
+        ("x1   N 月初餘額", z.x1_prev_balance, "+"),
+        ("x2   健保戶→中信 轉入", z.x2_clinic_transfer_in, "+"),
+        ("x2'  中信→玉山 院長補貼 (不入公式)",
+         z.x2_personal_subsidy_out, "（已含於 n1）"),
+        ("x3   澤豐現金支出", z.x3_zefeng_cash_expense, "−"),
+        ("x4   澤沛現金支出代墊（N+1 反推）", z.x4_zepei_cash_advance, "−"),
+        ("x5   澤沛還現金代墊（前月）", z.x5_zepei_cash_repay, "+"),
+        ("x6   豐沛金流入帳", z.x6_fengpei_in, "+"),
+        ("x7   澤沛合約還款入帳", z.x7_zepei_contract_in, "+"),
+        ("x8   澤豐現金存入", z.x8_zefeng_cash_in, "+"),
+        ("x9   編制外人力薪資（謝松坊）", z.x9_external_staff_salary, "−"),
+        ("x10  手KEY 非常規 net", z.x10_manual_net, "+"),
+        ("x12  澤豐合約支出", z.x12_zefeng_contract_expense, "−"),
+        ("x11  N 月底餘額", z.x11_current_balance, "−"),
     ]
     n1_df = pd.DataFrame(
         [{"變數": k, "金額": v, "符號": s} for k, v, s in n1_rows]

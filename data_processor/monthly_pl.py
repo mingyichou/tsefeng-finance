@@ -35,9 +35,12 @@ from datetime import date
 
 
 # ─── 帳號 / 標籤辨識 ──────────────────────────────────────
-ZEPEI_CTBC_TAIL = "137540125004"          # 澤沛中信帳號末段
-ZHOU_PERSONAL_TAIL = "0668979072975"      # 周院長個人帳尾號（澤豐玉山戶要排除）
-ZEFENG_CTBC_TAIL = "0347940007803"        # 澤豐自家中信帳號末段（內部移轉，不記）
+ZHOU_PERSONAL_TAIL = "0668979072975"      # 周院長個人玉山帳尾號（澤豐玉山戶要排除）
+ZEFENG_CTBC_TAIL = "0347940007803"        # 澤豐自家中信帳號末段（舊帳；保留向後相容）
+DEFAULT_ZHOU_ACCOUNTS = [
+    "0668979072975",    # 院長個人玉山
+    "137540125004",     # 澤豐&個人中信
+]
 
 
 def _normalize(text: str) -> str:
@@ -84,6 +87,41 @@ def _is_zhou_personal_transfer(counterparty: str) -> bool:
 def _is_zefeng_ctbc_internal(counterparty: str) -> bool:
     """澤豐玉山戶對方帳號是澤豐自家中信（內部移轉）— 出入帳都排除"""
     return ZEFENG_CTBC_TAIL.lstrip("0") in _digits_only(counterparty)
+
+
+def _read_zhou_accounts(sb) -> list[str]:
+    """讀 system_settings.zhou_personal_accounts；失敗回預設值。"""
+    import json
+    try:
+        rows = (
+            sb.table("system_settings").select("value")
+            .eq("key", "zhou_personal_accounts").limit(1).execute().data
+        )
+    except Exception:
+        return list(DEFAULT_ZHOU_ACCOUNTS)
+    if not rows:
+        return list(DEFAULT_ZHOU_ACCOUNTS)
+    v = rows[0].get("value")
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+    return list(DEFAULT_ZHOU_ACCOUNTS)
+
+
+def _is_internal_account(counterparty: str, accounts: list[str]) -> bool:
+    """對方帳號末段 in 院長 / 澤豐中信 帳號清單 → 視為內部移轉 / 院長個人。"""
+    cp = _digits_only(counterparty)
+    for acc in accounts:
+        a = (acc or "").lstrip("0")
+        if a and a in cp:
+            return True
+    return False
 
 
 def _extract_attr_month_from_desc(desc: str, fallback: str | None = None) -> str | None:
@@ -427,13 +465,18 @@ def calculate_zefeng_monthly(
     next_month = _next_month(service_month)
     prev_m = _prev_month(service_month)
 
-    # ─── 玉山健保戶：逐筆，排除 周院長個人 / 澤豐自家中信 ───
+    # ─── 玉山健保戶：逐筆，排除 周院長個人帳 + 澤豐中信內部移轉 ───
+    # 排除清單從 system_settings.zhou_personal_accounts 讀取（含 澤豐中信末段 137540125004）
+    zhou_accounts = _read_zhou_accounts(sb)
     esun_id = _get_bank_account_id(sb, clinic_id, "健保戶")
     if esun_id:
         for tx in _fetch_bank_transactions(sb, esun_id, service_month):
             amt = tx["amount"]
             cp = tx.get("counterparty") or ""
-            if _is_zhou_personal_transfer(cp) or _is_zefeng_ctbc_internal(cp):
+            # 雙向（inflow/outflow 都排）：對方含 zhou_personal_accounts 任一末段
+            # 或舊式 _is_zefeng_ctbc_internal 為兼容
+            if (_is_internal_account(cp, zhou_accounts)
+                    or _is_zefeng_ctbc_internal(cp)):
                 continue
             item = _bank_item(tx, attribution_month=service_month)
             if amt > 0:
