@@ -4219,6 +4219,15 @@ def _visit_field(component, field_name: str) -> int:
 # ============================================================
 # 5. 院長個人透支（Phase 5）
 # ============================================================
+def _prev_month_label(month_iso: str) -> str:
+    """ISO YYYY-MM-01 → 前月 YYYY-MM 字串。"""
+    from datetime import date
+    d = date.fromisoformat(month_iso)
+    if d.month == 1:
+        return f"{d.year - 1:04d}-12"
+    return f"{d.year:04d}-{d.month - 1:02d}"
+
+
 def page_personal():
     st.title("💸 院長個人財富分析")
 
@@ -4266,13 +4275,19 @@ def page_personal():
 
     # ─── 1. 周院長收入 (x13) ───
     st.divider()
-    st.subheader("① 周院長收入 (x13 周明毅看診薪資)")
+    st.subheader("① 周院長收入 (x13 周明毅看診薪資，前月服務薪資本月實領)")
     if z.x13_items:
         df = pd.DataFrame(z.x13_items)
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.markdown(f"**合計 NT$ {z.x13_zhou_salary:,}**")
+        st.caption(
+            f"（顯示 {sel_month[:7]} 帳列為前月 service_month 之兩院 total_salary 加總）"
+        )
     else:
-        st.info("該月份 doctor_salary_monthly 無 周明毅 資料 — 請先到「💵 醫師薪資」頁計算寫入")
+        st.info(
+            f"前月（{_prev_month_label(sel_month)}）"
+            f"doctor_salary_monthly 無 周明毅 資料 — 請先到「💵 醫師薪資」頁計算寫入"
+        )
 
     # ─── 2. 周院長支出（含支票）N = n1 + n2 ───
     st.divider()

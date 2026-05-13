@@ -22,7 +22,8 @@
   x10 = N 月 manual_entry(clinic=澤豐, income - expense)
   x11 = 中信 N 月底餘額
   x12 = N 月 contract_expense.service_month=N（澤豐合約支出）
-  x13 = N 月 doctor_salary_monthly 周明毅 total_salary 兩院總和
+  x13 = N-1 月 doctor_salary_monthly 周明毅 total_salary 兩院總和
+        (N 月實帳支付的薪水 = N-1 月服務月薪資)
 
   n2 (澤豐玉山 院長 personal outflow)
     = 澤豐玉山 N 月 outflow 對方含 zhou_personal_accounts（玉山 / 中信戶尾碼）
@@ -403,7 +404,7 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
         int(round(float(r.get("amount") or 0))) for r in ct
     )
 
-    # x13 周明毅薪資（兩院總和）
+    # x13 周明毅薪資（兩院總和）— N 月實帳支付的是 N-1 月服務月薪資
     zhou_doc = (
         sb.table("doctors").select("id").eq("name", "周明毅").execute().data
     )
@@ -412,7 +413,7 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
         zs = (
             sb.table("doctor_salary_monthly")
             .select("total_salary, clinic_id, service_month")
-            .eq("doctor_id", zhou_id).eq("service_month", sm)
+            .eq("doctor_id", zhou_id).eq("service_month", prev_m)
             .execute().data
         )
         for r in zs:
