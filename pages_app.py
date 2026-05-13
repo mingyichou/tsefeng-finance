@@ -4266,8 +4266,8 @@ def page_personal():
     st.divider()
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("周院長收入 (x13)", f"NT$ {z.x13_zhou_salary:,}")
-    k2.metric("總支出 N (n1+n2)", f"NT$ {z.total_expense:,}")
-    k3.metric("私人支出 (N-支票)", f"NT$ {z.private_expense:,}")
+    k2.metric("總支出 N (n1+n2−x2')", f"NT$ {z.total_expense:,}")
+    k3.metric("私人支出 (N−支票)", f"NT$ {z.private_expense:,}")
     k4.metric("透支 (花到診所營收)",
               f"NT$ {z.overdraft:,}",
               delta=("⚠️ 超支" if z.overdraft > 0 else "✅ 結餘"),
@@ -4298,8 +4298,8 @@ def page_personal():
     n1_rows = [
         ("x1   N 月初餘額", z.x1_prev_balance, "+"),
         ("x2   健保戶→中信 轉入", z.x2_clinic_transfer_in, "+"),
-        ("x2'  中信→玉山 院長補貼 (不入公式)",
-         z.x2_personal_subsidy_out, "（已含於 n1）"),
+        ("x2'  中信→玉山 院長補貼 (僅顯示)",
+         z.x2_personal_subsidy_out, "（隱含於 n1，在總和處扣回）"),
         ("x3   澤豐現金支出", z.x3_zefeng_cash_expense, "−"),
         ("x4   澤沛現金支出代墊（N+1 反推）", z.x4_zepei_cash_advance, "−"),
         ("x5   澤沛還現金代墊（前月）", z.x5_zepei_cash_repay, "+"),
@@ -4327,7 +4327,16 @@ def page_personal():
         )
     else:
         st.info("該月無玉山→院長個人帳號的轉出")
-    st.markdown(f"### 💸 **N 總支出 = NT$ {z.total_expense:,}**")
+
+    st.markdown(
+        f"### 💸 **N 總支出 = n1 + n2 − x2'** "
+        f"= {z.n1:,} + {z.n2:,} − {z.x2_personal_subsidy_out:,} "
+        f"= **NT$ {z.total_expense:,}**"
+    )
+    st.caption(
+        "扣 x2' 原因：n1 公式隱含包含中信→玉山的院長補貼，"
+        "但這筆錢進診所不算院長個人開支，故從總和扣回。"
+    )
 
     # ─── 3. 周院長私人支出 = N - 支票 ───
     st.divider()

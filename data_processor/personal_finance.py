@@ -188,8 +188,11 @@ class ZhouMonthlyFinance:
 
     @property
     def total_expense(self) -> int:
-        """周院長個人總支出 N = n1 + n2"""
-        return self.n1 + self.n2
+        """周院長個人總支出 N = n1 + n2 − x2'
+        x2' (中信→玉山 院長補貼) 已隱含在 n1，但院長把錢投進診所
+        不算個人開支，所以從總和扣回。
+        """
+        return self.n1 + self.n2 - self.x2_personal_subsidy_out
 
     @property
     def p_check_total(self) -> int:
