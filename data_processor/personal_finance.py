@@ -13,10 +13,15 @@
   x1  = 中信 N 月初餘額（= N-1 月最後 balance）
   x2  = N 月 中信 inflow 來自 澤豐玉山 健保戶（counterparty 對應 澤豐玉山）
   x3  = N 月 cash_expense.accrual_month=N（澤豐零碎現金支出）
-  x4  = N 月 澤沛現金支出（由 N+1 月之 x5 反推）
-  x5  = N 月 中信 inflow note 含「現金支出/現支」(澤沛還 N-1 月代墊)
-  x6  = N 月 中信 inflow note 含「豐沛金流」
-  x7  = N 月 中信 inflow note 含「合約」（澤沛還合約款）
+  x4  = N+1 月 澤沛中信 outflow note 含「現金支出/現支」反推
+        （N 月 澤沛現金支出，N+1 月澤沛還款）
+  x5  = N 月 澤沛中信 outflow note 含「現金支出/現支」
+        （澤沛還 N-1 月代墊；由澤沛端 outflow 抓，澤豐中信備註可能缺）
+  x6  = N 月 澤沛中信 outflow note 含「豐沛金流」
+  x7  = N 月 澤沛中信 outflow note 含「合約」（澤沛還合約款）
+
+  P.S. x5/x6/x7 雖然物理上是澤豐中信 inflow，但備註只標於澤沛端，
+       故由澤沛 outflow 抓金額（兩側必相等）。
   x8  = N 月 中信 inflow channel/summary 含「現金/存款機」+ manual_annotation 配對
   x9  = N-1 月 staff_salary_summary 編制外名單薪資（N 月 cash 支付）
   x10 = N 月 manual_entry(clinic=澤豐, income - expense)
@@ -237,10 +242,13 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
     # 診所 id
     clinics = sb.table("clinics").select("id, short_name").execute().data
     fz = next(c for c in clinics if c["short_name"] == "澤豐")
+    fp = next(c for c in clinics if c["short_name"] == "澤沛")
     fz_id = fz["id"]
+    fp_id = fp["id"]
 
     fz_ctbc_id = _get_bank_account_id(sb, fz_id, "進出戶")
     fz_esun_id = _get_bank_account_id(sb, fz_id, "健保戶")
+    fp_ctbc_id = _get_bank_account_id(sb, fp_id, "進出戶")
 
     # 從 system_settings 讀 院長個人帳號
     zhou_accounts = _read_settings_list(
@@ -272,39 +280,36 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
             # 若 N 月無交易，沿用 x1
             z.x11_current_balance = z.x1_prev_balance
 
-    # x2 玉山健保戶轉入 / x5/x6/x7/x8 入帳分類
-    # 取 fz_esun_id 的所有可能 counterparty 末段做 x2 識別
-    # 簡化：summary 含「玉山」或 channel='ATM跨行轉入' 且 counterparty 含玉山帳號
-    # 實務上：澤豐玉山 → 澤豐中信 跨行轉帳 → 中信 inflow 摘要常見「ＡＴＭ跨行轉」
+    # x2 玉山健保戶轉入：澤豐中信 inflow 摘要/備註含「玉山」
+    # 實務上：澤豐玉山 → 澤豐中信 跨行轉帳，摘要常見「ＡＴＭ跨行轉」
     for tx in n_tx:
         amt = tx.get("amount") or 0
-        note = tx.get("note") or ""
+        if amt <= 0:
+            continue
         summary = tx.get("summary") or ""
-        channel = tx.get("channel") or ""
+        note = tx.get("note") or ""
+        if ("玉山" in summary) or ("玉山" in note):
+            z.x2_clinic_transfer_in += int(amt)
+            z.x2_items.append(_to_item(tx))
 
-        if amt > 0:
-            # inflow 分類
+    # x5/x6/x7：從澤沛中信 N 月 outflow 的 note 分類抓金額
+    # （澤豐中信側備註常缺；澤沛端 outflow 必定一一對應澤豐 inflow，金額相等）
+    if fp_ctbc_id:
+        for tx in _fetch_tx(sb, fp_ctbc_id, sm):
+            amt = tx.get("amount") or 0
+            if amt >= 0:
+                continue
+            note = tx.get("note") or ""
+            abs_amt = -int(amt)
             if _is_fengpei(note):
-                z.x6_fengpei_in += int(amt)
+                z.x6_fengpei_in += abs_amt
                 z.x6_items.append(_to_item(tx))
-                continue
-            if _is_zepei_cash_repay(note):
-                z.x5_zepei_cash_repay += int(amt)
+            elif _is_zepei_cash_repay(note):
+                z.x5_zepei_cash_repay += abs_amt
                 z.x5_items.append(_to_item(tx))
-                continue
-            if _is_zepei_contract(note):
-                z.x7_zepei_contract_in += int(amt)
+            elif _is_zepei_contract(note):
+                z.x7_zepei_contract_in += abs_amt
                 z.x7_items.append(_to_item(tx))
-                continue
-
-            # x2 玉山健保戶轉入：對方為玉山相關
-            # 摘要含「玉山」、跨行轉入到中信、或 channel/summary 顯示 玉山
-            if ("玉山" in summary) or ("玉山" in note):
-                z.x2_clinic_transfer_in += int(amt)
-                z.x2_items.append(_to_item(tx))
-                continue
-
-            # 其他 inflow 暫不分類（可能 x8 現金存入：之後再判斷）
 
     # x8 現金存入需要 manual_annotation 配對（同 月度實帳金流 邏輯）
     ann_cash = (
@@ -327,12 +332,8 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
         summary = tx.get("summary") or ""
         channel = tx.get("channel") or ""
         note = tx.get("note") or ""
-        # 跳過已分類的 inflow（x2/x5/x6/x7）
-        if (_is_fengpei(note) or _is_zepei_cash_repay(note)
-                or _is_zepei_contract(note)):
-            continue
         if "玉山" in summary or "玉山" in note:
-            continue
+            continue  # 已歸 x2
         # 現金存入候選
         if not ("現金" in summary or "存款機" in channel):
             continue
@@ -354,15 +355,15 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
     )
     z.x3_zefeng_cash_expense = sum(int(r.get("amount") or 0) for r in cash)
 
-    # x4 澤沛現金支出（由 N+1 月 中信 inflow 註記="現金支出" 反推）
-    next_n_tx = _fetch_tx(sb, fz_ctbc_id, next_m) if fz_ctbc_id else []
-    for tx in next_n_tx:
-        amt = tx.get("amount") or 0
-        if amt <= 0:
-            continue
-        if _is_zepei_cash_repay(tx.get("note") or ""):
-            z.x4_zepei_cash_advance += int(amt)
-            z.x4_items.append(_to_item(tx))
+    # x4 澤沛現金支出（由 N+1 月 澤沛中信 outflow 註記="現金支出" 反推）
+    if fp_ctbc_id:
+        for tx in _fetch_tx(sb, fp_ctbc_id, next_m):
+            amt = tx.get("amount") or 0
+            if amt >= 0:
+                continue
+            if _is_zepei_cash_repay(tx.get("note") or ""):
+                z.x4_zepei_cash_advance += -int(amt)
+                z.x4_items.append(_to_item(tx))
 
     # x9 編制外人力薪資（N-1 月 service_month，N 月 cash 支付）
     ss = (
