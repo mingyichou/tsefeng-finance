@@ -48,6 +48,9 @@ from datetime import date
 
 XIE_SONGFANG_KEYWORDS = ("謝松坊",)  # 編制外人力
 
+# 澤豐玉山健保戶 帳號末段（用以區分 中信↔健保戶 vs 中信↔院長個人玉山）
+ZEFENG_ESUN_TAIL = "0347940007803"
+
 
 def _next_month(month: str) -> str:
     d = date.fromisoformat(month)
@@ -287,23 +290,28 @@ def calculate_zhou_monthly(sb, service_month: str) -> ZhouMonthlyFinance:
             # 若 N 月無交易，沿用 x1
             z.x11_current_balance = z.x1_prev_balance
 
-    # x2 雙向：澤豐中信 inflow（玉山→中信，入 n1 +x2）
-    #        / 澤豐中信 outflow 反向（中信→玉山，院長補貼 clinic，
-    #          不入公式但顯示，因為已隱含於 n1）
+    # x2 雙向：
+    #   inflow  → x2 (loose: 任何玉山往來；formula 需要全收為平衡項)
+    #   outflow → x2' (tight: 僅中信→澤豐玉山健保戶 0347940007803)
+    #             中信→院長個人玉山 (0668979072975) 不算 x2'，留在 n1
+    #             因為院長個人玉山 ↔ 中信 是院長自己帳戶之間移轉
     for tx in n_tx:
         amt = tx.get("amount") or 0
         summary = tx.get("summary") or ""
         note = tx.get("note") or ""
         cp = tx.get("counterparty") or ""
-        # 識別玉山往來：摘要、備註、或對方含「玉山」字樣
         if not ("玉山" in summary or "玉山" in note or "玉山" in cp):
             continue
         if amt > 0:
             z.x2_clinic_transfer_in += int(amt)
             z.x2_items.append(_to_item(tx))
         elif amt < 0:
-            z.x2_personal_subsidy_out += -int(amt)
-            z.x2_out_items.append(_to_item(tx))
+            # 只有對方是澤豐玉山健保戶 才算院長補貼 clinic
+            cp_digits = _digits_only(cp)
+            if ZEFENG_ESUN_TAIL.lstrip("0") in cp_digits:
+                z.x2_personal_subsidy_out += -int(amt)
+                z.x2_out_items.append(_to_item(tx))
+            # else: 中信→院長個人玉山 → 留在 n1 (未分類 outflow 自動歸 personal misc)
 
     # x5/x6/x7：從澤沛中信 N 月 outflow 的 note 分類抓金額
     # （澤豐中信側備註常缺；澤沛端 outflow 必定一一對應澤豐 inflow，金額相等）
