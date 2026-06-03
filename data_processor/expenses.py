@@ -437,12 +437,25 @@ def parse_inventory_transfer(
     file_obj.seek(0)
     df = pd.read_excel(file_obj, sheet_name=0, header=None)
 
+    ncol = df.shape[1]
+
+    def _clinic_of(text: str) -> int | None:
+        """從表頭片語判斷診所：含『澤豐』→澤豐、含『澤沛』→澤沛。"""
+        if "澤豐" in text:
+            return clinic_zefeng_id
+        if "澤沛" in text:
+            return clinic_zepei_id
+        return None
+
     records: list[dict] = []
     current_month: str | None = None
-    in_block = False  # True 表示目前在某月區塊內的資料列範圍
+    # 每月區塊的欄位群組：list of (item_col, qty_col, from_id, to_id)
+    # 由「pay」表頭列動態偵測，不寫死欄號（檔案排版曾為 C0/C1 + C4/C5，
+    # 早期版誤寫死 C6/C7 導致右欄『澤豐 pay 澤沛』整組讀不到）。
+    groups: list[tuple[int, int, int, int]] = []
 
     for r in range(df.shape[0]):
-        c0 = df.iloc[r, 0] if df.shape[1] > 0 else None
+        c0 = df.iloc[r, 0] if ncol > 0 else None
         c0_str = str(c0).strip() if pd.notna(c0) else ""
 
         # 月份區塊標題
@@ -451,44 +464,43 @@ def parse_inventory_transfer(
             roc_y, mo = int(m.group(1)), int(m.group(2))
             ad_y = roc_y + 1911
             current_month = f"{ad_y:04d}-{mo:02d}-01"
-            in_block = False  # 等 'pay' 表頭列出現再開始
+            groups = []  # 等 'pay' 表頭列重新偵測欄位
             continue
 
-        # 表頭列（'澤沛 pay 澤豐'）— 啟動資料收集
-        if "pay" in c0_str:
-            in_block = True
+        # 表頭列：掃整列找含『pay』的儲存格，逐一解析方向與欄位
+        # 「A pay B」語意：A 付錢給 B → 貨從 B → A（from=B, to=A）。
+        cells = [
+            (c, str(df.iloc[r, c]).strip())
+            for c in range(ncol) if pd.notna(df.iloc[r, c])
+        ]
+        pay_cells = [(c, v) for c, v in cells if "pay" in v.lower()]
+        if pay_cells:
+            new_groups: list[tuple[int, int, int, int]] = []
+            for c, v in pay_cells:
+                parts = re.split(r"pay", v, flags=re.I)
+                payer = _clinic_of(parts[0]) if parts else None
+                supplier = _clinic_of(parts[1]) if len(parts) > 1 else None
+                if payer and supplier and c + 1 < ncol:
+                    # item_col=c, qty_col=c+1, from=supplier(出貨方), to=payer(付款方)
+                    new_groups.append((c, c + 1, supplier, payer))
+            if new_groups:
+                groups = new_groups
             continue
 
-        if not (in_block and current_month):
+        if not (groups and current_month):
             continue
 
-        # 資料列：左欄 (C0=item, C1=qty) 澤豐→澤沛；右欄 (C6=item, C7=qty) 澤沛→澤豐
-        # 左欄組
-        if df.shape[1] > 1:
-            item_l = _norm_str(df.iloc[r, 0])
-            qty_l = _to_float(df.iloc[r, 1])
-            if item_l and qty_l and qty_l > 0:
+        # 資料列：依各群組欄位收錄
+        for item_col, qty_col, from_id, to_id in groups:
+            item = _norm_str(df.iloc[r, item_col])
+            qty = _to_float(df.iloc[r, qty_col])
+            if item and qty and qty > 0:
                 records.append({
                     "transfer_month": current_month,
-                    "from_clinic_id": clinic_zefeng_id,
-                    "to_clinic_id": clinic_zepei_id,
-                    "item": item_l,
-                    "qty": round(qty_l, 2),
-                    "unit_price": None,
-                    "amount": None,
-                })
-
-        # 右欄組
-        if df.shape[1] > 7:
-            item_r = _norm_str(df.iloc[r, 6])
-            qty_r = _to_float(df.iloc[r, 7])
-            if item_r and qty_r and qty_r > 0:
-                records.append({
-                    "transfer_month": current_month,
-                    "from_clinic_id": clinic_zepei_id,
-                    "to_clinic_id": clinic_zefeng_id,
-                    "item": item_r,
-                    "qty": round(qty_r, 2),
+                    "from_clinic_id": from_id,
+                    "to_clinic_id": to_id,
+                    "item": item,
+                    "qty": round(qty, 2),
                     "unit_price": None,
                     "amount": None,
                 })
