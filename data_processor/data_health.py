@@ -7,9 +7,22 @@ compute_cashflow_health() 不依賴 streamlit，純算 issues / 表格資料。
 
 from __future__ import annotations
 
+import unicodedata
 from collections import Counter
 
 from data_processor.monthly_pl import _next_month, _prev_month
+
+# 澤豐合約支出「每月必填」的 10 個廠商（對應合約支出檔 R0 表頭）。
+# 規則：該月每個廠商都要有資料列（填 0 算已填，留空才算缺）。
+REQUIRED_CONTRACT_VENDORS = [
+    "莊松榮簽口", "港香蘭簽口", "天一簽口", "科達簽口", "順天堂無票合約",
+    "大墩叫貨", "駿賀簽口", "力至高簽口", "德瑞適&神美針", "房租(玉)",
+]
+
+
+def _norm_vendor(s) -> str:
+    """NFKC 正規化 + 去空白；吸收全形/半形括號差異。"""
+    return unicodedata.normalize("NFKC", str(s or "")).strip()
 
 
 def compute_cashflow_health(sb, service_month: str) -> dict:
@@ -89,14 +102,28 @@ def compute_cashflow_health(sb, service_month: str) -> dict:
             m = f"x3 cash_expense {sm_label} 缺資料：請上傳澤豐現金支出 xlsx"
             issues.append(m); issues_fz.append(m)
 
-        n = _count("contract_expense", [
-            ("eq", "clinic_id", fz_id), ("eq", "service_month", service_month),
-        ])
-        other_rows.append({"資料源": "x12 澤豐合約支出 (contract_expense)",
-                           "月份": sm_label, "筆數": n,
-                           "狀態": "✅" if n > 0 else "⚠️ 缺"})
-        if n == 0:
-            m = f"x12 contract_expense {sm_label} 缺資料：請上傳澤豐合約支出 xlsx"
+        crows = (
+            sb.table("contract_expense").select("vendor")
+            .eq("clinic_id", fz_id).eq("service_month", service_month)
+            .execute().data
+        )
+        present = {_norm_vendor(r.get("vendor")) for r in crows}
+        missing = [v for v in REQUIRED_CONTRACT_VENDORS
+                   if _norm_vendor(v) not in present]
+        n_req = len(REQUIRED_CONTRACT_VENDORS)
+        other_rows.append({
+            "資料源": "x12 澤豐合約支出 (contract_expense)",
+            "月份": sm_label,
+            "筆數": f"{n_req - len(missing)}/{n_req} 廠商",
+            "狀態": "✅" if not missing else "⚠️ 缺",
+        })
+        if missing:
+            if not crows:
+                m = (f"x12 contract_expense {sm_label} 缺資料："
+                     "請上傳澤豐合約支出 xlsx")
+            else:
+                m = (f"x12 澤豐合約支出 {sm_label} 有 {len(missing)} 廠商留空："
+                     f"{'、'.join(missing)}（請在合約支出檔填值，可填 0 但勿留空後重傳）")
             issues.append(m); issues_fz.append(m)
 
         rows_x9 = (

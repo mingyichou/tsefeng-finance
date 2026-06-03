@@ -299,9 +299,12 @@ def parse_contract_expense(
                 continue
             val = df.iloc[row_idx, col]
             if pd.isna(val):
+                # 留空 = 該月該廠商資料未填（不寫入；完整度診斷會抓出來）
                 continue
             amount = _to_float(val)
-            if amount is None or amount == 0:
+            if amount is None:
+                # 非數字（標題殘留等）才跳過；0 視為「已填」要寫入，
+                # 供完整度診斷判定「填 0 算完整、留空才算缺」
                 continue
             key = (service_month, vendor)
             if key in seen:
