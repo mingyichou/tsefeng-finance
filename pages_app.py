@@ -1381,7 +1381,7 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
 
 def _render_pl_charts(by_clinic_month: dict, clinic_short: str,
                       chart_months: list[str]) -> None:
-    """近 12 個月 G(總收入)/O(盈餘A) 柱狀圖；排除嚴重不完整月份。"""
+    """近 6 個月 G(總收入)/O(盈餘A) 柱狀圖；排除嚴重不完整月份。"""
     import altair as alt
 
     rows = []
@@ -1402,7 +1402,7 @@ def _render_pl_charts(by_clinic_month: dict, clinic_short: str,
         })
 
     if not rows:
-        st.info(f"{clinic_short}：近 12 個月內無資料完整的月份可比較")
+        st.info(f"{clinic_short}：近 6 個月內無資料完整的月份可比較")
         return
 
     df = pd.DataFrame(rows).sort_values("月份")
@@ -1416,7 +1416,7 @@ def _render_pl_charts(by_clinic_month: dict, clinic_short: str,
                 "月份", alt.Tooltip("總收入 G:Q", format=","),
             ],
         ).properties(
-            title=f"{clinic_short} 總收入 G 近 12 月",
+            title=f"{clinic_short} 總收入 G 近 6 月",
             height=320,
         )
         st.altair_chart(chart_g, use_container_width=True)
@@ -1433,7 +1433,7 @@ def _render_pl_charts(by_clinic_month: dict, clinic_short: str,
                 "月份", alt.Tooltip("盈餘 O:Q", format=","),
             ],
         ).properties(
-            title=f"{clinic_short} 盈餘 O 近 12 月（綠正紅負）",
+            title=f"{clinic_short} 盈餘 O 近 6 月（綠正紅負）",
             height=320,
         )
         st.altair_chart(chart_o, use_container_width=True)
