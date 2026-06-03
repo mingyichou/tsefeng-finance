@@ -5,6 +5,9 @@
 讀 inventory_transfer + product_pricing + tcm_concentrate_pricing，組出金流明細。
 
 辨識邏輯：
+  0. 品項名含 (水) 或 (水藥包) 標註
+     → 剝除標註後，到 product_pricing 中 vendor='水藥包' 區塊比對
+       （第二個 sheet「自費藥粉&自費商品」的水藥包 vendor 區塊）
   1. 品項名含 (天一|港香蘭|莊松榮|科達|順天堂|仙豐) 之一（括號或 dash 接續）
      → 走 tcm_concentrate_pricing：amount = qty × price × ratio
        ratio = 0.65 (天一/港香蘭) 或 0.70 (莊松榮/科達/順天堂/仙豐)
@@ -75,22 +78,24 @@ ALIAS_GROUPS: list[list[str]] = [
     ["瑪卡", "馬卡", "瑪卡(200G)", "馬卡(200G)"],
     ["特級瑪卡", "特級馬卡", "特輯瑪卡"],
     ["西洋蔘", "西洋參", "西洋蔘(100G)"],
-    ["三合一膠囊(顆)", "三合一膠囊"],
-    ["佳綠姿膠囊(顆)", "佳綠姿膠囊"],
-    ["植麗素(顆)", "植麗素膠囊(顆)", "植麗素膠囊", "植麗素"],
-    ["塑姿膠囊(顆)", "塑姿膠囊"],
+    ["三合一", "三合一(顆)", "三合一膠囊(顆)", "三合一膠囊"],
+    ["佳綠姿", "佳綠姿(顆)", "佳綠姿膠囊(顆)", "佳綠姿膠囊"],
+    ["植麗素", "植麗素(顆)", "植麗素膠囊(顆)", "植麗素膠囊"],
+    ["塑姿", "塑姿(顆)", "塑姿膠囊(顆)", "塑姿膠囊"],
     [
+        "甲殼素", "殼寡糖", "甲殼素(顆)", "殼寡糖(顆)",
         "甲殼素膠囊", "殼寡糖膠囊",
         "甲殼素膠囊(顆)", "殼寡糖膠囊(顆)",
         "甲殼素膠囊(殼寡糖)",
     ],
     [
+        "CLA", "CLA(顆)", "紅花籽油", "紅花籽油膠囊(顆)",
         "CLA膠囊", "CLA膠囊(顆)",
-        "紅花籽油膠囊", "紅花籽油膠囊(顆)",
+        "紅花籽油膠囊",
     ],
-    ["非洲芒果膠囊(顆)", "非洲芒果膠囊"],
-    ["束膳纖(顆)", "束膳纖膠囊(顆)", "束膳纖膠囊", "束膳纖"],
-    ["溯本纖(顆)", "溯本纖膠囊", "溯本纖"],
+    ["非洲芒果", "非洲芒果(顆)", "非洲芒果膠囊(顆)", "非洲芒果膠囊"],
+    ["束膳纖", "束膳纖(顆)", "束膳纖膠囊(顆)", "束膳纖膠囊"],
+    ["溯本纖", "溯本纖(顆)", "溯本纖膠囊", "溯本纖膠囊(顆)"],
     ["龜鹿二仙膠仙膠", "龜鹿二仙膠仙膠(盒)", "御珍品", "御珍品(龜鹿二仙膠)"],
     # 其它自費商品
     ["洛神花萼膠囊", "洛神花萼蔓越莓膠囊"],
@@ -127,6 +132,22 @@ def _norm(s: str | None) -> str:
     if not s:
         return ""
     return unicodedata.normalize("NFKC", str(s)).strip()
+
+
+# ─── 水藥包辨識（院長 2026-06-03）────────────────────────
+# 凡品項含「(水)」或「(水藥包)」標註者，一律歸到自費商品檔
+# 第二個 sheet「自費藥粉&自費商品」的「水藥包」vendor 區塊比對。
+# 比對時把水標註剝除，「四物湯(水)」/「四物湯(水藥包)」/「四物湯」收斂成同一鍵。
+_WATER_RE = re.compile(r"[(（]\s*水(?:藥包)?\s*[)）]")
+
+
+def _has_water_marker(name: str | None) -> bool:
+    return bool(_WATER_RE.search(_norm(name)))
+
+
+def _strip_water_marker(name: str | None) -> str:
+    """剝除水標註後的純品名（已 NFKC normalize）。"""
+    return _WATER_RE.sub("", _norm(name)).strip()
 
 
 def _build_alias_index(groups: list[list[str]]) -> dict[str, list[str]]:
@@ -230,6 +251,26 @@ def _build_pricing_index(rows: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _build_water_index(rows: list[dict]) -> dict[str, dict]:
+    """
+    product_pricing 中 vendor='水藥包' 的列
+      → {剝除水標註後的 _norm(product_name): row}
+    （只收 cost_price 非 NULL；同鍵取先出現者）
+    """
+    out: dict[str, dict] = {}
+    for r in rows:
+        if _norm(r.get("vendor")) != "水藥包":
+            continue
+        name = r.get("product_name")
+        if not name or r.get("cost_price") is None:
+            continue
+        key = _strip_water_marker(name)
+        if key in out:
+            continue
+        out[key] = r
+    return out
+
+
 def compute_inventory_amounts(
     inventory_rows: list[dict],
     tcm_pricing_rows: list[dict],
@@ -246,6 +287,7 @@ def compute_inventory_amounts(
     """
     tcm_idx = _build_tcm_index(tcm_pricing_rows)
     pp_idx = _build_pricing_index(product_pricing_rows)
+    water_idx = _build_water_index(product_pricing_rows)
 
     out: list[PricedItem] = []
     for row in inventory_rows:
@@ -270,7 +312,24 @@ def compute_inventory_amounts(
         source = "未匹配"
         note: str | None = None
 
-        if vendor:
+        if _has_water_marker(item):
+            # 水藥包：剝除水標註後到「水藥包」vendor 區塊比對
+            # （同時嘗試剝水後的等價別名）
+            vendor, clean = None, _strip_water_marker(item)
+            pp = None
+            for cand in _equivalents_of(clean):
+                pp = water_idx.get(_strip_water_marker(cand))
+                if pp:
+                    break
+            if pp:
+                unit_price = float(pp["cost_price"])
+                amount = round(qty * unit_price, 2)
+                source = "自費(水藥包)"
+                note = f"水藥包：{clean}"
+            else:
+                source = "未匹配"
+                note = f"水藥包表查無 {clean}"
+        elif vendor:
             # 走科中：嘗試 clean 名 + 所有等價別名
             v_key = _norm(vendor)
             tcm = None
