@@ -3039,7 +3039,9 @@ def _section_inventory_transfer():
     st.caption(
         "檔名範例：『澤豐中醫診所調貨整理.xlsx』。系統解析每月區塊的雙欄向"
         "（澤沛 pay 澤豐 / 澤豐 pay 澤沛）。"
-        "金額暫不算（等 Sprint 2.8 自費商品成本售價表上線後由 trigger 帶入）。"
+        "金額在「金流結算」頁即時試算。"
+        "⚠️ 採全月覆蓋：上傳後，檔案內出現的每個月份會先清空再寫入，"
+        "同月有品項改動或刪除時請整月重傳。"
     )
     uploaded = st.file_uploader(
         "上傳調貨整理 xlsx",
@@ -3113,14 +3115,21 @@ def _section_inventory_transfer():
                         k: v for k, v in r.items() if k != "方向"
                     }
             payload = list(merged.values())
-            # UNIQUE (transfer_month, from_clinic_id, to_clinic_id, item)
-            # 重複上傳會覆蓋同組鍵的 qty / unit_price / amount
-            sb.table("inventory_transfer").upsert(
-                payload,
-                on_conflict="transfer_month,from_clinic_id,to_clinic_id,item",
-            ).execute()
+            # ── 全月覆蓋：先清除檔案內各月的兩家舊調貨資料，再寫入 ──
+            # （同月若有品項改動/刪除，舊列才不會殘留，例如已刪除的清肺飲）
+            months = sorted({r["transfer_month"] for r in payload})
+            sb.table("inventory_transfer").delete() \
+                .in_("transfer_month", months) \
+                .in_("from_clinic_id", [fz_id, fp_id]) \
+                .in_("to_clinic_id", [fz_id, fp_id]) \
+                .execute()
+            sb.table("inventory_transfer").insert(payload).execute()
             dup = len(records) - len(payload)
-            msg = f"✅ 寫入 {len(payload)} 筆（同月+同方向+同品項會覆蓋舊值）"
+            mrange = f"{months[0][:7]}~{months[-1][:7]}" if months else "-"
+            msg = (
+                f"✅ 全月覆蓋寫入 {len(payload)} 筆"
+                f"（涵蓋 {len(months)} 個月：{mrange}，已清除這些月份的舊資料）"
+            )
             if dup:
                 msg += f"；已合併 {dup} 筆同鍵重複（qty 加總）"
             st.success(msg)
