@@ -408,6 +408,16 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
     # ─── 中信進出戶：每筆都記，出帳時標註 settle_kind ───
     ctbc_id = _get_bank_account_id(sb, clinic_id, "進出戶")
     if ctbc_id:
+        # 股東注資（manual_annotation category=capital_injection / 澤沛中信）：
+        # 實際入帳但非經營收入，與「月度損益分析」一致從收入排除。
+        cap = (
+            sb.table("manual_annotation")
+            .select("entry_date, amount")
+            .eq("category", "capital_injection").eq("account", "澤沛中信")
+            .gte("entry_date", service_month).lt("entry_date", next_month)
+            .execute().data
+        )
+        cap_keys = {(r["entry_date"], int(r["amount"] or 0)) for r in cap}
         for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
             amt = tx["amount"]
             note = tx.get("note") or ""
@@ -415,6 +425,8 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             attr = prev_m if kind else service_month
             item = _bank_item(tx, attribution_month=attr, settle_kind=kind)
             if amt > 0:
+                if (tx.get("transaction_date"), int(amt)) in cap_keys:
+                    continue  # 股東注資排除（不計入收入）
                 m.ctbc_inflow_items.append(item)
             elif amt < 0:
                 item["amount"] = -amt
