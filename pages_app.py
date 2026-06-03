@@ -820,110 +820,15 @@ def _render_data_health(sb, service_month: str):
     顯示該月份所有資料來源的筆數，0 筆會 ⚠️ 警告。
     用途：跨月切換時，院長可一眼看出某月某帳戶/某資料源是否缺資料，
           避免誤判為系統 bug。
+    完整度判定邏輯抽到 data_processor.data_health（與財報列印共用）。
     """
-    from collections import Counter
-    from data_processor.monthly_pl import _next_month, _prev_month
+    from data_processor.data_health import compute_cashflow_health
 
-    next_m = _next_month(service_month)
-    prev_m = _prev_month(service_month)
     sm_label = service_month[:7]
-    pm_label = prev_m[:7]
-
-    # 4 個關鍵銀行帳戶
-    accounts = (
-        sb.table("bank_accounts")
-        .select("id, clinic_id, bank, account_type, is_personal_mixed")
-        .execute().data
-    )
-    clinic_resp = sb.table("clinics").select("id, short_name").execute().data
-    cid_to_short = {c["id"]: c["short_name"] for c in clinic_resp}
-    fz_id = next((c["id"] for c in clinic_resp if c["short_name"] == "澤豐"), None)
-    fp_id = next((c["id"] for c in clinic_resp if c["short_name"] == "澤沛"), None)
-
-    # 一次撈本月所有 bank_transactions count by account_id
-    tx_rows = (
-        sb.table("bank_transactions").select("account_id")
-        .gte("transaction_date", service_month).lt("transaction_date", next_m)
-        .execute().data
-    )
-    tx_counts = Counter(r["account_id"] for r in tx_rows)
-
-    bank_table = []
-    issues: list[str] = []
-    for acc in accounts:
-        clinic = cid_to_short.get(acc["clinic_id"], "?")
-        bank = acc.get("bank", "?")
-        atype = acc.get("account_type", "?")
-        if acc.get("is_personal_mixed"):
-            atype = f"{atype}（混戶）"
-        n = tx_counts.get(acc["id"], 0)
-        bank_table.append({
-            "診所": clinic,
-            "戶別": f"{bank} {atype}",
-            f"{sm_label} 筆數": n,
-            "狀態": "✅" if n > 0 else "⚠️ 缺",
-        })
-        if n == 0:
-            issues.append(f"{clinic} {bank} {atype}：{sm_label} CSV 未上傳")
-
-    # 其他關鍵資料源
-    def _count(table: str, filters: list[tuple[str, str, object]]) -> int:
-        q = sb.table(table).select("id", count="exact")
-        for op, col, val in filters:
-            q = getattr(q, op)(col, val)
-        return q.execute().count or 0
-
-    other_rows = []
-    if fz_id:
-        n = _count("cash_expense", [("eq", "clinic_id", fz_id), ("eq", "accrual_month", service_month)])
-        other_rows.append({"資料源": "x3 澤豐現金支出 (cash_expense)", "月份": sm_label, "筆數": n,
-                           "狀態": "✅" if n > 0 else "⚠️ 缺"})
-        if n == 0:
-            issues.append(f"x3 cash_expense {sm_label} 缺資料：請上傳澤豐現金支出 xlsx")
-
-        n = _count("contract_expense", [("eq", "clinic_id", fz_id), ("eq", "service_month", service_month)])
-        other_rows.append({"資料源": "x12 澤豐合約支出 (contract_expense)", "月份": sm_label, "筆數": n,
-                           "狀態": "✅" if n > 0 else "⚠️ 缺"})
-        if n == 0:
-            issues.append(f"x12 contract_expense {sm_label} 缺資料：請上傳澤豐合約支出 xlsx")
-
-        # x9 謝松坊：staff_salary_summary 在 prev_m 是否有「謝松坊」
-        rows_x9 = (
-            sb.table("staff_salary_summary")
-            .select("id, employee_label")
-            .eq("clinic_id", fz_id).eq("service_month", prev_m)
-            .execute().data
-        )
-        n_x9 = sum(1 for r in rows_x9 if "謝松坊" in (r.get("employee_label") or ""))
-        other_rows.append({"資料源": f"x9 謝松坊薪資 ({pm_label} 服務月)", "月份": pm_label, "筆數": n_x9,
-                           "狀態": "✅" if n_x9 > 0 else "⚠️ 缺"})
-        if n_x9 == 0:
-            issues.append(f"x9 staff_salary_summary {pm_label} 沒謝松坊：請到員工薪資頁按「全部月份一次匯入」")
-
-        # x13 周院長：doctor_salary_monthly prev_m 是否有周明毅
-        zhou = sb.table("doctors").select("id").eq("name", "周明毅").execute().data
-        if zhou:
-            zhou_id = zhou[0]["id"]
-            n_x13 = _count("doctor_salary_monthly", [
-                ("eq", "doctor_id", zhou_id), ("eq", "service_month", prev_m),
-            ])
-            other_rows.append({"資料源": f"x13 周院長薪資 ({pm_label} 服務月)", "月份": pm_label, "筆數": n_x13,
-                               "狀態": "✅" if n_x13 > 0 else "⚠️ 缺"})
-            if n_x13 == 0:
-                issues.append(f"x13 doctor_salary_monthly {pm_label} 沒周院長：請到醫師薪資頁選 {pm_label} 並按「💾 寫入」")
-
-        # x8 manual_annotation：澤豐&個人中信「存現」標記
-        ann_rows = (
-            sb.table("manual_annotation").select("id, description")
-            .eq("scope", "診所").eq("form", "存現").eq("account", "澤豐&個人中信")
-            .eq("clinic_id", fz_id)
-            .gte("entry_date", service_month).lt("entry_date", next_m)
-            .execute().data
-        )
-        other_rows.append({"資料源": "x8 manual_annotation（澤豐存現標記）", "月份": sm_label,
-                           "筆數": len(ann_rows),
-                           "狀態": "✅" if len(ann_rows) > 0 else "ℹ️ 無"})
-        # x8 缺註記不一定是問題（該月沒存現），不放進 issues
+    health = compute_cashflow_health(sb, service_month)
+    issues = health["issues"]
+    bank_table = health["bank_table"]
+    other_rows = health["other_rows"]
 
     with st.expander(
         f"🩺 {sm_label} 資料完整度診斷"
@@ -1486,6 +1391,140 @@ def _render_pl_breakdown(by_clinic_month: dict, clinic_short: str,
             sub_sum = sum(int(it.get("amount") or 0) for it in items)
             st.markdown(f"**{title}** — 合計 NT$ {sub_sum:,}（{len(items)} 筆）")
             st.dataframe(sub, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# 2c. 財報列印
+# ============================================================
+def _open_in_new_tab_widget(html_str: str, key: str):
+    """用 components.html 內嵌按鈕：點擊以 Blob 開新分頁顯示報表。"""
+    import json
+    import streamlit.components.v1 as components
+
+    payload = json.dumps(html_str)
+    btn_html = f"""
+<div style="margin:4px 0;">
+  <button id="open_{key}" style="background:#6A5ACD;color:#fff;border:none;
+     padding:10px 18px;border-radius:8px;font-size:15px;cursor:pointer;
+     font-weight:600;">🔗 開啟報表（新分頁）</button>
+  <span id="hint_{key}" style="margin-left:10px;color:#b85c00;font-size:12px;"></span>
+</div>
+<script>
+  const html_{key} = {payload};
+  document.getElementById("open_{key}").onclick = function() {{
+    try {{
+      const blob = new Blob([html_{key}], {{type: "text/html;charset=utf-8"}});
+      const url = URL.createObjectURL(blob);
+      const w = window.open(url, "_blank");
+      if (!w) {{
+        document.getElementById("hint_{key}").innerText =
+          "瀏覽器擋了彈出視窗，請改用下方「下載 HTML」按鈕。";
+      }}
+    }} catch (e) {{
+      document.getElementById("hint_{key}").innerText = "開啟失敗：" + e;
+    }}
+  }};
+</script>
+"""
+    components.html(btn_html, height=60)
+
+
+def page_reports():
+    st.title("🖨️ 財報列印")
+    st.caption(
+        "產生可列印成 A4（1~2 頁）的獨立 HTML 報表。點「開啟報表」會在新分頁顯示，"
+        "於該分頁按 Ctrl+P 即可列印；亦可直接下載 HTML 檔。"
+    )
+
+    from datetime import datetime
+    from data_processor import report_builder as rb
+    from data_processor.monthly_pl import list_available_months as cf_months
+    from data_processor.monthly_profit_loss import (
+        list_available_months as pl_months,
+    )
+
+    sb = get_authed_client()
+
+    REPORTS = {
+        "A 月度實帳金流分析": ("cashflow", "month"),
+        "B 季度實帳金流分析": ("cashflow", "quarter"),
+        "C 年度實帳金流分析": ("cashflow", "year"),
+        "D 月度損益分析": ("pl", "month"),
+        "E 年度損益分析": ("pl", "year"),
+    }
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        report_name = st.selectbox("報表種類", list(REPORTS.keys()),
+                                   key="rpt_type")
+    with c2:
+        clinic = st.radio("診所", ["澤豐", "澤沛"], horizontal=True,
+                          key="rpt_clinic")
+
+    kind, gran = REPORTS[report_name]
+    months = _filter_min_month(cf_months(sb) if kind == "cashflow"
+                               else pl_months(sb))
+    months = sorted(set(months), reverse=True)
+    if not months:
+        st.warning("⚠️ 尚無可用月份資料。")
+        return
+
+    # 期間選擇
+    sel_month = sel_year = sel_q = None
+    if gran == "month":
+        sel_month = st.selectbox("月份", months,
+                                 format_func=rb.roc_label, key="rpt_month")
+    elif gran == "quarter":
+        quarters = sorted(
+            {rb.quarter_of(m) for m in months}, reverse=True)
+        sel = st.selectbox(
+            "季度", quarters,
+            format_func=lambda yq: f"{yq[0]} 第 {yq[1]} 季", key="rpt_q")
+        sel_year, sel_q = sel
+    else:  # year
+        years = sorted({int(m[:4]) for m in months}, reverse=True)
+        sel_year = st.selectbox("年度", years,
+                                format_func=lambda y: f"{y} 年", key="rpt_year")
+
+    if not st.button("📄 產生報表", type="primary", key="rpt_gen"):
+        return
+
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with st.spinner("產生報表中..."):
+        try:
+            if kind == "cashflow" and gran == "month":
+                html_str, err = rb.build_cashflow_monthly(
+                    sb, clinic, sel_month, months, generated)
+            elif kind == "cashflow" and gran == "quarter":
+                html_str, err = rb.build_cashflow_quarterly(
+                    sb, clinic, sel_year, sel_q, months, generated)
+            elif kind == "cashflow" and gran == "year":
+                html_str, err = rb.build_cashflow_yearly(
+                    sb, clinic, sel_year, months, generated)
+            elif kind == "pl" and gran == "month":
+                html_str, err = rb.build_pl_monthly(
+                    sb, clinic, sel_month, months, generated)
+            else:  # pl year
+                html_str, err = rb.build_pl_yearly(
+                    sb, clinic, sel_year, months, generated)
+        except Exception as e:
+            st.error(f"產生報表失敗：{e}")
+            return
+
+    if err:
+        st.warning(err, icon="⚠️")
+        return
+
+    st.success("✅ 報表已產生")
+    fname = f"{clinic}_{report_name.split()[0]}_{report_name[2:]}.html"
+    _open_in_new_tab_widget(html_str, key="rpt")
+    st.download_button(
+        "⬇️ 下載 HTML（備援）", data=html_str.encode("utf-8"),
+        file_name=fname, mime="text/html", key="rpt_dl",
+    )
+    with st.expander("👁️ 內嵌預覽（外觀可能與列印略有差異）"):
+        import streamlit.components.v1 as components
+        components.html(html_str, height=700, scrolling=True)
 
 
 # ============================================================
