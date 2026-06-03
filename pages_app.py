@@ -3094,17 +3094,36 @@ def _section_inventory_transfer():
         type="primary", key="transfer_save",
     ):
         try:
-            payload = [
-                {k: v for k, v in r.items() if k != "方向"}
-                for r in records
-            ]
+            # 同一批內依 UNIQUE 鍵 (transfer_month, from_clinic_id,
+            # to_clinic_id, item) 去重：同月+同方向+同品項出現多筆時
+            # 把 qty 加總（同一鍵在一個 upsert command 內只能有一列，
+            # 否則 Postgres 會丟 21000「cannot affect row a second time」）。
+            merged: dict[tuple, dict] = {}
+            for r in records:
+                key = (
+                    r["transfer_month"], r["from_clinic_id"],
+                    r["to_clinic_id"], r["item"],
+                )
+                if key in merged:
+                    merged[key]["qty"] = round(
+                        merged[key]["qty"] + r["qty"], 2
+                    )
+                else:
+                    merged[key] = {
+                        k: v for k, v in r.items() if k != "方向"
+                    }
+            payload = list(merged.values())
             # UNIQUE (transfer_month, from_clinic_id, to_clinic_id, item)
             # 重複上傳會覆蓋同組鍵的 qty / unit_price / amount
             sb.table("inventory_transfer").upsert(
                 payload,
                 on_conflict="transfer_month,from_clinic_id,to_clinic_id,item",
             ).execute()
-            st.success(f"✅ 寫入 {len(payload)} 筆（同月+同方向+同品項會覆蓋舊值）")
+            dup = len(records) - len(payload)
+            msg = f"✅ 寫入 {len(payload)} 筆（同月+同方向+同品項會覆蓋舊值）"
+            if dup:
+                msg += f"；已合併 {dup} 筆同鍵重複（qty 加總）"
+            st.success(msg)
             st.balloons()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
