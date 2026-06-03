@@ -25,6 +25,76 @@ def _norm_vendor(s) -> str:
     return unicodedata.normalize("NFKC", str(s or "")).strip()
 
 
+def compute_pl_health(sb, service_month: str) -> dict:
+    """
+    月度損益(會計精神)的資料完整度。
+    因損益需大量「下個月(N+1)」銀行明細回推，故完整門檻為：
+      - N+1 月 玉山健保戶 CSV 已上傳（該診所）
+      - N+1 月 中信進出戶 CSV 已上傳（該診所）
+      - N 月 健保給付(nhi_payment_notices)至少 1 筆（健保第一筆給付，該診所）
+    任一缺 → 該診所該月視為不完整。
+
+    Returns dict: issues_fz / issues_fp / complete_fz / complete_fp /
+                  rows(list[dict] 診斷表)
+    """
+    next_m = _next_month(service_month)
+    nn_m = _next_month(next_m)
+    sm_label = service_month[:7]
+    nx_label = next_m[:7]
+
+    clinics = sb.table("clinics").select("id, short_name").execute().data
+    fz_id = next((c["id"] for c in clinics if c["short_name"] == "澤豐"), None)
+    fp_id = next((c["id"] for c in clinics if c["short_name"] == "澤沛"), None)
+    accounts = (
+        sb.table("bank_accounts")
+        .select("id, clinic_id, account_type").execute().data
+    )
+
+    def _acc(clinic_id, atype):
+        return next((a["id"] for a in accounts
+                     if a["clinic_id"] == clinic_id
+                     and a["account_type"] == atype), None)
+
+    def _bank_n(acc_id, m0, m1) -> int:
+        if not acc_id:
+            return 0
+        return (sb.table("bank_transactions").select("id", count="exact")
+                .eq("account_id", acc_id)
+                .gte("transaction_date", m0).lt("transaction_date", m1)
+                .execute().count or 0)
+
+    def _nhi_n(clinic_id) -> int:
+        return (sb.table("nhi_payment_notices").select("id", count="exact")
+                .eq("clinic_id", clinic_id).eq("service_month", service_month)
+                .execute().count or 0)
+
+    def _clinic_issues(clinic_id, short) -> list[str]:
+        out = []
+        if _bank_n(_acc(clinic_id, "健保戶"), next_m, nn_m) == 0:
+            out.append(f"{short} 玉山健保戶 {nx_label} CSV 未上傳（損益回推需要）")
+        if _bank_n(_acc(clinic_id, "進出戶"), next_m, nn_m) == 0:
+            out.append(f"{short} 中信進出戶 {nx_label} CSV 未上傳（損益回推需要）")
+        if _nhi_n(clinic_id) == 0:
+            out.append(f"{short} 健保給付 {sm_label} 尚無第一筆給付資料")
+        return out
+
+    issues_fz = _clinic_issues(fz_id, "澤豐") if fz_id else ["找不到澤豐"]
+    issues_fp = _clinic_issues(fp_id, "澤沛") if fp_id else ["找不到澤沛"]
+
+    rows = [{
+        "月份": sm_label,
+        "澤豐": "✅ 完整" if not issues_fz else f"⚠️ 缺 {len(issues_fz)} 項",
+        "澤沛": "✅ 完整" if not issues_fp else f"⚠️ 缺 {len(issues_fp)} 項",
+    }]
+    return {
+        "issues_fz": issues_fz,
+        "issues_fp": issues_fp,
+        "complete_fz": not issues_fz,
+        "complete_fp": not issues_fp,
+        "rows": rows,
+    }
+
+
 def compute_cashflow_health(sb, service_month: str) -> dict:
     """
     回傳該月實帳金流的資料完整度。

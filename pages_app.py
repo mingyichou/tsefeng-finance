@@ -17,6 +17,47 @@ def _filter_min_month(months):
     return [m for m in months if m and m >= MIN_SERVICE_MONTH]
 
 
+# ─── 計算結果快取（提速；資料指紋變動時自動失效）──────────────
+def _data_version(sb) -> tuple:
+    """各上游表筆數組成的輕量指紋；任一表新增/刪除即改變 → 快取自動失效。
+    不快取本函式（須反映當下狀態）；count 查詢便宜。"""
+    def c(t):
+        try:
+            return (sb.table(t).select("id", count="exact")
+                    .limit(1).execute().count or 0)
+        except Exception:
+            return 0
+    return tuple(c(t) for t in (
+        "bank_transactions", "nhi_payment_notices", "manual_annotation",
+        "manual_entry", "doctor_salary_monthly", "staff_salary_summary",
+        "contract_expense", "cash_expense", "check_expense",
+    ))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_both_pl(_sb, service_month: str, version: tuple):
+    from data_processor.monthly_profit_loss import calculate_both_pl
+    return calculate_both_pl(_sb, service_month)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_pl_health(_sb, service_month: str, version: tuple):
+    from data_processor.data_health import compute_pl_health
+    return compute_pl_health(_sb, service_month)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_both_clinics(_sb, service_month: str, version: tuple):
+    from data_processor.monthly_pl import calculate_both_clinics
+    return calculate_both_clinics(_sb, service_month)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_check_month(_sb, service_month: str, version: tuple):
+    from data_processor.monthly_pl import calculate_check_expense_month
+    return calculate_check_expense_month(_sb, service_month)
+
+
 # ============================================================
 # 1. 業績儀表板（Phase 3）
 # ============================================================
@@ -871,9 +912,10 @@ def page_overview():
             "月份", months, format_func=lambda d: d[:7], key="pl_month",
         )
 
+    version = _data_version(sb)
     with st.spinner("計算中..."):
-        pl_fz, pl_fp = calculate_both_clinics(sb, service_month)
-        check = calculate_check_expense_month(sb, service_month)
+        pl_fz, pl_fp = _cached_both_clinics(sb, service_month, version)
+        check = _cached_check_month(sb, service_month, version)
 
     # ════════════════════════════════════════════════════════
     # 0. 資料完整度診斷（讓院長一眼看到該月缺什麼）
@@ -1082,8 +1124,8 @@ def page_overview():
     chk_data = []
     for m in sorted(months)[-12:]:
         try:
-            tfz, tfp = calculate_both_clinics(sb, m)
-            tchk = calculate_check_expense_month(sb, m)
+            tfz, tfp = _cached_both_clinics(sb, m, version)
+            tchk = _cached_check_month(sb, m, version)
             trend_data.append({
                 "月份": m[:7],
                 "澤豐淨利": tfz.net,
@@ -1152,14 +1194,17 @@ def page_overview():
 def page_monthly_pl():
     st.title("📈 月度損益分析")
 
-    from data_processor.monthly_profit_loss import (
-        calculate_both_pl, list_available_months,
-    )
+    from data_processor.monthly_profit_loss import list_available_months
 
     st.caption(
         "🧾 **會計精神**：N 月「歸屬」的款項記在 N 月（與「月度實帳金流分析」不同）。"
         "支付通常延後（4 月轉出歸 3 月），健保給付以備註月份為準，"
         "整復推拿用『只記帳』條目獨立統計。"
+    )
+
+    st.caption(
+        "ℹ️ 損益需用「下個月」銀行明細回推，故只顯示**資料完整**的月份"
+        "（下月玉山+中信 CSV 已上傳、本月健保第一筆給付已入帳）。"
     )
 
     sb = get_authed_client()
@@ -1168,37 +1213,83 @@ def page_monthly_pl():
         st.warning("⚠️ 尚無可分析的月份資料")
         return
 
-    default_n = min(6, len(months))
+    version = _data_version(sb)
+    # 完整度只檢查近 15 個月（cheap count；快取）
+    candidates = months[:15]
+    health = {m: _cached_pl_health(sb, m, version) for m in candidates}
+    complete_fz = [m for m in candidates if health[m]["complete_fz"]]
+    complete_fp = [m for m in candidates if health[m]["complete_fp"]]
+
+    # ── 資料完整度診斷 ──
+    with st.expander(
+        "🩺 月度損益 資料完整度診斷（近 6 個月）", expanded=False,
+    ):
+        diag_rows = []
+        issue_lines: list[str] = []
+        for m in candidates[:6]:
+            h = health[m]
+            diag_rows.append({
+                "月份": m[:7],
+                "澤豐": "✅ 完整" if h["complete_fz"] else f"⚠️ 缺 {len(h['issues_fz'])} 項",
+                "澤沛": "✅ 完整" if h["complete_fp"] else f"⚠️ 缺 {len(h['issues_fp'])} 項",
+            })
+            for i in h["issues_fz"] + h["issues_fp"]:
+                issue_lines.append(f"{m[:7]}：{i}")
+        st.dataframe(pd.DataFrame(diag_rows), use_container_width=True,
+                     hide_index=True)
+        if issue_lines:
+            st.markdown("**⚠️ 待補資料：**")
+            for ln in issue_lines:
+                st.markdown(f"- {ln}")
+        st.caption("資料不完整的月份不會出現在下方分析與「財報列印」。")
+
+    if not complete_fz and not complete_fp:
+        st.warning(
+            "⚠️ 目前沒有資料完整的月份可分析。"
+            "請先上傳「下個月」的玉山+中信 CSV 與本月健保給付資料。"
+        )
+        return
+
+    max_n = min(12, max(len(complete_fz), len(complete_fp), 1))
     col1, col2 = st.columns([3, 1])
     with col1:
-        chosen_n = st.slider(
-            "顯示最近幾個月", min_value=1, max_value=min(12, len(months)),
-            value=default_n,
-        )
+        if max_n > 1:
+            chosen_n = st.slider(
+                "顯示最近幾個完整月份", min_value=1, max_value=max_n,
+                value=min(3, max_n),
+            )
+        else:
+            chosen_n = 1
+            st.caption("目前僅 1 個完整月份")
     with col2:
-        st.metric("資料月份數", len(months))
+        st.metric("完整月份數", f"{max(len(complete_fz), len(complete_fp))}")
 
-    sel_months = months[:chosen_n]  # 表格用：最新在前
-    chart_months = months[:min(12, len(months))]  # 圖表用：固定取近 12 月
-    compute_months = sorted(set(sel_months) | set(chart_months), reverse=True)
+    fz_tbl, fz_chart = complete_fz[:chosen_n], complete_fz[:6]
+    fp_tbl, fp_chart = complete_fp[:chosen_n], complete_fp[:6]
+    need = sorted(set(fz_tbl) | set(fz_chart) | set(fp_tbl) | set(fp_chart),
+                  reverse=True)
 
-    # 計算
     by_clinic_month: dict[tuple[str, str], any] = {}
-    with st.spinner(f"計算 {len(compute_months)} 個月 × 2 診所..."):
-        for sm in compute_months:
+    with st.spinner(f"計算 {len(need)} 個月 × 2 診所..."):
+        for sm in need:
             try:
-                pl_fz, pl_fp = calculate_both_pl(sb, sm)
+                pl_fz, pl_fp = _cached_both_pl(sb, sm, version)
                 by_clinic_month[("澤豐", sm)] = pl_fz
                 by_clinic_month[("澤沛", sm)] = pl_fp
             except Exception as e:
                 st.error(f"{sm} 計算失敗：{e}")
 
-    # 每家診所一張表 + 比較柱狀圖
-    for clinic_short in ("澤豐", "澤沛"):
+    # 每家診所一張表 + 比較柱狀圖（各自只顯示該診所完整月份）
+    for clinic_short, tbl_months, chart_m in (
+        ("澤豐", fz_tbl, fz_chart), ("澤沛", fp_tbl, fp_chart),
+    ):
         st.subheader(f"🏥 {clinic_short} 月度損益")
-        _render_pl_table(by_clinic_month, clinic_short, sel_months)
-        _render_pl_charts(by_clinic_month, clinic_short, chart_months)
-        _render_pl_breakdown(by_clinic_month, clinic_short, sel_months)
+        if not tbl_months:
+            st.info(f"{clinic_short}：目前無資料完整的月份")
+            continue
+        _render_pl_table(by_clinic_month, clinic_short, tbl_months)
+        _render_pl_charts(by_clinic_month, clinic_short, chart_m)
+        _render_pl_breakdown(by_clinic_month, clinic_short, tbl_months)
 
 
 def _fmt_amt(v) -> str:

@@ -123,6 +123,7 @@ class PLData:
     def __init__(self, sb):
         self.sb = sb
         self._pl: dict = {}
+        self._health: dict = {}
 
     def _ensure(self, month: str):
         if month not in self._pl:
@@ -135,8 +136,13 @@ class PLData:
         return fz if clinic == "澤豐" else fp
 
     def complete(self, month: str, clinic: str) -> bool:
-        pl = self.clinic_pl(month, clinic)
-        return pl.g_total_income > 0 and pl.h_salary_total > 0
+        # 完整度依「下個月銀行 CSV + 本月健保第一筆給付」上游資料判定
+        # （比跑完整 calculate_both_pl 便宜，趨勢掃描更快）。
+        if month not in self._health:
+            from data_processor.data_health import compute_pl_health
+            self._health[month] = compute_pl_health(self.sb, month)
+        h = self._health[month]
+        return h["complete_fz"] if clinic == "澤豐" else h["complete_fp"]
 
 
 # ════════════════════════════════════════════════════════════
