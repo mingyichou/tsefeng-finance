@@ -439,9 +439,9 @@ def _productivity_breakdown(
     return {
         "診察費": consult_nhi,
         "內科費(藥費)": drug_nhi,
-        "處(內+xx)" if clinic_short == "澤豐" else "處置費":
-            combo if clinic_short == "澤豐" else treatment_single,
-        "純xx": pure,  # 澤沛恆 0
+        "處(內+xx)": combo,        # 澤豐有值，澤沛恆 0
+        "純xx": pure,              # 澤豐有值，澤沛恆 0
+        "處置費": treatment_single, # 澤沛有值，澤豐恆 0
         "調劑費": dispense_nhi,
         "健保小計": int(round(nhi_pre)),
         "健保*0.9": int(round(nhi_part)),
