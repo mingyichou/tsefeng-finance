@@ -5203,6 +5203,7 @@ def page_alliance_settlement():
                     "比例": it.ratio,
                     "金額": it.amount,
                     "來源": it.source,
+                    "備註": it.note or "",
                 }
                 for it in priced_items if it.direction == "沛PAY豐"
             ]
@@ -5223,6 +5224,7 @@ def page_alliance_settlement():
                     "比例": it.ratio,
                     "金額": it.amount,
                     "來源": it.source,
+                    "備註": it.note or "",
                 }
                 for it in priced_items if it.direction == "豐PAY沛"
             ]
@@ -5238,7 +5240,9 @@ def page_alliance_settlement():
                 f"⚠️ 未匹配品項（{len(unmatched)} 筆，未計入金額）"
             ):
                 st.caption(
-                    "原因：該品項在「自費商品成本&售價」或「科中進貨價目表」中找不到對應。"
+                    "原因：該品項在「自費商品成本&售價」或「科中進貨價目表」中找不到對應"
+                    "（已含別名與前 3/5 字模糊比對；模糊比對有 2 個以上候選時"
+                    "不自動帶入，候選列於「原因」欄供人工確認）。"
                     "請至「本月資料匯入區 → 自費商品/科中進貨價目」上傳最新表，或"
                     "確認品項命名一致。"
                 )

@@ -13,7 +13,10 @@
        ratio = 0.65 (天一/港香蘭) 或 0.70 (莊松榮/科達/順天堂/仙豐)
   2. 不含廠商 keyword
      → 走 product_pricing.cost_price (vendor 寬鬆比對)：amount = qty × cost_price
-  3. 兩處都查不到
+  3. 精確比對（含別名）失敗
+     → 前綴模糊比對（前 5 字 → 前 3 字）；唯一候選才帶入，
+       2 個以上候選維持未匹配並在 note 列出候選
+  4. 兩處都查不到
      → 標記 unmatched，amount=None
 
 只返回試算結果；UI 自行決定如何呈現。
@@ -55,6 +58,8 @@ ALIAS_GROUPS: list[list[str]] = [
     ["製附子", "附子"],
     # 中藥複方（湯/散互通 + 藥丸系列括號 vs dash）
     ["辛夷清肺湯", "辛夷清肺散"],
+    ["梔子豉湯", "梔子鼓湯"],   # 調貨「鼓」↔ 價目表「豉」
+    ["聖癒湯", "聖愈湯"],       # 調貨「愈」↔ 價目表「癒」
     ["六味地黃丸(藥丸)", "六味地黃丸-藥丸"],
     ["杞菊地黃丸(藥丸)", "杞菊地黃丸-藥丸"],
     ["天王補心丹(藥丸)", "天王補心丹-藥丸"],
@@ -118,7 +123,10 @@ ALIAS_GROUPS: list[list[str]] = [
     # 外用藥/凝膠
     ["金絲膏", "金絲膏水布", "金絲膏-水布", "金絲膏(水布)"],
     ["全方位", "全方位舒緩凝膠", "全方位舒緩凝膠(30ml)"],
-    ["舒敏", "舒敏保濕乳霜", "舒敏保濕乳霜(150ml)", "舒敏舒緩乳霜(150ml)"],
+    [
+        "舒敏", "舒敏乳霜", "舒敏保濕乳霜",
+        "舒敏保濕乳霜(150ml)", "舒敏舒緩乳霜(150ml)",
+    ],
     ["銀膚調理霜", "銀膚特潤調理霜", "銀膚特潤調理霜(100ml)"],
     ["頭皮乳", "頭皮淨化清爽調理乳", "頭皮淨化清爽調理乳(100ml)"],
     ["皮脂平衡潔髮乳", "皮脂平衡潔髮乳(400ml)"],
@@ -183,6 +191,43 @@ def _equivalents_of(name: str) -> list[str]:
             return [name] + eq
         return eq
     return [name]
+
+
+# ─── 前綴模糊比對（院長 2026-07-04）──────────────────────
+# 精確比對（含別名）失敗後，改抓「前 5 字相同」→ 再退「前 3 字相同」的候選：
+#   恰好 1 個候選 → 直接帶入其價格（如 佳衛暢 → 佳衛暢益生菌）
+#   2 個以上候選 → 維持未匹配，note 列出候選供人工確認
+# 品名 normalize 後未滿 3 字不做模糊比對（太短易誤配）。
+_FUZZY_MIN_CHARS = 3
+
+
+def _fuzzy_prefix_match(
+    query: str, keys,
+) -> tuple[str | None, int | None, list[str]]:
+    """
+    回傳 (唯一命中的 key, 命中前綴長度 5|3, 候選 keys)。
+    無命中且無候選時回傳 (None, None, [])。
+    """
+    q = _norm(query)
+    if len(q) < _FUZZY_MIN_CHARS:
+        return None, None, []
+    for n in (5, 3):
+        if len(q) < n:
+            continue
+        prefix = q[:n]
+        cands = [k for k in keys if len(k) >= n and k.startswith(prefix)]
+        if len(cands) == 1:
+            return cands[0], n, cands
+        if len(cands) >= 2:
+            return None, n, cands
+    return None, None, []
+
+
+def _fmt_candidates(cands: list[str], limit: int = 5) -> str:
+    shown = "、".join(cands[:limit])
+    if len(cands) > limit:
+        shown += f"…等 {len(cands)} 項"
+    return shown
 
 
 @dataclass
@@ -291,6 +336,11 @@ def compute_inventory_amounts(
     pp_idx = _build_pricing_index(product_pricing_rows)
     water_idx = _build_water_index(product_pricing_rows)
 
+    # 模糊比對用：各廠商的科中品名清單（normalized）
+    tcm_names_by_vendor: dict[str, list[str]] = {}
+    for (v_key, n_key) in tcm_idx:
+        tcm_names_by_vendor.setdefault(v_key, []).append(n_key)
+
     out: list[PricedItem] = []
     for row in inventory_rows:
         item = row["item"]
@@ -329,8 +379,23 @@ def compute_inventory_amounts(
                 source = "自費(水藥包)"
                 note = f"水藥包：{clean}"
             else:
-                source = "未匹配"
-                note = f"水藥包表查無 {clean}"
+                # 模糊比對：前 5 字 → 前 3 字，唯一命中才帶入
+                hit, lv, cands = _fuzzy_prefix_match(clean, water_idx.keys())
+                if hit:
+                    pp = water_idx[hit]
+                    unit_price = float(pp["cost_price"])
+                    amount = round(qty * unit_price, 2)
+                    source = "自費(水藥包)"
+                    note = f"模糊命中(前{lv}字)：{clean} → {pp['product_name']}"
+                elif cands:
+                    source = "未匹配"
+                    note = (
+                        f"水藥包表前{lv}字有 {len(cands)} 個候選："
+                        f"{_fmt_candidates(cands)}｜請人工確認品名"
+                    )
+                else:
+                    source = "未匹配"
+                    note = f"水藥包表查無 {clean}"
         elif vendor:
             # 走科中：嘗試 clean 名 + 所有等價別名
             v_key = _norm(vendor)
@@ -350,8 +415,26 @@ def compute_inventory_amounts(
                 if tried_alias:
                     note = f"別名命中：{clean} → {tried_alias}"
             else:
-                source = "未匹配"
-                note = f"科中表查無 {vendor} × {clean}（含別名）"
+                # 模糊比對：只在同廠商的品名內找，前 5 字 → 前 3 字
+                hit, lv, cands = _fuzzy_prefix_match(
+                    clean, tcm_names_by_vendor.get(v_key, [])
+                )
+                if hit:
+                    tcm = tcm_idx[(v_key, hit)]
+                    unit_price = float(tcm["price"])
+                    ratio = BRAND_RATIO[vendor]
+                    amount = round(qty * unit_price * ratio, 2)
+                    source = f"科中{tcm['category']}"
+                    note = f"模糊命中(前{lv}字)：{clean} → {tcm['product_name']}"
+                elif cands:
+                    source = "未匹配"
+                    note = (
+                        f"科中表({vendor})前{lv}字有 {len(cands)} 個候選："
+                        f"{_fmt_candidates(cands)}｜請人工確認品名"
+                    )
+                else:
+                    source = "未匹配"
+                    note = f"科中表查無 {vendor} × {clean}（含別名/模糊）"
         else:
             # 走自費商品（不分廠商，僅靠 product_name）
             # 嘗試順序：item 原名 + clean 名 + item 等價 + clean 等價
@@ -381,8 +464,27 @@ def compute_inventory_amounts(
                     msg += f"｜別名命中：→ {tried_alias}"
                 note = msg
             else:
-                source = "未匹配"
-                note = "自費商品表查無（含別名）"
+                # 模糊比對：前 5 字 → 前 3 字，唯一命中才帶入
+                # （如 佳衛暢 → 佳衛暢益生菌、攝護通膠囊 → 攝護通）
+                hit, lv, cands = _fuzzy_prefix_match(clean, pp_idx.keys())
+                if hit:
+                    pp = pp_idx[hit]
+                    unit_price = float(pp["cost_price"])
+                    amount = round(qty * unit_price, 2)
+                    source = "自費"
+                    note = (
+                        f"自費商品({pp.get('vendor')})｜"
+                        f"模糊命中(前{lv}字)：{clean} → {pp['product_name']}"
+                    )
+                elif cands:
+                    source = "未匹配"
+                    note = (
+                        f"自費商品表前{lv}字有 {len(cands)} 個候選："
+                        f"{_fmt_candidates(cands)}｜請人工確認品名"
+                    )
+                else:
+                    source = "未匹配"
+                    note = "自費商品表查無（含別名/模糊）"
 
         out.append(PricedItem(
             transfer_month=row["transfer_month"],
