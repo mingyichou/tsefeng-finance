@@ -715,3 +715,303 @@ def _incomplete_note(periods: list[str], issues: list[str]) -> str:
         f"⚠️ {plist} 資料未完全，無法形成報表。"
         + (f"<ul>{detail}</ul>" if detail else "")
     )
+
+
+# ════════════════════════════════════════════════════════════
+# 澤沛合夥人月度財務報表（給胡舒婷醫師）
+#   內容同「月度實帳金流分析」澤沛區塊：收入/支出細項 + 逐筆明細
+#   + 月度淨利趨勢；不含支票支出（獨立項目本就不屬澤沛實帳）。
+#   視覺獨立美化（卡片式、漸層抬頭），與 A~E 報表分開的 CSS。
+# ════════════════════════════════════════════════════════════
+
+_PARTNER_SETTLE_LABEL = {
+    "x5_cash": "現金結算（→周院長）",
+    "x6_fengpei": "豐沛金流（→澤豐）",
+    "x7_contract": "合約結算（→周院長）",
+}
+
+_PARTNER_CSS = """
+* { box-sizing:border-box; margin:0; padding:0; }
+@page { size:A4 portrait; margin:10mm; }
+body { font-family:"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif;
+  background:#f4f4f9; color:#2b2b3a; font-size:13px; padding:24px 12px; }
+.sheet { max-width:820px; margin:0 auto; background:#fff; border-radius:18px;
+  box-shadow:0 6px 28px rgba(80,70,160,.12); overflow:hidden; }
+.hero { background:linear-gradient(120deg,#6A5ACD 0%,#8E7CE8 55%,#FFA07A 130%);
+  color:#fff; padding:26px 32px 22px; }
+.hero h1 { font-size:23px; letter-spacing:1px; font-weight:800; }
+.hero .sub { margin-top:6px; font-size:13px; opacity:.92; }
+.hero .tag { display:inline-block; margin-top:10px; background:rgba(255,255,255,.18);
+  border:1px solid rgba(255,255,255,.45); border-radius:99px; padding:3px 14px;
+  font-size:11.5px; letter-spacing:2px; }
+.wrap { padding:22px 32px 26px; }
+.kpis { display:flex; gap:14px; margin-bottom:20px; }
+.kpi { flex:1; border-radius:14px; padding:14px 16px; }
+.kpi .label { font-size:11.5px; letter-spacing:1px; opacity:.75; }
+.kpi .value { font-size:21px; font-weight:800; margin-top:4px;
+  font-variant-numeric:tabular-nums; }
+.kpi.inc { background:#eef4ff; color:#1d4ed8; }
+.kpi.exp { background:#fff1ec; color:#c2410c; }
+.kpi.net-pos { background:#ecfdf3; color:#15803d; }
+.kpi.net-neg { background:#fef2f2; color:#b91c1c; }
+h2 { font-size:15.5px; color:#4c3fb0; margin:22px 0 10px; display:flex;
+  align-items:center; gap:8px; }
+h2::before { content:""; width:5px; height:18px; border-radius:3px;
+  background:linear-gradient(#6A5ACD,#FFA07A); }
+h3 { font-size:12.5px; color:#7a76a8; margin:14px 0 6px; font-weight:600; }
+table { width:100%; border-collapse:collapse; font-size:12.3px; }
+th { text-align:left; color:#6b6790; font-weight:600; font-size:11.5px;
+  letter-spacing:.5px; padding:7px 10px; border-bottom:2px solid #e8e6f7; }
+td { padding:6px 10px; border-bottom:1px solid #f0eff8; }
+tbody tr:nth-child(even) td { background:#fbfaff; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+tr.total td { font-weight:800; background:#f3f1fb !important; color:#4c3fb0;
+  border-top:2px solid #d9d4f2; border-bottom:none; }
+tr.sub td { color:#948fbd; font-size:11.3px; }
+tr.sub td:first-child { padding-left:26px; }
+.hintline { color:#a5a1c4; font-size:10.6px; margin:4px 0 2px; }
+.subnote { color:#a5a1c4; font-size:10.6px; margin:4px 0 8px; }
+.trend-card { background:#fbfaff; border:1px solid #eceafb; border-radius:14px;
+  padding:14px 14px 6px; margin-top:6px; }
+.trend-svg { width:100%; height:auto; }
+.svg-title { font-size:13px; font-weight:700; fill:#4c3fb0; }
+.axis { font-size:10px; fill:#999; } .pt { font-size:9.5px; fill:#555; }
+.legend { font-size:10px; fill:#666; }
+.grid { stroke:#eee; stroke-width:1; } .zero { stroke:#ccc; stroke-width:1.2; }
+.chart-empty { color:#999; font-size:12px; padding:18px; text-align:center; }
+.note { background:#fff9ec; border:1px solid #ffe3a3; border-radius:10px;
+  padding:10px 14px; color:#8a5a00; font-size:12px; margin:10px 0; }
+.foot { margin-top:22px; padding-top:10px; border-top:1px dashed #e3e0f3;
+  color:#a5a1c4; font-size:10.5px; display:flex; justify-content:space-between; }
+@media print {
+  body { background:#fff; padding:0; }
+  .sheet { box-shadow:none; border-radius:0; max-width:none; }
+}
+"""
+
+
+def _partner_tx_table(rows: list[dict], *, date_key: str,
+                      desc_keys: list[str], show_settle: bool = False) -> str:
+    """逐筆明細表：日期 / 項目說明(摘要+備註) / (分類) / 金額。"""
+    if not rows:
+        return "<div class='hintline'>（本月無資料）</div>"
+    cells = []
+    for r in rows:
+        desc = "　".join(
+            str(r.get(k) or "").strip() for k in desc_keys
+            if str(r.get(k) or "").strip()
+        ) or "—"
+        settle_td = ""
+        if show_settle:
+            lab = _PARTNER_SETTLE_LABEL.get(r.get("settle_kind") or "", "")
+            settle_td = f"<td>{_html.escape(lab)}</td>"
+        cells.append(
+            f"<tr><td>{_html.escape(str(r.get(date_key) or ''))}</td>"
+            f"<td>{_html.escape(desc)}</td>{settle_td}"
+            f"<td class='num'>{_fmt(r.get('amount'))}</td></tr>"
+        )
+    total = sum(int(r.get("amount") or 0) for r in rows)
+    span = 3 if show_settle else 2
+    head = ("<tr><th style='width:92px'>日期</th><th>項目說明</th>"
+            + ("<th style='width:150px'>分類</th>" if show_settle else "")
+            + "<th class='num' style='width:110px'>金額 (NT$)</th></tr>")
+    return (
+        f"<table><thead>{head}</thead><tbody>{''.join(cells)}"
+        f"<tr class='total'><td colspan='{span}'>小計（{len(rows)} 筆）</td>"
+        f"<td class='num'>{_fmt(total)}</td></tr></tbody></table>"
+    )
+
+
+def _partner_doc(title: str, subtitle: str, body: str, generated: str) -> str:
+    """合夥人報表共用 HTML 骨架（漸層 hero + 卡片）。"""
+    return (
+        "<!DOCTYPE html><html lang='zh-Hant'><head><meta charset='utf-8'>"
+        f"<title>{_html.escape(title)}</title>"
+        f"<style>{_PARTNER_CSS}</style></head><body><div class='sheet'>"
+        f"<div class='hero'><h1>{_html.escape(title)}</h1>"
+        f"<div class='sub'>{_html.escape(subtitle)}</div>"
+        "<div class='tag'>合 夥 人 報 表</div></div>"
+        f"<div class='wrap'>{body}"
+        "<div class='foot'><span>澤豐聯盟財務系統</span>"
+        f"<span>產生時間 {generated}　·　瀏覽器 Ctrl+P 可列印</span></div>"
+        "</div></div></body></html>"
+    )
+
+
+def _partner_kpis(items: list[tuple[str, int, bool]]) -> str:
+    """items: (label, value, is_profit)。is_profit → 正綠負紅。"""
+    cells = []
+    for label, value, is_profit in items:
+        if is_profit:
+            cls = "net-pos" if value >= 0 else "net-neg"
+        else:
+            cls = "inc" if "收入" in label else "exp"
+        cells.append(
+            f"<div class='kpi {cls}'><div class='label'>{_html.escape(label)}"
+            f"</div><div class='value'>NT$ {_fmt(value)}</div></div>"
+        )
+    return f"<div class='kpis'>{''.join(cells)}</div>"
+
+
+def build_zepei_partner_monthly(sb, month: str, all_months: list[str],
+                                generated: str):
+    """澤沛合夥人月度財務報表 → (html, err)。err 非 None 表示資料未完整。"""
+    clinic = "澤沛"
+    cf = CashflowData(sb)
+    issues = cf.issues(month, clinic)
+    if issues:
+        return None, _incomplete_note([roc_label(month)], issues)
+
+    pl = cf.clinic_pl(month, clinic)
+
+    kpis = _partner_kpis([
+        ("總收入", pl.total_income, False),
+        ("總支出", pl.total_expense, False),
+        ("本月淨利", pl.net, True),
+    ])
+
+    # 收入 / 支出分類小計（同月度實帳金流分析）
+    inc_rows = cashflow_income_rows(clinic, pl)
+    exp_rows = cashflow_expense_rows(clinic, pl)
+    body = kpis
+    body += "<h2>收入細項</h2>"
+    body += _cat_table("收入項目", inc_rows, "總收入", pl.total_income)
+    body += "<h3>玉山健保戶入帳明細</h3>"
+    body += _partner_tx_table(pl.esun_inflow_items, date_key="transaction_date",
+                              desc_keys=["summary", "note"])
+    body += "<h3>中信進出戶入帳明細</h3>"
+    body += _partner_tx_table(pl.ctbc_inflow_items, date_key="transaction_date",
+                              desc_keys=["summary", "note"])
+    if pl.x10_income_items:
+        body += "<h3>其他收入（手動補登）</h3>"
+        body += _partner_tx_table(pl.x10_income_items, date_key="entry_date",
+                                  desc_keys=["description"])
+
+    body += "<h2>支出細項</h2>"
+    body += _cat_table("支出項目", exp_rows, "總支出", pl.total_expense)
+    body += "<h3>玉山健保戶出帳明細</h3>"
+    body += _partner_tx_table(pl.esun_outflow_items, date_key="transaction_date",
+                              desc_keys=["summary", "note"])
+    body += "<h3>中信進出戶出帳明細（含結算分類）</h3>"
+    body += _partner_tx_table(pl.ctbc_outflow_items, date_key="transaction_date",
+                              desc_keys=["summary", "note"], show_settle=True)
+    # 前月現金結算細項 — 合夥人重點對帳區，固定顯示
+    if pl.x5_detail_items or pl.cash_settle_outflow:
+        body += ("<h3>現金結算細項（前月現金支出逐筆；金額已含於中信"
+                 "「現金結算」、不重複加總）</h3>")
+        if pl.x5_detail_items:
+            body += _partner_tx_table(
+                pl.x5_detail_items, date_key="expense_date",
+                desc_keys=["description"],
+            )
+            if (pl.cash_settle_outflow
+                    and pl.x5_detail_total != pl.cash_settle_outflow):
+                body += (
+                    "<div class='note'>⚠️ 現金細項合計 "
+                    f"{_fmt(pl.x5_detail_total)} 與本月現金結算轉帳 "
+                    f"{_fmt(pl.cash_settle_outflow)} 不同"
+                    f"（差 {_fmt(pl.cash_settle_outflow - pl.x5_detail_total)}）"
+                    "。</div>"
+                )
+        else:
+            body += (
+                "<div class='note'>ℹ️ 本月現金結算 NT$ "
+                f"{_fmt(pl.cash_settle_outflow)} 的逐筆細項尚未上傳"
+                "（澤沛現金支出檔），僅顯示結算總額。</div>"
+            )
+    if pl.x10_expense_items:
+        body += "<h3>其他支出（手動補登）</h3>"
+        body += _partner_tx_table(pl.x10_expense_items, date_key="entry_date",
+                                  desc_keys=["description"])
+
+    # 月度淨利趨勢（近 12 個有效月，澤沛）
+    vms = _valid_months_desc(
+        all_months, lambda m: cf.complete(m, clinic), month)[:12]
+    vms = list(reversed(vms))
+    labels = [roc_label(m) for m in vms]
+    netvals = [cf.clinic_pl(m, clinic).net for m in vms]
+    body += "<h2>月度淨利趨勢</h2><div class='trend-card'>"
+    body += svg_line_chart(labels, [Series("澤沛淨利", netvals, BRAND)],
+                           width=740, height=260)
+    body += "</div>"
+
+    return _partner_doc(
+        "澤沛中醫診所 · 月度財務報表",
+        f"報表月份：{roc_label(month)}　·　"
+        "實帳模式（當月帳上實際發生的款項記在當月）",
+        body, generated,
+    ), None
+
+
+def build_zepei_partner_quarterly(sb, year: int, q: int,
+                                  all_months: list[str], generated: str):
+    """澤沛合夥人季度財務報表 → (html, err)。
+
+    內容：本季 3 個月收入/支出/淨利表格 + 近 12 個有效月淨利趨勢
+          + 近 6 個有效季淨利趨勢（皆澤沛）。
+    完整度：不完整月份跳過並註記；全季皆不完整 → err。
+    """
+    clinic = "澤沛"
+    cf = CashflowData(sb)
+    all_set = set(all_months)
+    period = [m for m in months_of_quarter(year, q) if m in all_set]
+    if not period:
+        return None, _incomplete_note(
+            [f"{year} Q{q}"], [f"{year} 第 {q} 季尚無任何月份資料"])
+    used = [m for m in period if cf.complete(m, clinic)]
+    skipped = [roc_label(m) for m in period if not cf.complete(m, clinic)]
+    if not used:
+        return None, _incomplete_note(
+            [f"{year} 第 {q} 季"],
+            [iss for m in period for iss in cf.issues(m, clinic)])
+
+    pls = [cf.clinic_pl(m, clinic) for m in used]
+    inc = [p.total_income for p in pls]
+    exp = [p.total_expense for p in pls]
+    net = [p.net for p in pls]
+
+    body = ""
+    if skipped:
+        body += ("<div class='note'>ℹ️ 已跳過資料未完整的月份（不納入本報表）："
+                 f"{'、'.join(skipped)}。</div>")
+    body += _partner_kpis([
+        ("季總收入", sum(inc), False),
+        ("季總支出", sum(exp), False),
+        ("季度淨利", sum(net), True),
+    ])
+    body += "<h2>本季各月收入／支出／淨利</h2>"
+    body += _month_breakdown_table([roc_label(m) for m in used], inc, exp, net)
+
+    # 月度淨利趨勢：近 12 個有效月（以本季最後一個有效月為終點）
+    vms = _valid_months_desc(
+        all_months, lambda m: cf.complete(m, clinic), used[-1])[:12]
+    vms = list(reversed(vms))
+    body += "<h2>月度淨利趨勢（近 12 個有效月）</h2><div class='trend-card'>"
+    body += svg_line_chart(
+        [roc_label(m) for m in vms],
+        [Series("澤沛月淨利", [cf.clinic_pl(m, clinic).net for m in vms],
+                BRAND)],
+        width=740, height=260,
+    )
+    body += "</div>"
+
+    # 季度淨利趨勢：近 6 個有效季（3 個月皆存在且完整）
+    vqs = _valid_quarters(all_set, lambda m: cf.complete(m, clinic),
+                          (year, q), 6)
+    body += "<h2>季度淨利趨勢（近 6 個有效季）</h2><div class='trend-card'>"
+    body += svg_line_chart(
+        [f"{yy}Q{qq}" for yy, qq in vqs],
+        [Series("澤沛季淨利",
+                [sum(cf.clinic_pl(m, clinic).net
+                     for m in months_of_quarter(yy, qq)) for yy, qq in vqs],
+                BRAND)],
+        width=740, height=260,
+    )
+    body += "</div>"
+
+    return _partner_doc(
+        "澤沛中醫診所 · 季度財務報表",
+        f"報表季度：{year} 第 {q} 季"
+        f"（涵蓋 {roc_label(used[0])} ~ {roc_label(used[-1])}）　·　實帳模式",
+        body, generated,
+    ), None

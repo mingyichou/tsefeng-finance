@@ -1016,7 +1016,10 @@ def page_overview():
         with st.expander(f"📑 玉山出帳明細（{len(pl_fz.esun_outflow_items)} 筆）"):
             _show_items(pl_fz.esun_outflow_items, _BANK_COLS)
     if pl_fz.x3_items:
-        with st.expander(f"📑 x3 澤豐現金支出明細（{len(pl_fz.x3_items)} 筆）"):
+        with st.expander(
+            f"📑 x3 澤豐現金支出明細（本月 {len(pl_fz.x3_items)} 筆，"
+            f"合計 NT$ {pl_fz.x3_zefeng_cash_expense:,}）"
+        ):
             _show_items(pl_fz.x3_items)
     if pl_fz.x9_items:
         with st.expander("📑 x9 謝松坊薪資明細（歸屬前月）"):
@@ -1093,9 +1096,117 @@ def page_overview():
                 pl_fp.ctbc_outflow_items,
                 ["transaction_date", "summary", "counterparty", "amount", "note", "settle_kind", "attribution_month"],
             )
+    # x5 現金結算的前月逐筆明細（cash_expense，由澤沛現金支出檔上傳）
+    if pl_fp.x5_detail_items:
+        with st.expander(
+            f"📑 x5 澤沛現金結算明細（前月現金支出 {len(pl_fp.x5_detail_items)} 筆，"
+            f"合計 NT$ {pl_fp.x5_detail_total:,}）"
+        ):
+            if (pl_fp.cash_settle_outflow
+                    and pl_fp.x5_detail_total != pl_fp.cash_settle_outflow):
+                st.caption(
+                    f"⚠️ 明細合計 {pl_fp.x5_detail_total:,} ≠ 本月 x5 結算轉帳 "
+                    f"{pl_fp.cash_settle_outflow:,}"
+                    f"（差 {pl_fp.cash_settle_outflow - pl_fp.x5_detail_total:+,}）"
+                    "— 結算可能含零頭調整或明細檔未更新。"
+                )
+            st.caption("ℹ️ 明細僅供對帳；金額已由中信 x5 結算交易入帳，不重複加總。")
+            _show_items(pl_fp.x5_detail_items)
+    elif pl_fp.cash_settle_outflow:
+        st.caption(
+            "ℹ️ x5 現金結算尚無前月逐筆明細 — 請至「📥 本月資料匯入 → "
+            "現金支出（含支票自動分流）」選「澤沛」上傳現金支出檔。"
+        )
     if pl_fp.x10_expense_items:
         with st.expander(f"📑 x10 手 KEY 支出明細（{len(pl_fp.x10_expense_items)} 筆）"):
             _show_items(pl_fp.x10_expense_items)
+
+    # ── 澤沛合夥人財務報表（給胡舒婷醫師，開新分頁）──
+    st.markdown("### 🤝 澤沛合夥人財務報表")
+    st.caption(
+        "美化版新分頁呈現，可直接列印或下載傳給胡醫師（不含支票獨立項目）。"
+        "**月度**：收入/支出細項 + 逐筆明細（含前月現金結算細項）+ 月度淨利趨勢。"
+        "**季度**：本季各月收入/支出/淨利 + 近 12 月月度淨利趨勢 + 近 6 季季度淨利趨勢。"
+    )
+    from datetime import datetime as _dt
+    from data_processor import report_builder as rb
+
+    def _render_partner_output(state_key: str, widget_key: str, fname: str):
+        html_cached = st.session_state.get(state_key)
+        if not html_cached:
+            return
+        _open_in_new_tab_widget(html_cached, key=widget_key)
+        st.download_button(
+            "⬇️ 下載 HTML（備援，可用 LINE/Email 傳給胡醫師）",
+            data=html_cached.encode("utf-8"),
+            file_name=fname, mime="text/html", key=f"{widget_key}_dl",
+        )
+        with st.expander("👁️ 內嵌預覽（外觀以新分頁為準）"):
+            import streamlit.components.v1 as components
+            components.html(html_cached, height=700, scrolling=True)
+
+    # 月度
+    if st.button(
+        f"📄 產生 {service_month[:7]} 月度報表",
+        key="fp_partner_gen",
+    ):
+        with st.spinner("產生月度報表中..."):
+            try:
+                html_str, err = rb.build_zepei_partner_monthly(
+                    sb, service_month, months,
+                    _dt.now().strftime("%Y-%m-%d %H:%M"),
+                )
+            except Exception as e:
+                html_str, err = None, f"產生報表失敗:{e}"
+        if err:
+            st.warning(err, icon="⚠️")
+            st.session_state.pop("fp_partner_html", None)
+        else:
+            st.session_state["fp_partner_html"] = html_str
+            st.session_state["fp_partner_month"] = service_month
+    if st.session_state.get("fp_partner_month") == service_month:
+        _render_partner_output(
+            "fp_partner_html", "fp_partner",
+            f"澤沛財務報表_{service_month[:7]}.html",
+        )
+
+    # 季度
+    q_col1, q_col2 = st.columns([2, 3])
+    quarters = sorted({rb.quarter_of(m) for m in months}, reverse=True)
+    cur_q = rb.quarter_of(service_month)
+    with q_col1:
+        sel_q = st.selectbox(
+            "季度", quarters,
+            index=quarters.index(cur_q) if cur_q in quarters else 0,
+            format_func=lambda yq: f"{yq[0]} 第 {yq[1]} 季",
+            key="fp_partner_q_sel",
+        )
+    with q_col2:
+        st.write("")  # 對齊
+        gen_q = st.button(
+            f"📄 產生 {sel_q[0]} Q{sel_q[1]} 季度報表",
+            key="fp_partner_q_gen",
+        )
+    if gen_q:
+        with st.spinner("產生季度報表中..."):
+            try:
+                html_q, err_q = rb.build_zepei_partner_quarterly(
+                    sb, sel_q[0], sel_q[1], months,
+                    _dt.now().strftime("%Y-%m-%d %H:%M"),
+                )
+            except Exception as e:
+                html_q, err_q = None, f"產生報表失敗:{e}"
+        if err_q:
+            st.warning(err_q, icon="⚠️")
+            st.session_state.pop("fp_partner_q_html", None)
+        else:
+            st.session_state["fp_partner_q_html"] = html_q
+            st.session_state["fp_partner_q_key"] = sel_q
+    if st.session_state.get("fp_partner_q_key") == sel_q:
+        _render_partner_output(
+            "fp_partner_q_html", "fp_partner_q",
+            f"澤沛財務報表_{sel_q[0]}Q{sel_q[1]}.html",
+        )
 
     # ════════════════════════════════════════════════════════
     # 3. 支票支出（兩家共用，獨立項目，不入合計）
@@ -2207,19 +2318,21 @@ def _section_cash_expense():
 
     st.subheader("💵 現金支出（含支票自動分流）")
     st.caption(
-        "檔名範例：『澤豐中醫診所現金支出.xlsx』。"
+        "檔名範例：『澤豐/澤沛中醫診所現金支出.xlsx』。"
         "檔內描述以「支票-XXX(銀行)」開頭的列會自動分流到 check_expense 表，"
         "其他歸 cash_expense。**不需另外上傳支票檔。**"
     )
 
     st.info(
-        "ℹ️ **澤沛現金支出由系統從澤沛中信交易自動辨識**（標籤如「沛02月現金支出」），"
-        "不需上傳檔案。本區僅供澤豐使用。"
+        "ℹ️ **澤豐**：現金支出直接入實帳（x3，本月）。\n\n"
+        "ℹ️ **澤沛**：現金支出「合計」仍由系統從澤沛中信 x5 結算交易自動入帳"
+        "（標籤如「沛02月現金支出」）；本區上傳的澤沛檔僅提供**逐筆明細對帳**"
+        "（顯示於月度實帳金流分析的「x5 澤沛現金結算明細」），不會重複計入合計。"
     )
 
     col1, col2, col3 = st.columns([1, 1, 3])
     with col1:
-        clinic_choice = st.radio("診所", ["澤豐"], key="cash_exp_clinic")
+        clinic_choice = st.radio("診所", ["澤豐", "澤沛"], key="cash_exp_clinic")
     with col2:
         roc_year = st.number_input(
             "民國年", min_value=110, max_value=130, value=115, step=1,

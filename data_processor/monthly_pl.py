@@ -167,6 +167,14 @@ class ZepeiMonthly:
     # 手 KEY x10
     x10_income_items: list = field(default_factory=list)
     x10_expense_items: list = field(default_factory=list)
+    # x5 現金結算的「前月現金支出」逐筆明細（cash_expense 表，
+    # 由澤沛現金支出檔上傳）— 僅供對帳顯示，不入合計
+    # （實際金流已由中信 x5 settle 交易記帳，避免重複計算）
+    x5_detail_items: list = field(default_factory=list)
+
+    @property
+    def x5_detail_total(self) -> int:
+        return sum(it.get("amount", 0) for it in self.x5_detail_items)
 
     @property
     def esun_inflow_total(self) -> int:
@@ -460,6 +468,24 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             "description": r.get("description") or "",
             "amount": r.get("amount") or 0,
             "attribution_month": service_month,
+        })
+
+    # ─── x5 現金結算「前月」逐筆明細（僅供對帳，不入合計）───
+    # N 月中信 x5 settle = 結算 N-1 月的澤沛現金支出；
+    # 明細來自澤沛現金支出檔上傳的 cash_expense（accrual_month = N-1）。
+    cash_detail = (
+        sb.table("cash_expense")
+        .select("expense_date, description, amount")
+        .eq("clinic_id", clinic_id).eq("accrual_month", prev_m)
+        .order("expense_date")
+        .execute().data
+    )
+    for r in cash_detail:
+        m.x5_detail_items.append({
+            "expense_date": r.get("expense_date"),
+            "description": r.get("description") or "",
+            "amount": r.get("amount") or 0,
+            "attribution_month": prev_m,
         })
 
     return m
