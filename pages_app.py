@@ -1343,7 +1343,14 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
     _row("G 總收入 = B+C+E+F", lambda p: p.g_total_income, highlight=True)
 
     # === 支出面 ===
-    _row("H 醫師薪資", lambda p: p.h_doctor, section="支出")
+    def _doctor_salary_cell(p):
+        miss = getattr(p, "doctor_salary_missing", None) or []
+        if miss:
+            names = "、".join(m["doctor"] for m in miss)
+            return f"{_fmt_amt(p.h_doctor)} ⚠️缺{names}"
+        return p.h_doctor
+
+    _row("H 醫師薪資", _doctor_salary_cell, section="支出")
     _row("H 護理師&助理薪資", lambda p: p.h_nurse)
     if clinic_short == "澤豐":
         _row("H 編制外人員薪資", lambda p: p.h_external)
@@ -1466,6 +1473,19 @@ def _render_pl_breakdown(by_clinic_month: dict, clinic_short: str,
         if not pl:
             st.info("該月份無資料")
             return
+
+        miss = getattr(pl, "doctor_salary_missing", None) or []
+        if miss:
+            lines = "；".join(
+                f"{m['doctor']}（{m['reason']}"
+                + (f"，系統實領 {m['expected']:,}" if m.get("expected") else "")
+                + "）"
+                for m in miss
+            )
+            st.warning(
+                f"⚠️ H 醫師薪資缺漏：{lines}。"
+                "該筆薪轉（若存在）暫列於護理師&助理薪資。"
+            )
 
         sections = [
             ("H 醫師薪資", pl.doctor_salary_items),

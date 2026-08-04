@@ -22,7 +22,12 @@
     H 薪資（細分3類）
       a 醫師薪資  - 周明毅: doctor_salary_monthly(N月)兩院總和(全算澤豐)
                   - 呂敏盛/胡舒婷: 對應玉山 outflow summary='薪資轉帳',
-                    memo 含醫師姓名，attr_month=memo 內 YYYMM 或 入帳月-1
+                    ① 備註含醫師姓名（manual_annotation 配對）
+                    ② 金額比對：主聘本院非周醫師 N 月系統實領
+                       (兩院 total_salary 合計 − 勞健保扣) == N+1 月薪轉金額
+                       （玉山 csv 備註只有「整批薪轉」無醫師名時的備援）
+                    都比對不到 → doctor_salary_missing 註記（11504 及之前
+                    計算值可能與實匯不同，屬預期情形）
       b 護理師&助理 ← 玉山 outflow summary='薪資轉帳' 排除醫師，入帳月-1
       c 編制外人員  ← staff_salary_summary employee in external_names, N月
     I 現金支出
@@ -174,6 +179,9 @@ class ClinicMonthlyPL:
     doctor_salary_items: list = field(default_factory=list)
     nurse_salary_items: list = field(default_factory=list)
     external_salary_items: list = field(default_factory=list)
+    # 醫師薪資比對不到玉山薪轉時的缺漏註記：
+    # [{doctor, expected(實領 or None), reason}]；不入金額合計
+    doctor_salary_missing: list = field(default_factory=list)
 
     # === I 現金支出 ===
     cash_expense_items: list = field(default_factory=list)
@@ -305,6 +313,48 @@ def _has_doctor_name(text: str, doctor_names: list[str]) -> str | None:
         if name and name in text:
             return name
     return None
+
+
+def _expected_doctor_net_salary(
+    sb, clinic_id: int, service_month: str, doctor_names: list[str],
+) -> dict[str, int | None]:
+    """主聘=本院、非周明毅醫師的「系統實領」，供玉山薪轉金額比對。
+
+    實領 = 該醫師 N 月兩院 doctor_salary_monthly.total_salary 合計
+           − 勞保扣 − 健保扣（扣除額只記在主聘列，直接加總即可）。
+    N 月薪資由主聘院在 N+1 月上旬玉山「整批薪轉」匯出。
+
+    Returns:
+        {醫師名: 實領；該月薪資未計算則為 None}
+    """
+    docs = sb.table("doctors").select("id, name").execute().data
+    did_to_name = {d["id"]: d["name"] for d in docs}
+    dc = (
+        sb.table("doctor_clinic").select("doctor_id, role")
+        .eq("clinic_id", clinic_id).neq("role", "support")
+        .execute().data
+    )
+    out: dict[str, int | None] = {}
+    for r in dc:
+        name = did_to_name.get(r["doctor_id"])
+        if not name or name == "周明毅" or name not in doctor_names:
+            continue
+        rows = (
+            sb.table("doctor_salary_monthly")
+            .select("total_salary, labor_deduction, nhi_deduction")
+            .eq("doctor_id", r["doctor_id"])
+            .eq("service_month", service_month)
+            .execute().data
+        )
+        if rows:
+            out[name] = (
+                sum(int(x.get("total_salary") or 0) for x in rows)
+                - sum(int(x.get("labor_deduction") or 0) for x in rows)
+                - sum(int(x.get("nhi_deduction") or 0) for x in rows)
+            )
+        else:
+            out[name] = None
+    return out
 
 
 # ─── 收入面計算 ────────────────────────────────────────────
@@ -591,6 +641,7 @@ def _compute_expense(
     }
 
     if esun_id:
+        pending: list[dict] = []  # 無醫師名備註的薪轉（金額比對備選）
         for tx in _fetch_bank_tx(sb, esun_id, next_m):
             amt = tx.get("amount") or 0
             if amt >= 0:
@@ -623,14 +674,51 @@ def _compute_expense(
                     "source": "玉山轉帳+備註",
                 })
             elif not doctor_hit:
-                pl.nurse_salary_items.append({
+                pending.append({
                     "transaction_date": tx_date,
                     "annotation": desc,
                     "counterparty": cp,
                     "amount": amount_abs,
-                    "source": "玉山轉帳",
                 })
             # doctor_hit == 周明毅 → 跳過(走 doctor_salary_monthly)
+
+        # ② 金額比對備援：玉山 csv 備註只有「整批薪轉」無醫師名時，
+        #    用「系統實領」比對未識別薪轉金額 → 歸醫師薪資。
+        #    比對不到（11504 及之前計算值可能與實匯不同）→ 記缺漏註記。
+        expected_net = _expected_doctor_net_salary(
+            sb, clinic_id, sm, doctor_names,
+        )
+        matched = {it.get("doctor") for it in pl.doctor_salary_items}
+        for name, net in expected_net.items():
+            if name in matched:
+                continue
+            if net == 0:
+                continue  # 該月無薪資（如未看診），不算缺
+            if net is not None:
+                idx = next(
+                    (i for i, p in enumerate(pending) if p["amount"] == net),
+                    None,
+                )
+                if idx is not None:
+                    p = pending.pop(idx)
+                    pl.doctor_salary_items.append({
+                        "doctor": name,
+                        "transaction_date": p["transaction_date"],
+                        "annotation": p["annotation"],
+                        "amount": p["amount"],
+                        "source": "玉山轉帳+金額比對(系統實領)",
+                    })
+                    continue
+            pl.doctor_salary_missing.append({
+                "doctor": name,
+                "expected": net,
+                "reason": ("系統薪資未計算" if net is None
+                           else "玉山無相符薪轉金額"),
+            })
+
+        # 剩餘未識別薪轉 → 護理師&助理
+        for p in pending:
+            pl.nurse_salary_items.append({**p, "source": "玉山轉帳"})
 
     # H c 編制外人員 (謝松坊 etc)：staff_salary_summary service_month=N月
     if external_names:
