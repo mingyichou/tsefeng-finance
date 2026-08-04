@@ -777,7 +777,8 @@ def _section_doctor_personal_compare(sb):
     st.subheader("📊 合理門診量（五階段堆疊）")
     st.caption(
         "下→上：1-30 / 31-50 / 51-70 / 71-150 / 151-1000 人次。"
-        "支援醫師欄位 = 各正職「補支援醫師數」歸給該診所支援醫師（從末階段往前扣）。"
+        "「（支援）」柱 = 該診所支援醫師；其合理量在來源檔掛在各正職的"
+        "「補支援醫師數」，匯入時從末階段往前扣並歸給支援醫師。"
     )
     try:
         cap_rows = (sb.table("doctor_capacity_stage").select("*")
@@ -794,14 +795,17 @@ def _section_doctor_personal_compare(sb):
         STAGE_COLORS = ["#4B0082", "#6A5ACD", "#9370DB", "#BA55D3", "#DDA0DD"]
         rows4: list[dict] = []
 
-        def _add_cap(scope: str, name: str, stages: list[int]):
+        def _add_cap(scope: str, name: str, stages: list[int],
+                     is_support: bool = False):
             if sum(stages) == 0:
                 return
+            label = f"{name}（支援）" if is_support else name
             for i, stg in enumerate(stages):
                 rows4.append({
-                    "分組": scope, "醫師": name,
-                    "顯示": f"{SCOPE_PREFIX[scope]} {name}",
-                    "排序": {"澤豐": 1, "澤沛": 2, "全院": 3}[scope],
+                    "分組": scope, "醫師": label,
+                    "顯示": f"{SCOPE_PREFIX[scope]} {label}",
+                    "排序": {"澤豐": 1, "澤沛": 2}[scope],
+                    "支援序": 1 if is_support else 0,
                     "階段": STAGE_NAMES[i],
                     "階段序": i,
                     "人次": int(stg),
@@ -813,20 +817,23 @@ def _section_doctor_personal_compare(sb):
                 return [0] * 5
             return [r.get(f"stage{i+1}") or 0 for i in range(5)]
 
-        for name in fz_doctors:
-            _add_cap("澤豐", name, _stages_of(fz_id, name_to_did[name]))
-        for name in fp_doctors:
-            _add_cap("澤沛", name, _stages_of(fp_id, name_to_did[name]))
-        for name in all_doctors:
-            d_id = name_to_did[name]
-            both = [a + b for a, b in zip(
-                _stages_of(fz_id, d_id), _stages_of(fp_id, d_id))]
-            _add_cap("全院", name, both)
+        # 各診所柱體 = 主聘 + 支援（is_support 列來自匯入時的「補支援醫師數」歸屬）；
+        # 名單以醫師配置 union 該月 doctor_capacity_stage 實有列，避免漏柱
+        for c_id, scope, base_names in (
+            (fz_id, "澤豐", fz_doctors), (fp_id, "澤沛", fp_doctors),
+        ):
+            cap_names = {did_to_name[d] for (cc, d) in cap_idx
+                         if cc == c_id and d in did_to_name}
+            for name in sorted(set(base_names) | cap_names):
+                d_id = name_to_did[name]
+                r = cap_idx.get((c_id, d_id))
+                _add_cap(scope, name, _stages_of(c_id, d_id),
+                         is_support=bool(r and r.get("is_support")))
 
         if rows4:
             df4 = pd.DataFrame(rows4)
-            order4 = (df4[["顯示", "排序", "醫師"]].drop_duplicates()
-                      .sort_values(["排序", "醫師"])["顯示"].tolist())
+            order4 = (df4[["顯示", "排序", "支援序", "醫師"]].drop_duplicates()
+                      .sort_values(["排序", "支援序", "醫師"])["顯示"].tolist())
             ch4 = alt.Chart(df4).mark_bar().encode(
                 x=alt.X("顯示:N", sort=order4,
                         axis=alt.Axis(labelAngle=-30, title=None)),
