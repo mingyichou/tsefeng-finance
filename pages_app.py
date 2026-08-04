@@ -398,25 +398,26 @@ def _get_nurse_cost_params(sb) -> tuple[float, float]:
 def _productivity_breakdown(
     out_row: dict | None, cash_row: dict | None, clinic_short: str
 ) -> dict:
-    """醫師產值估算公式拆解（澤豐/澤沛兩套）。回傳所有中間值。
+    """醫師產值估算公式拆解（依處置費有無拆分選公式）。回傳所有中間值。
 
-    澤豐：(診察費 + 內科費*0.2 + 處(內+xx)*0.3 + 純xx*0.5 + 調劑費)*0.9
+    澤豐 ≤11506（48 欄舊制，處置費拆 combo/pure）：
+         (診察費 + 內科費*0.2 + 處(內+xx)*0.3 + 純xx*0.5 + 調劑費)*0.9
          + 掛號費 + 自費(內服+外用+保養+飲片)*0.3 + 自費(針+傷+脫)*0.4
          + 自費(檢驗)*0.8 + 自費(診察) + 自費(其他)
-    澤沛：(診察費 + 藥費*0.2 + 處置費*0.5 + 調劑費)*0.9 + 同上自費部分
+    澤沛全期間、澤豐 11507 起（16 欄制，單一處置費）：
+         (診察費 + 藥費*0.2 + 處置費*0.5 + 調劑費)*0.9 + 同上自費部分
     """
     g = lambda d, k: (d.get(k) or 0) if d else 0
     consult_nhi = g(out_row, "nhi_consult_fee")
     drug_nhi = g(out_row, "nhi_drug_fee")
     dispense_nhi = g(out_row, "nhi_dispense_fee")
-    if clinic_short == "澤豐":
-        combo = g(out_row, "nhi_combo_treatment")
-        pure = g(out_row, "nhi_pure_treatment")
+    combo = g(out_row, "nhi_combo_treatment") if clinic_short == "澤豐" else 0
+    pure = g(out_row, "nhi_pure_treatment") if clinic_short == "澤豐" else 0
+    if combo or pure:  # 澤豐 48 欄舊制（≤11506）才有拆分
         treatment_single = 0
         nhi_pre = (consult_nhi + drug_nhi * 0.2
                    + combo * 0.3 + pure * 0.5 + dispense_nhi)
-    else:  # 澤沛
-        combo = pure = 0
+    else:  # 澤沛全期間 + 澤豐 11507 起：單一處置費 *0.5
         treatment_single = g(out_row, "nhi_treatment_fee")
         nhi_pre = (consult_nhi + drug_nhi * 0.2
                    + treatment_single * 0.5 + dispense_nhi)
@@ -439,9 +440,9 @@ def _productivity_breakdown(
     return {
         "診察費": consult_nhi,
         "內科費(藥費)": drug_nhi,
-        "處(內+xx)": combo,        # 澤豐有值，澤沛恆 0
-        "純xx": pure,              # 澤豐有值，澤沛恆 0
-        "處置費": treatment_single, # 澤沛有值，澤豐恆 0
+        "處(內+xx)": combo,        # 僅澤豐 48 欄舊制（≤11506）有值
+        "純xx": pure,              # 僅澤豐 48 欄舊制（≤11506）有值
+        "處置費": treatment_single, # 16 欄制有值（澤沛全期間；澤豐 11507 起）
         "調劑費": dispense_nhi,
         "健保小計": int(round(nhi_pre)),
         "健保*0.9": int(round(nhi_part)),
@@ -3272,12 +3273,14 @@ def _section_outpatient_report():
     """門診申報金額統計報表 + A91+複針補表（Sprint 2.4）"""
     from data_processor.clinic_report import (
         detect_format,
-        parse_fz_main, parse_fp_main, parse_fp_a91,
+        parse_fz_main, parse_main16, parse_a91,
     )
 
     st.subheader("📊 門診申報金額統計報表 + A91+複針（批次）")
     st.caption(
-        "三種版式自動識別：澤豐 48 欄主表 / 澤沛 16 欄主表 / 澤沛 A91+複針 137 欄補表。"
+        "版式自動識別（澤豐自 11507 起改用與澤沛相同醫資系統）："
+        "16 欄主表 + A91+複針 137 欄補表（兩家通用）；"
+        "澤豐 ≤11506 為 48 欄舊主表（已含 A91/複針，無補表）。"
         "可一次選多份；補表會 partial update 到主表已存在的列。"
     )
 
@@ -3302,14 +3305,14 @@ def _section_outpatient_report():
     errors: list[str] = []
 
     parser_map = {
-        "fz_main": parse_fz_main,
-        "fp_main": parse_fp_main,
-        "fp_a91": parse_fp_a91,
+        "fz_main48": parse_fz_main,
+        "main16": parse_main16,
+        "a91_137": parse_a91,
     }
     kind_label = {
-        "fz_main": "澤豐 48 欄",
-        "fp_main": "澤沛 16 欄",
-        "fp_a91": "澤沛 A91+複針 137 欄",
+        "fz_main48": "48 欄主表（舊制 ≤11506）",
+        "main16": "16 欄主表",
+        "a91_137": "A91+複針 137 欄補表",
     }
 
     for f in uploaded_files:
@@ -3317,13 +3320,13 @@ def _section_outpatient_report():
             meta = detect_format(f.name)
             cid = short_to_cid[meta["clinic_short"]]
             recs = parser_map[meta["kind"]](f, f.name, cid, name_to_did)
-            if meta["kind"] == "fp_a91":
+            if meta["kind"] == "a91_137":
                 a91_records.extend(recs)
             else:
                 main_records.extend(recs)
             summaries.append({
                 "檔名": f.name,
-                "版式": kind_label[meta["kind"]],
+                "版式": f"{meta['clinic_short']} {kind_label[meta['kind']]}",
                 "服務月": meta["service_month"],
                 "醫師數": len(recs),
             })
@@ -3386,6 +3389,12 @@ def _import_outpatient_records(
     errors: list[str] = []
 
     if main_records:
+        # 48 欄舊制與 16 欄新制的欄位集合不同，混批 upsert 需補齊缺鍵
+        # （皆為數值欄；缺鍵＝該版式報表無此欄位，補 0 語意正確）
+        all_keys = set().union(*(r.keys() for r in main_records))
+        for r in main_records:
+            for k in all_keys - r.keys():
+                r[k] = 0
         try:
             sb.table("doctor_outpatient_summary").upsert(
                 main_records,
@@ -3801,6 +3810,38 @@ def _import_bank_records(sb, records: list[dict]):
 # ============================================================
 # 4. 醫師薪資（Phase 3.5）
 # ============================================================
+def _warn_missing_a91_supplement(inputs: dict, service_month: str):
+    """複針/A91 獎金依賴 A91+複針補表（澤沛 11504 起；澤豐 11507 改新系統起）。
+    若該診所主表已入庫但複針/A91 全為 0，多半是補表尚未上傳 → 提醒。"""
+    from data_processor.salary import ACU_A91_EFFECTIVE_FROM
+    from data_processor.clinic_report import FZ_NEW_SYSTEM_FROM_MONTH
+
+    if service_month < ACU_A91_EFFECTIVE_FROM:
+        return
+    roc_ym = f"{int(service_month[:4]) - 1911}{service_month[5:7]}"
+    for cid, c in inputs["clinics"].items():
+        short = c["short_name"]
+        if short == "澤豐" and service_month < FZ_NEW_SYSTEM_FROM_MONTH:
+            continue  # 澤豐舊制 48 欄主表已含複針/A91，無補表
+        rows = [v for (k_cid, _), v in inputs["outpatient"].items() if k_cid == cid]
+        if not rows:
+            st.warning(
+                f"⚠️ {short} {roc_ym} 門診申報主表尚未上傳，"
+                "複針/A91 獎金將計為 0。"
+            )
+        elif not any(
+            (r.get("acu_complex_mid_count") or 0)
+            + (r.get("acu_complex_high_count") or 0)
+            + (r.get("a91_count") or 0)
+            for r in rows
+        ):
+            st.warning(
+                f"⚠️ {short} {roc_ym} 複針/A91 人數全為 0 —"
+                f"「{roc_ym}{short}A91+複針.xlsx」補表可能尚未上傳，"
+                "相關獎金將計為 0。"
+            )
+
+
 def page_salary():
     st.title("💵 醫師薪資計算")
 
@@ -3842,6 +3883,8 @@ def page_salary():
     if not components:
         st.warning("該月份無計算結果")
         return
+
+    _warn_missing_a91_supplement(inputs, service_month)
 
     # ════════════════════════════════════════════════════════
     # PART 1：彙總比較表（網頁儀表板模式）
