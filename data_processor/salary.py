@@ -4,13 +4,15 @@
 從 DB 讀資料、計算月度薪資、寫入 doctor_salary_monthly。
 
 資料來源：
-  - doctors                          → session_fee 診薪
-  - doctor_clinic                    → role + director_allowance
+  - doctors                          → 診薪 fallback（v12 前的單一值）
+  - doctor_session_fees              → 診薪（日期版本化，取該月月底有效值）
+  - doctor_clinic                    → role + director_allowance（日期版本化，
+                                       該月有重疊的角色列才參與計算）
   - doctor_visit_stats               → 診數 + 各類健保人次（業績獎金）
   - doctor_cash_monthly (view)       → 自費月度總計（抽成基底）
   - doctor_commission_rules          → 抽成率（預設）
   - doctor_commission_overrides      → 醫師個別覆寫（如周醫師診察費 50%）
-  - doctor_insurance_deductions      → 勞健保扣除額
+  - doctor_insurance_deductions      → 勞健保扣除額（勞保按日比例、健保當月在保全額）
   - bonus_rules                      → 業績獎金門檻 15.1（讀取但邏輯硬寫）
 
 公式：
@@ -23,6 +25,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+
+from .doctor_config import (
+    active_dc_rows,
+    fetch_doctor_clinic,
+    fetch_session_fees,
+    insurance_for_month,
+    parse_date,
+    resolve_session_fee,
+)
 
 
 # ─── 業績獎金固定常數 ────────────────────────────────────
@@ -84,6 +95,9 @@ class SalaryComponent:
     acu_complex_bonus: int = 0
     a91_count: int = 0
     a91_bonus: int = 0
+    # 角色列生效區間（主聘判定用，不寫入 DB）
+    role_from: str | None = None
+    role_to: str | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -142,6 +156,7 @@ class Payslip:
     labor_deduction: int = 0
     nhi_deduction: int = 0
     insurance_base: int = 0
+    insurance_note: str | None = None
 
     @property
     def gross_total(self) -> int:
@@ -174,9 +189,8 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
     doctors = sb.table("doctors").select("id, name, session_fee, is_active").execute().data
     clinics = sb.table("clinics").select("id, short_name").execute().data
 
-    doctor_clinic = sb.table("doctor_clinic").select(
-        "doctor_id, clinic_id, role, director_allowance"
-    ).execute().data
+    doctor_clinic = fetch_doctor_clinic(sb)      # 含生效日期（migration 前自動 fallback）
+    session_fees = fetch_session_fees(sb)        # 診薪歷史（表不存在回 []）
 
     visit_stats = (
         sb.table("doctor_visit_stats")
@@ -223,6 +237,7 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
         "doctors": {d["id"]: d for d in doctors},
         "clinics": {c["id"]: c for c in clinics},
         "doctor_clinic": doctor_clinic,
+        "session_fees": session_fees,
         "visit_stats": {
             (v["clinic_id"], v["doctor_id"]): v for v in visit_stats
         },
@@ -299,13 +314,14 @@ def _calc_perf_bonus(
 def calculate_components(inputs: dict, service_month: str) -> list[SalaryComponent]:
     """
     為該月份所有 (診所×醫師) 組合計算 SalaryComponent。
-    依 doctor_clinic 表的所有列為計算基礎，不限於有 visit_stats 的。
+    依 doctor_clinic 表「該月有效」的角色列為計算基礎（v12 起帶生效區間：
+    到職前/離職後的月份不再列入），不限於有 visit_stats 的。
     （沒看診診數=0、抽成=0、業績不觸發；但記錄一筆便於審計）
     """
     components: list[SalaryComponent] = []
     threshold = inputs["bonus_threshold"]
 
-    for dc in inputs["doctor_clinic"]:
+    for dc in active_dc_rows(inputs["doctor_clinic"], service_month):
         doctor_id = dc["doctor_id"]
         clinic_id = dc["clinic_id"]
         role = dc["role"]
@@ -323,7 +339,12 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
 
         sessions = (visit_row or {}).get("sessions_total", 0) or 0
         # session_fee 為 NUMERIC(7,1)（如 3230.8），先乘診數最後再 round
-        session_fee = float(doctor.get("session_fee") or 0)
+        # v12：診薪取「該月月底有效」的版本（doctor_session_fees），
+        # 無歷史列時 fallback doctors.session_fee
+        session_fee = resolve_session_fee(
+            inputs.get("session_fees") or [], inputs["doctors"],
+            doctor_id, service_month,
+        )
         session_pay = round(sessions * session_fee)
         commission_total, breakdown = _calc_commission(inputs, doctor_id, cash_row)
         triggered, avg, b_int, b_pure, b_combo = _calc_perf_bonus(
@@ -370,6 +391,8 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
             acu_complex_bonus=acu_bonus,
             a91_count=a91_cnt,
             a91_bonus=a91_b,
+            role_from=dc.get("effective_from"),
+            role_to=dc.get("effective_to"),
         )
 
         if not visit_row:
@@ -393,12 +416,17 @@ def build_payslips(
     for c in components:
         by_doctor.setdefault(c.doctor_id, []).append(c)
 
-    # 找每位醫師的主聘 (role != 'support' 的列)；若全是 support 則取第一個
-    sm_dt = date.fromisoformat(service_month)
-
+    # 找每位醫師的主聘 (role != 'support' 的列)；若全是 support 則取第一個。
+    # 月中轉診所（同月兩個主聘列）取生效較新的那家當主聘（扣除只扣一次）。
     payslips: list[Payslip] = []
     for doctor_id, comps in by_doctor.items():
-        main = next((c for c in comps if c.role != "support"), comps[0])
+        mains = [c for c in comps if c.role != "support"]
+        if mains:
+            main = max(
+                mains, key=lambda c: parse_date(c.role_from) or date.min
+            )
+        else:
+            main = comps[0]
         support = next((c for c in comps if c.role == "support" and c.gross > 0), None)
 
         ps = Payslip(
@@ -413,25 +441,17 @@ def build_payslips(
             support_clinic_name=support.clinic_name if support else None,
         )
 
-        # 勞健保扣除（主聘診所、生效期間有效的）
-        for ins in inputs["insurance_deductions"]:
-            if ins["clinic_id"] != main.clinic_id:
-                continue
-            if ins["doctor_id"] != doctor_id:
-                continue
-            ef_from = date.fromisoformat(ins["effective_from"])
-            ef_to = (
-                date.fromisoformat(ins["effective_to"])
-                if ins.get("effective_to") else None
-            )
-            if ef_from > sm_dt:
-                continue
-            if ef_to and ef_to < sm_dt:
-                continue
-            ps.labor_deduction = ins.get("labor_deduction") or 0
-            ps.nhi_deduction = ins.get("nhi_deduction") or 0
-            ps.insurance_base = ins.get("insurance_base") or 0
-            break
+        # 勞健保扣除（主聘診所）：
+        #   勞保按日比例（扣除額/30 × 當月在保天數，整月在保全額）
+        #   健保當月任一天在保即扣全額
+        ins = insurance_for_month(
+            inputs["insurance_deductions"],
+            main.clinic_id, doctor_id, service_month,
+        )
+        ps.labor_deduction = ins["labor"]
+        ps.nhi_deduction = ins["nhi"]
+        ps.insurance_base = ins["base"]
+        ps.insurance_note = ins["note"]
 
         payslips.append(ps)
 

@@ -327,13 +327,15 @@ def _expected_doctor_net_salary(
     Returns:
         {醫師名: 實領；該月薪資未計算則為 None}
     """
+    from .doctor_config import active_dc_rows, fetch_doctor_clinic
+
     docs = sb.table("doctors").select("id, name").execute().data
     did_to_name = {d["id"]: d["name"] for d in docs}
-    dc = (
-        sb.table("doctor_clinic").select("doctor_id, role")
-        .eq("clinic_id", clinic_id).neq("role", "support")
-        .execute().data
-    )
+    # v12：主聘角色帶生效區間，只取薪資月份有效的列（離職/轉院後不再比對）
+    dc = [
+        r for r in active_dc_rows(fetch_doctor_clinic(sb), service_month)
+        if r["clinic_id"] == clinic_id and r["role"] != "support"
+    ]
     out: dict[str, int | None] = {}
     for r in dc:
         name = did_to_name.get(r["doctor_id"])
