@@ -5006,6 +5006,7 @@ def _settings_doctor_roster(sb):
         [
             "➕ 新增醫師（到職）",
             "🤝 新增支援角色（跨院兼診）",
+            "🔚 結束單一角色（如：結束某院支援）",
             "🔁 轉換診所（換主聘）",
             "📅 醫師離職",
             "💲 調整診薪",
@@ -5107,6 +5108,38 @@ def _settings_doctor_roster(sb):
                 except Exception as e:
                     st.error(f"新增失敗：{e}")
 
+    # 2b) 結束單一角色 -------------------------------------------------------
+    elif action.startswith("🔚"):
+        st.caption(
+            "只結束選定的那一條角色列（其他診所的角色不動）。"
+            "例：A 醫師結束澤沛支援、但續任澤豐主聘 → 選澤沛支援列。"
+            "整個人離職請用「醫師離職」。"
+        )
+        if not active_dc:
+            st.info("沒有現行角色列。")
+        else:
+            opt = st.selectbox(
+                "要結束的角色列",
+                active_dc,
+                format_func=lambda r: (
+                    f"{did_name.get(r['doctor_id'])}｜{cid_name.get(r['clinic_id'])}"
+                    f"｜{role_label.get(r['role'], r['role'])}"
+                    f"｜{str(r.get('effective_from') or '')[:10]} 起"
+                ),
+                key="ro_end_row",
+            )
+            end_date = st.date_input("最後有效日（含）", value=today, key="ro_end_date")
+            if st.button("💾 結束此角色", type="primary", key="ro_end_save"):
+                try:
+                    _end_row(opt["id"], end_date, f"角色結束（{end_date}）")
+                    st.success(
+                        f"✅ {did_name[opt['doctor_id']]} 於 {cid_name[opt['clinic_id']]} 的"
+                        f"{role_label.get(opt['role'])}角色已於 {end_date} 結束"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"結束失敗：{e}")
+
     # 3) 轉換診所 ------------------------------------------------------------
     elif action.startswith("🔁"):
         mains = [r for r in active_dc if r["role"] != "support"]
@@ -5135,10 +5168,31 @@ def _settings_doctor_roster(sb):
                 tr_date = st.date_input("轉換生效日（新診所第一天）", value=today, key="ro_tr_date")
                 tr_allow = st.number_input("轉入院長津貼", min_value=0, step=1000,
                                            value=0, key="ro_tr_allow")
-            st.caption("原診所角色列自動於生效日前一天結束。勞健保若隨主聘診所轉移，請至「勞健保扣除額」分頁結束舊列並新增新診所列。")
+            keep_support = st.checkbox(
+                f"原診所（{cid_name.get(opt['clinic_id'])}）自生效日起續任支援醫",
+                key="ro_tr_keep_support",
+            )
+            # 目標診所若已有未結束的支援列（原本就在該院兼診）→ 自動升主聘
+            old_support = [
+                r for r in active_dc
+                if r["doctor_id"] == opt["doctor_id"]
+                and r["clinic_id"] == tr_clinic and r["role"] == "support"
+            ]
+            if old_support:
+                st.caption(
+                    f"ℹ️ 偵測到其在 {cid_name[tr_clinic]} 的支援列，"
+                    "將自動於生效日前一天結束（升為主聘）。"
+                )
+            st.caption(
+                "原診所主聘列自動於生效日前一天結束。"
+                "勞健保若隨主聘診所轉移，請至「勞健保扣除額」分頁登記異動"
+                "（舊診所登記全 0、新診所登記新狀態，生效日=轉換日）。"
+            )
             if st.button("💾 執行轉換", type="primary", key="ro_tr_save"):
                 try:
                     _end_row(opt["id"], previous_day(tr_date), f"轉出至{cid_name[tr_clinic]}（{tr_date} 生效）")
+                    for r in old_support:
+                        _end_row(r["id"], previous_day(tr_date), f"升為主聘（{tr_date}）")
                     sb.table("doctor_clinic").insert({
                         "doctor_id": opt["doctor_id"], "clinic_id": tr_clinic,
                         "role": tr_role,
@@ -5146,10 +5200,23 @@ def _settings_doctor_roster(sb):
                         "effective_from": str(tr_date),
                         "note": f"自{cid_name.get(opt['clinic_id'])}轉入（{tr_date}）",
                     }).execute()
-                    st.success(
+                    if keep_support:
+                        sb.table("doctor_clinic").insert({
+                            "doctor_id": opt["doctor_id"],
+                            "clinic_id": opt["clinic_id"],
+                            "role": "support", "director_allowance": 0,
+                            "effective_from": str(tr_date),
+                            "note": f"轉主聘後續任支援（{tr_date}）",
+                        }).execute()
+                    msg = (
                         f"✅ {did_name[opt['doctor_id']]} 自 {tr_date} 起轉至 "
                         f"{cid_name[tr_clinic]}（{role_label[tr_role]}）"
                     )
+                    if old_support:
+                        msg += f"；原 {cid_name[tr_clinic]} 支援列已結束"
+                    if keep_support:
+                        msg += f"；{cid_name.get(opt['clinic_id'])} 續任支援"
+                    st.success(msg)
                     st.rerun()
                 except Exception as e:
                     st.error(f"轉換失敗：{e}")
@@ -5173,21 +5240,37 @@ def _settings_doctor_roster(sb):
             st.caption(
                 "將結束該醫師所有未結束的角色列（"
                 + "、".join(f"{cid_name.get(r['clinic_id'])} {role_label.get(r['role'])}" for r in affected)
-                + "），並同步結束其勞健保扣除配置（退保日=最後在職日）。"
-                "離職後月份不再列入薪資計算；歷史月份重算不受影響。"
+                + "），並自動補一筆勞健保**全 0 異動**（生效日=離職次日，"
+                "歷史保留、離職前月份重算不受影響）。"
+                "離職後月份不再列入薪資計算；該醫師會收合到勞健保頁「已無投保」區。"
             )
             if st.button("💾 確認離職", type="primary", key="ro_rs_save"):
                 try:
+                    from data_processor.doctor_config import (
+                        current_insurance_snapshot,
+                    )
                     for r in affected:
                         _end_row(r["id"], rs_date, f"離職（{rs_date}）")
-                    # 勞健保同步退保
+                    # 勞健保退保：補全 0 異動（快照模型，不刪歷史）
                     ins_rows = sb.table("doctor_insurance_deductions").select(
-                        "id, effective_to"
-                    ).eq("doctor_id", rs_doc).is_("effective_to", "null").execute().data
-                    for ir in ins_rows:
-                        sb.table("doctor_insurance_deductions").update(
-                            {"effective_to": str(rs_date)}
-                        ).eq("id", ir["id"]).execute()
+                        "id, clinic_id, doctor_id, insurance_base, "
+                        "labor_deduction, nhi_deduction, effective_from, effective_to"
+                    ).eq("doctor_id", rs_doc).execute().data
+                    day_after = rs_date + timedelta(days=1)
+                    for c_id in {r["clinic_id"] for r in ins_rows}:
+                        snap = current_insurance_snapshot(
+                            ins_rows, c_id, rs_doc, rs_date
+                        )
+                        if snap["labor"] == 0 and snap["nhi"] == 0:
+                            continue
+                        sb.table("doctor_insurance_deductions").upsert({
+                            "clinic_id": c_id, "doctor_id": rs_doc,
+                            "insurance_base": 0, "labor_deduction": 0,
+                            "nhi_deduction": 0,
+                            "effective_from": str(day_after),
+                            "effective_to": None,
+                            "note": f"離職退保（最後在職日 {rs_date}）",
+                        }, on_conflict="clinic_id,doctor_id,effective_from").execute()
                     st.success(f"✅ {did_name[rs_doc]} 已登記離職（最後在職日 {rs_date}）")
                     st.rerun()
                 except Exception as e:
@@ -5338,15 +5421,22 @@ def _settings_doctor_roster(sb):
 
 
 def _settings_insurance_deductions(sb):
-    """勞健保扣除額管理（在主聘診所×醫師配置；UI CRUD）"""
-    st.subheader("勞健保扣除額")
+    """勞健保投保異動管理（v12.1 快照模型：每筆=異動生效日起的完整狀態）"""
+    from datetime import date as _date
+    from data_processor.doctor_config import (
+        current_insurance_snapshot, insurance_for_month,
+    )
+
+    st.subheader("勞健保扣除額（投保異動）")
     st.caption(
-        "規則：只在主聘診所扣一次，支援診所扣 0。"
-        "生效起/結束請填**實際加保/退保日期**（支援月中，如 9/15 到職投保）。\n\n"
-        "計算方式（兩者不同）：**勞保**按日比例 = 扣除額/30 × 當月在保天數"
-        "（整月在保扣全額）；**健保**當月任一天在保即扣全額。"
-        "投保額異動請結束舊列（填結束日）再新增一列（新生效日），"
-        "下次計算薪資自動套用。"
+        "每筆紀錄＝一次**投保異動**：填「異動生效日」＋當日起的完整狀態"
+        "（勞保扣／健保扣／投保額三欄都要確實填寫，未投保填 **0**），"
+        "有效至下一筆異動的前一天，**不需退保日**——退保＝再登記一筆、把該欄改 0。"
+        "勞健保可分開投保：如到職先只保健保（勞保填 0），一個月後加勞保再登記一筆。\n\n"
+        "計算：**勞保**按日比例 = 扣除額/30 × 當月在保天數（整月在保扣全額，"
+        "月中異動自動切段）；**健保**當月任一天在保即扣全額。"
+        "只在主聘診所扣一次，支援診所扣 0。"
+        "離職請用「醫師主檔 → 醫師離職」，會自動補一筆全 0 異動。"
     )
 
     try:
@@ -5365,28 +5455,59 @@ def _settings_insurance_deductions(sb):
     if not rows:
         st.info("尚無資料。請新增。")
 
-    df = pd.DataFrame(rows).copy() if rows else pd.DataFrame()
-    if not df.empty:
-        df["診所"] = df["clinic_id"].map(clinics)
-        df["醫師"] = df["doctor_id"].map(doctors)
-        view = df[[
-            "id", "診所", "醫師", "insurance_base",
-            "labor_deduction", "nhi_deduction",
-            "effective_from", "effective_to", "note",
-        ]].rename(columns={
-            "insurance_base": "投保額",
-            "labor_deduction": "勞保扣",
-            "nhi_deduction": "健保扣",
-            "effective_from": "生效起",
-            "effective_to": "結束",
-            "note": "備註",
-        })
-        st.dataframe(view, use_container_width=True, hide_index=True)
+    today = _date.today()
+    combos = sorted({(r["clinic_id"], r["doctor_id"]) for r in rows})
+
+    def _last_change(c_id, d_id):
+        ds = [str(r.get("effective_from") or "")[:10] for r in rows
+              if r["clinic_id"] == c_id and r["doctor_id"] == d_id]
+        return max(ds) if ds else ""
+
+    current_list, inactive_list = [], []
+    for c_id, d_id in combos:
+        snap = current_insurance_snapshot(rows, c_id, d_id, today)
+        entry = {
+            "診所": clinics.get(c_id, "?"),
+            "醫師": doctors.get(d_id, "?"),
+            "投保額": snap["base"],
+            "勞保扣": snap["labor"],
+            "健保扣": snap["nhi"],
+            "最近異動": _last_change(c_id, d_id),
+        }
+        if snap["labor"] == 0 and snap["nhi"] == 0:
+            inactive_list.append(entry)
+        else:
+            current_list.append(entry)
+
+    if current_list:
+        st.markdown("**📋 現行在保狀態**")
+        st.dataframe(pd.DataFrame(current_list),
+                     use_container_width=True, hide_index=True)
+    if inactive_list:
+        with st.expander(f"💤 已無投保（{len(inactive_list)} 位，含離職/退保）"):
+            st.dataframe(pd.DataFrame(inactive_list),
+                         use_container_width=True, hide_index=True)
+
+    if rows:
+        with st.expander("🗂️ 投保異動歷史（全部紀錄）"):
+            df = pd.DataFrame(rows).copy()
+            df["診所"] = df["clinic_id"].map(clinics)
+            df["醫師"] = df["doctor_id"].map(doctors)
+            view = df[[
+                "id", "診所", "醫師", "insurance_base",
+                "labor_deduction", "nhi_deduction", "effective_from", "note",
+            ]].rename(columns={
+                "insurance_base": "投保額",
+                "labor_deduction": "勞保扣",
+                "nhi_deduction": "健保扣",
+                "effective_from": "異動生效日",
+                "note": "備註",
+            }).sort_values(["醫師", "異動生效日"])
+            st.dataframe(view, use_container_width=True, hide_index=True)
 
     # ─── 單月試算（與薪資引擎同一套邏輯）───
     if rows:
         with st.expander("🧮 單月扣除試算（驗證按日比例）"):
-            from data_processor.doctor_config import insurance_for_month
             calc_month = st.date_input(
                 "薪資月份（取該月 1 日）",
                 value=pd.Timestamp.today().to_period("M").to_timestamp().date(),
@@ -5418,18 +5539,11 @@ def _settings_insurance_deductions(sb):
         return
 
     st.divider()
-    st.markdown("**新增 / 修改一筆配置**")
-
-    edit_id = st.selectbox(
-        "選擇要修改的列（或留「新增」建立新列）",
-        options=["（新增）"] + [f"id={r['id']} {clinics.get(r['clinic_id'])}/{doctors.get(r['doctor_id'])}" for r in rows],
-        key="ins_edit_select",
+    st.markdown("**📝 登記一筆投保異動**")
+    st.caption(
+        "選診所×醫師後，三欄自動帶入**現行值**——要改的改、不變的維持、"
+        "退保的欄位改 0，填異動生效日後儲存。同一天重複儲存會覆蓋當天那筆。"
     )
-    is_edit = edit_id != "（新增）"
-    selected = None
-    if is_edit:
-        sid = int(edit_id.split()[0].split("=")[1])
-        selected = next((r for r in rows if r["id"] == sid), None)
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -5437,86 +5551,91 @@ def _settings_insurance_deductions(sb):
             "主聘診所",
             options=list(clinics.keys()),
             format_func=lambda i: clinics[i],
-            index=list(clinics.keys()).index(selected["clinic_id"]) if selected else 0,
             key="ins_clinic",
         )
         doctor_id = st.selectbox(
             "醫師",
             options=list(doctors.keys()),
             format_func=lambda i: doctors[i],
-            index=list(doctors.keys()).index(selected["doctor_id"]) if selected else 0,
             key="ins_doctor",
         )
-        insurance_base = st.number_input(
-            "投保額",
-            min_value=0, step=100,
-            value=int(selected["insurance_base"]) if selected else 0,
-            key="ins_base",
-        )
-    with col_b:
-        labor_deduction = st.number_input(
-            "勞保扣（整月全額；月中加/退保會自動按日比例）",
-            min_value=0, step=10,
-            value=int(selected["labor_deduction"] or 0) if selected else 0,
-            key="ins_labor",
-        )
-        nhi_deduction = st.number_input(
-            "健保扣",
-            min_value=0, step=10,
-            value=int(selected["nhi_deduction"] or 0) if selected else 0,
-            key="ins_nhi",
-        )
-        effective_from = st.date_input(
-            "加保生效日（含；可為月中日期）",
-            value=(
-                pd.to_datetime(selected["effective_from"]).date()
-                if selected and selected.get("effective_from") else pd.Timestamp("2026-01-01").date()
-            ),
-            key="ins_from",
-        )
-        effective_to = st.date_input(
-            "退保日（含；留空=仍在保）",
-            value=(
-                pd.to_datetime(selected["effective_to"]).date()
-                if selected and selected.get("effective_to") else None
-            ),
-            key="ins_to",
-        )
 
-    note = st.text_input(
-        "備註",
-        value=selected["note"] if selected and selected.get("note") else "",
-        key="ins_note",
+    snap = current_insurance_snapshot(rows, clinic_id, doctor_id, today)
+    st.info(
+        f"現行狀態：投保額 {snap['base']:,}｜勞保扣 {snap['labor']:,}"
+        f"｜健保扣 {snap['nhi']:,}"
+        + ("（目前無投保）" if snap["labor"] == 0 and snap["nhi"] == 0 else "")
     )
 
-    col_save, col_del = st.columns(2)
-    with col_save:
-        if st.button("💾 儲存", type="primary", key="ins_save"):
-            payload = {
-                "clinic_id": clinic_id,
-                "doctor_id": doctor_id,
-                "insurance_base": insurance_base,
-                "labor_deduction": labor_deduction,
-                "nhi_deduction": nhi_deduction,
-                "effective_from": str(effective_from),
-                "effective_to": str(effective_to) if effective_to else None,
-                "note": note or None,
-            }
+    # key 帶組合 → 切換醫師時表單自動帶入該醫師現行值
+    kb = f"{clinic_id}_{doctor_id}"
+    with col_b:
+        effective_from = st.date_input(
+            "投保異動生效日（實際加/退/調整日，可為月中）",
+            value=today,
+            key=f"ins_from_{kb}",
+        )
+    col_1, col_2, col_3 = st.columns(3)
+    with col_1:
+        insurance_base = st.number_input(
+            "投保額", min_value=0, step=100,
+            value=int(snap["base"]), key=f"ins_base_{kb}",
+        )
+    with col_2:
+        labor_deduction = st.number_input(
+            "勞保扣（未保/退保填 0）", min_value=0, step=10,
+            value=int(snap["labor"]), key=f"ins_labor_{kb}",
+        )
+    with col_3:
+        nhi_deduction = st.number_input(
+            "健保扣（未保/退保填 0）", min_value=0, step=10,
+            value=int(snap["nhi"]), key=f"ins_nhi_{kb}",
+        )
+
+    note = st.text_input("備註（如：加保勞保、勞保退保、調投保額）", key=f"ins_note_{kb}")
+
+    if st.button("💾 登記異動", type="primary", key="ins_save"):
+        payload = {
+            "clinic_id": clinic_id,
+            "doctor_id": doctor_id,
+            "insurance_base": insurance_base,
+            "labor_deduction": labor_deduction,
+            "nhi_deduction": nhi_deduction,
+            "effective_from": str(effective_from),
+            "effective_to": None,
+            "note": note or None,
+        }
+        try:
+            sb.table("doctor_insurance_deductions").upsert(
+                payload, on_conflict="clinic_id,doctor_id,effective_from"
+            ).execute()
+            st.success(
+                f"✅ 已登記 {doctors[doctor_id]}（{clinics[clinic_id]}）"
+                f"{effective_from} 起：投保額 {insurance_base:,}｜"
+                f"勞保 {labor_deduction:,}｜健保 {nhi_deduction:,}"
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"儲存失敗：{e}")
+
+    # ─── 進階：刪除打錯的異動列 ───
+    with st.expander("🗑️ 進階：刪除單筆異動（打錯資料時用）"):
+        st.caption("刪除會讓前一筆異動的狀態延續到下一筆，歷史月份重算會跟著變，請確認再刪。")
+        del_opt = st.selectbox(
+            "選擇異動列",
+            rows,
+            format_func=lambda r: (
+                f"id={r['id']}｜{clinics.get(r['clinic_id'])}／{doctors.get(r['doctor_id'])}"
+                f"｜{str(r.get('effective_from') or '')[:10]} 起"
+                f"｜投保額 {r.get('insurance_base') or 0:,}"
+                f"｜勞 {r.get('labor_deduction') or 0:,}｜健 {r.get('nhi_deduction') or 0:,}"
+            ),
+            key="ins_del_select",
+        ) if rows else None
+        if del_opt is not None and st.button("確認刪除", key="ins_del"):
             try:
-                if is_edit:
-                    sb.table("doctor_insurance_deductions").update(payload).eq("id", sid).execute()
-                    st.success(f"✅ 已更新 id={sid}")
-                else:
-                    sb.table("doctor_insurance_deductions").insert(payload).execute()
-                    st.success("✅ 已新增")
-                st.rerun()
-            except Exception as e:
-                st.error(f"儲存失敗：{e}")
-    with col_del:
-        if is_edit and st.button("🗑️ 刪除", key="ins_del"):
-            try:
-                sb.table("doctor_insurance_deductions").delete().eq("id", sid).execute()
-                st.success(f"✅ 已刪除 id={sid}")
+                sb.table("doctor_insurance_deductions").delete().eq("id", del_opt["id"]).execute()
+                st.success(f"✅ 已刪除 id={del_opt['id']}")
                 st.rerun()
             except Exception as e:
                 st.error(f"刪除失敗：{e}")
