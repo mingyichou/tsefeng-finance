@@ -297,7 +297,9 @@ def svg_line_chart(
 # ════════════════════════════════════════════════════════════
 
 _CSS = """
-* { box-sizing: border-box; }
+* { box-sizing: border-box;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important; }
 @page { size: A4 portrait; margin: 12mm; }
 body { font-family: "Microsoft JhengHei","PingFang TC","Noto Sans TC",
        sans-serif; color:#222; margin:0; padding:16px; font-size:13px; }
@@ -731,7 +733,9 @@ _PARTNER_SETTLE_LABEL = {
 }
 
 _PARTNER_CSS = """
-* { box-sizing:border-box; margin:0; padding:0; }
+* { box-sizing:border-box; margin:0; padding:0;
+    -webkit-print-color-adjust:exact !important;
+    print-color-adjust:exact !important; }
 @page { size:A4 portrait; margin:10mm; }
 body { font-family:"Microsoft JhengHei","PingFang TC","Noto Sans TC",sans-serif;
   background:#f4f4f9; color:#2b2b3a; font-size:13px; padding:24px 12px; }

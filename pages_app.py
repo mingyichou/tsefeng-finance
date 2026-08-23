@@ -4514,16 +4514,19 @@ def generate_doctor_payslip_html(
     .cash-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
     .cash-table th, .cash-table td {
         border: 1.5px solid #6A5ACD; padding: 10px 14px; text-align: center; }
-    .cash-table th { background: #f0eafc; font-size: 15px; }
-    .cash-table td { font-size: 20px; font-weight: bold; }
-    .sign-cell { min-width: 280px; height: 110px; vertical-align: bottom;
-                 text-align: left; }
+    .cash-table th.cash-label { background: #f0eafc; font-size: 15px;
+        width: 130px; }
+    .cash-table td.cash-amt { font-size: 20px; font-weight: bold;
+        width: 220px; white-space: nowrap; }
+    .remit-note { color: #666; font-size: 14px; }
+    .sign-cell { height: 110px; vertical-align: bottom; text-align: left; }
     .sign-label { font-size: 11px; color: #999; font-weight: normal; }
+    /* 強制列印背景色（瀏覽器預設不印背景，這裡覆蓋） */
+    * { -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important; }
     @media print {
         @page { margin: 1.5cm; }
         body { margin: 0; }
-        .total { background: #fff; border: 1px solid #6A5ACD; }
-        .cash-table th { background: #fff; }
     }
     </style>
     """
@@ -4573,19 +4576,25 @@ def generate_doctor_payslip_html(
             html.append(_md_line_to_html(line))
         html.append("</div>")
 
-    # ─── 現金支付版：匯款金額（=投保額）＋現金給付＋簽收欄 ───
+    # ─── 現金支付版：匯款/現金分 2 行（現金先發時只簽現金，匯款走帳簿）───
     if cash_payment and ps:
         remit = int(ps.insurance_base or 0)
         cash = int(ps.take_home) - remit
         cash_style = " style='color:#c0392b'" if cash < 0 else ""
         html.append("<div class='total'>")
         html.append("<h2>💵 給付方式</h2>")
-        html.append("<table class='cash-table'><tr>")
-        html.append("<th>匯款金額</th><th>現金給付</th><th>簽收欄</th></tr><tr>")
-        html.append(f"<td>NT {remit:,} 元</td>")
-        html.append(f"<td{cash_style}>NT {cash:,} 元</td>")
-        html.append("<td class='sign-cell'><span class='sign-label'>簽收</span></td>")
-        html.append("</tr></table>")
+        html.append("<table class='cash-table'>")
+        html.append(
+            "<tr><th class='cash-label'>匯款金額</th>"
+            f"<td class='cash-amt'>NT {remit:,} 元</td>"
+            "<td class='remit-note'>詳見匯款帳簿明細</td></tr>"
+        )
+        html.append(
+            "<tr><th class='cash-label'>現金給付</th>"
+            f"<td class='cash-amt'{cash_style}>NT {cash:,} 元</td>"
+            "<td class='sign-cell'><span class='sign-label'>簽收</span></td></tr>"
+        )
+        html.append("</table>")
         html.append(
             "<div style='color:#777;font-size:12px;margin-top:8px'>"
             "匯款金額＝當月投保額；現金給付＝實領總額 − 匯款金額"
