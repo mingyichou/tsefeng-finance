@@ -4236,6 +4236,19 @@ def page_salary():
             mime="text/html",
             key=f"dl_html_{doctor_id}",
         )
+        # 現金支付版：末尾多 匯款金額(=投保額)/現金給付(=實領−匯款)/簽收欄
+        if ps:
+            html_cash = generate_doctor_payslip_html(
+                comps, ps, cash_lookup, role_label, service_month,
+                cash_payment=True,
+            )
+            st.download_button(
+                f"📄 下載 {doctor_name} 薪資單 HTML-現金支付（開啟後 Ctrl+P 列印乾淨版面）",
+                data=html_cash.encode("utf-8"),
+                file_name=f"薪資單_現金支付_{doctor_name}_{service_month[:7]}.html",
+                mime="text/html",
+                key=f"dl_html_cash_{doctor_id}",
+            )
 
     if selected_doctor == SHOW_ALL:
         st.info(
@@ -4470,11 +4483,18 @@ def _md_line_to_html(line: str) -> str:
 
 
 def generate_doctor_payslip_html(
-    comps, ps, cash_lookup: dict, role_label: dict, service_month: str
+    comps, ps, cash_lookup: dict, role_label: dict, service_month: str,
+    cash_payment: bool = False,
 ) -> str:
-    """產生單一醫師薪資單的完整 HTML（給下載+瀏覽器列印用）"""
+    """產生單一醫師薪資單的完整 HTML（給下載+瀏覽器列印用）。
+
+    cash_payment=True：現金支付版 — 內容同一般版，末尾多
+    「匯款金額（=當月投保額）／現金給付（=實領−匯款）／簽收欄」。
+    """
     doctor_name = comps[0].doctor_name
     title = f"{doctor_name} 薪資單 {service_month[:7]}"
+    if cash_payment:
+        title += "（現金支付）"
 
     css = """
     <style>
@@ -4491,10 +4511,19 @@ def generate_doctor_payslip_html(
     .two-cols { display: flex; gap: 20px; flex-wrap: wrap; }
     .two-cols > div { flex: 1; min-width: 380px; }
     hr { border: none; border-top: 1px dashed #ccc; margin: 12px 0; }
+    .cash-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    .cash-table th, .cash-table td {
+        border: 1.5px solid #6A5ACD; padding: 10px 14px; text-align: center; }
+    .cash-table th { background: #f0eafc; font-size: 15px; }
+    .cash-table td { font-size: 20px; font-weight: bold; }
+    .sign-cell { min-width: 280px; height: 110px; vertical-align: bottom;
+                 text-align: left; }
+    .sign-label { font-size: 11px; color: #999; font-weight: normal; }
     @media print {
         @page { margin: 1.5cm; }
         body { margin: 0; }
         .total { background: #fff; border: 1px solid #6A5ACD; }
+        .cash-table th { background: #fff; }
     }
     </style>
     """
@@ -4542,6 +4571,31 @@ def generate_doctor_payslip_html(
         )
         for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
             html.append(_md_line_to_html(line))
+        html.append("</div>")
+
+    # ─── 現金支付版：匯款金額（=投保額）＋現金給付＋簽收欄 ───
+    if cash_payment and ps:
+        remit = int(ps.insurance_base or 0)
+        cash = int(ps.take_home) - remit
+        cash_style = " style='color:#c0392b'" if cash < 0 else ""
+        html.append("<div class='total'>")
+        html.append("<h2>💵 給付方式</h2>")
+        html.append("<table class='cash-table'><tr>")
+        html.append("<th>匯款金額</th><th>現金給付</th><th>簽收欄</th></tr><tr>")
+        html.append(f"<td>NT {remit:,} 元</td>")
+        html.append(f"<td{cash_style}>NT {cash:,} 元</td>")
+        html.append("<td class='sign-cell'><span class='sign-label'>簽收</span></td>")
+        html.append("</tr></table>")
+        html.append(
+            "<div style='color:#777;font-size:12px;margin-top:8px'>"
+            "匯款金額＝當月投保額；現金給付＝實領總額 − 匯款金額"
+            f"（NT {int(ps.take_home):,} − NT {remit:,}）</div>"
+        )
+        if cash < 0:
+            html.append(
+                "<div style='color:#c0392b;font-size:13px;margin-top:4px'>"
+                "⚠️ 當月實領低於投保額，現金給付為負，請人工確認。</div>"
+            )
         html.append("</div>")
 
     html.append(
