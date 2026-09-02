@@ -20,18 +20,42 @@ def _filter_min_month(months):
 # ─── 計算結果快取（提速；資料指紋變動時自動失效）──────────────
 def _data_version(sb) -> tuple:
     """各上游表筆數組成的輕量指紋；任一表新增/刪除即改變 → 快取自動失效。
-    不快取本函式（須反映當下狀態）；count 查詢便宜。"""
+    不快取本函式（須反映當下狀態）；count 查詢便宜。
+
+    manual_annotation 另做**內容雜湊**：金流備註常被就地修改（UPDATE
+    金額/分類/日期，筆數不變），只算筆數會讓修改後 30 分鐘內看到舊結果
+    （2026-09-02 院長私人帳務改金額不生效的根因）。表小（數十筆），
+    全表雜湊便宜。"""
     def c(t):
         try:
             return (sb.table(t).select("id", count="exact")
                     .limit(1).execute().count or 0)
         except Exception:
             return 0
+
+    def ann_hash():
+        import hashlib
+        import json
+        cols = ("id, entry_date, amount, category, account, form, "
+                "clinic_id, description, gross_amount, cash_salary_deduction")
+        try:
+            rows = sb.table("manual_annotation").select(cols).execute().data
+        except Exception:
+            try:  # v13 migration 未跑
+                rows = sb.table("manual_annotation").select(
+                    "id, entry_date, amount, category, account, form, "
+                    "clinic_id, description"
+                ).execute().data
+            except Exception:
+                return "na"
+        blob = json.dumps(rows, sort_keys=True, ensure_ascii=False,
+                          default=str).encode("utf-8")
+        return hashlib.md5(blob).hexdigest()
     return tuple(c(t) for t in (
-        "bank_transactions", "nhi_payment_notices", "manual_annotation",
+        "bank_transactions", "nhi_payment_notices",
         "manual_entry", "doctor_salary_monthly", "staff_salary_summary",
         "contract_expense", "cash_expense", "check_expense",
-    ))
+    )) + (ann_hash(),)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1048,7 +1072,7 @@ def page_overview():
             f"🚨 有 {len(pl_fz.private_unmatched_items)} 筆「院長私人帳務」"
             "標記**沒配對到任何銀行交易**，該筆金流仍被計入收支！"
             "常見原因：①實際扣款含跨行手續費（如 KEY 3,000,000 實扣 "
-            "3,000,015，差額 ≤30 且同日可自動吸收，其餘須改 KEY 成實扣金額）"
+            "3,000,040，差額 ≤50 且同日可自動吸收，其餘須改 KEY 成實扣金額）"
             "②單筆限額被拆成多筆轉帳（一筆標記只排一筆，須分開 KEY）"
             "③日期/帳戶選錯。請打開下方玉山出入帳明細核對實際金額後修正備註。"
         )
@@ -3151,7 +3175,7 @@ def _section_manual_annotation():
         "填日期＋金額＋帳戶，該筆銀行交易會**完全排除**於月度實帳金流與"
         "月度損益的收入與支出（實帳金流頁有排除明細可核對）。"
         "⚠️ 金額請填**銀行實際扣款/入帳金額**：跨行轉帳手續費併入扣款時"
-        "（同日差 ≤30 元會自動吸收，超過請填實扣額如 3,000,015）；"
+        "（同日差 ≤50 元會自動吸收，超過請填實扣額如 3,000,040）；"
         "拆成多筆轉帳要分開 KEY（一筆標記只排一筆交易）。"
     )
 

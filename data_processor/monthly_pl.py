@@ -445,7 +445,7 @@ def _fetch_cash_ann(sb, account: str, month_start: str, month_end: str,
     return [r for r in rows if not r.get("category")]
 
 
-PRIVATE_FEE_TOLERANCE = 30   # 跨行轉帳手續費（15/30 元）併入扣款的容差
+PRIVATE_FEE_TOLERANCE = 50   # 跨行轉帳手續費（15/30/40 元）併入扣款的容差
 
 
 def _make_private_excluder(sb, account: str, month_start: str, month_end: str):
@@ -457,8 +457,8 @@ def _make_private_excluder(sb, account: str, month_start: str, month_end: str):
     比對順序（每筆備註只消耗一次，避免同額多筆交易被同一備註全排掉）：
       1. (entry_date, |amount|) 精準
       2. 金額唯一（容日期差幾天）
-      3. 同日 + 金額差 ≤ 30（吸收跨行轉帳手續費併入扣款，如
-         KEY 3,000,000 實扣 3,000,015）
+      3. 同日 + 金額差 ≤ 50（吸收跨行轉帳手續費 15/30/40 併入扣款，
+         如 KEY 3,000,000 實扣 3,000,040）
     form 有填（轉入/存現=入、轉出/領現=出）時方向必須相符。
 
     Returns:
