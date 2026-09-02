@@ -67,6 +67,7 @@ from .monthly_pl import (
     _cash_ann_amounts,
     _extract_attr_month_from_desc,
     _fetch_cash_ann,
+    _make_private_excluder,
 )
 
 
@@ -951,8 +952,11 @@ def _compute_expense(
         })
 
     if is_zefeng:
-        # 澤豐：N 月玉山 outflow 排除（院長個人 + 薪資轉帳）
+        # 澤豐：N 月玉山 outflow 排除（院長個人 + 薪資轉帳 + 🔴私人帳務標記）
         if esun_id:
+            is_private = _make_private_excluder(
+                sb, "澤豐玉山", sm, next_m,
+            )
             for tx in _fetch_bank_tx(sb, esun_id, sm):
                 amt = tx.get("amount") or 0
                 if amt >= 0:
@@ -961,6 +965,8 @@ def _compute_expense(
                 cp = tx.get("counterparty") or ""
                 if _is_zhou_personal(cp, zhou_accounts):
                     continue
+                if is_private(tx) is not None:
+                    continue  # 🔴 院長私人帳務（手 KEY 標記）排除
                 if any(k in summary for k in SALARY_SUMMARY_KEYWORDS):
                     continue
                 pl.other_expense_items.append({
@@ -990,14 +996,19 @@ def _compute_expense(
                     "amount": -int(amt),
                     "source": "澤沛中信其他支出",
                 })
-        # 澤沛玉山 outflow 排除薪資（已歸 H）
+        # 澤沛玉山 outflow 排除薪資（已歸 H）+ 🔴私人帳務標記
         if esun_id:
+            is_private = _make_private_excluder(
+                sb, "澤沛玉山", sm, next_m,
+            )
             for tx in _fetch_bank_tx(sb, esun_id, sm):
                 amt = tx.get("amount") or 0
                 if amt >= 0:
                     continue
                 summary = tx.get("summary") or ""
                 if any(k in summary for k in SALARY_SUMMARY_KEYWORDS):
+                    continue
+                if is_private(tx) is not None:
                     continue
                 pl.other_expense_items.append({
                     "transaction_date": tx.get("transaction_date"),

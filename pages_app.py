@@ -1043,6 +1043,20 @@ def page_overview():
                 "存入銀行前先扣的醫師薪資列此為支出（淨額 = 實際存入）。"
             )
             _show_items(pl_fz.x14_items)
+    if getattr(pl_fz, "private_excluded_items", None):
+        with st.expander(
+            f"🔴 院長私人帳務排除明細"
+            f"（{len(pl_fz.private_excluded_items)} 筆，不入收入/支出）"
+        ):
+            st.caption(
+                "手 KEY「院長私人帳務」標記命中的銀行交易，"
+                "已完全排除於實帳金流與損益分析。"
+            )
+            _show_items(
+                pl_fz.private_excluded_items,
+                ["transaction_date", "summary", "counterparty",
+                 "direction", "amount", "private_note"],
+            )
 
     # ════════════════════════════════════════════════════════
     # 2. 澤沛中醫診所實帳收支
@@ -1106,6 +1120,20 @@ def page_overview():
                 "存入銀行前先扣的醫師薪資列此為支出（淨額 = 實際存入）。"
             )
             _show_items(pl_fp.cash_salary_pay_items)
+    if getattr(pl_fp, "private_excluded_items", None):
+        with st.expander(
+            f"🔴 院長私人帳務排除明細"
+            f"（{len(pl_fp.private_excluded_items)} 筆，不入收入/支出）"
+        ):
+            st.caption(
+                "手 KEY「院長私人帳務」標記命中的銀行交易，"
+                "已完全排除於實帳金流與損益分析。"
+            )
+            _show_items(
+                pl_fp.private_excluded_items,
+                ["transaction_date", "summary", "counterparty",
+                 "direction", "amount", "private_note"],
+            )
 
     if pl_fp.esun_outflow_items:
         with st.expander(f"📑 玉山出帳明細（{len(pl_fp.esun_outflow_items)} 筆）"):
@@ -2943,6 +2971,7 @@ _ANN_CATEGORY_LABELS = {
     None: "金流備註",
     "memo_only": "🟡 只記帳（不影響金流，只進月度損益分析）",
     "capital_injection": "🔴 股東注資（排除於月度損益分析收入）",
+    "director_personal": "🔴 院長私人帳務（排除於實帳金流與損益的收入與支出）",
 }
 _ANN_CATEGORY_OPTIONS = list(_ANN_CATEGORY_LABELS.values())
 _ANN_CATEGORY_BY_LABEL = {v: k for k, v in _ANN_CATEGORY_LABELS.items()}
@@ -3090,7 +3119,10 @@ def _section_manual_annotation():
         "💡 **分類**：\n"
         "- **金流備註** — 預設值，會影響金流辨識（如澤豐現金入帳的對應說明）。\n"
         "- **只記帳** — 不參與任何金流核對，只在「月度損益分析」獨立統計（例：傳統整復推拿收入）。\n"
-        "- **股東注資** — 對應澤沛中信實際入帳，但不算經營收入；在「月度損益分析」收入欄會被排除。"
+        "- **股東注資** — 對應澤沛中信實際入帳，但不算經營收入；在「月度損益分析」收入欄會被排除。\n"
+        "- **院長私人帳務** — 診所帳戶（如澤豐玉山）裡發生的院長私人進出；"
+        "填日期＋金額＋帳戶，該筆銀行交易會**完全排除**於月度實帳金流與"
+        "月度損益的收入與支出（實帳金流頁有排除明細可核對）。"
     )
 
     if st.session_state.pop("_ann_just_saved", None):
@@ -3119,7 +3151,8 @@ def _section_manual_annotation():
         df["診所"] = df["clinic_id"].map(cid_to_short).fillna("—")
         if "category" in df.columns:
             df["分類"] = df["category"].map(
-                {"memo_only": "🟡 只記帳", "capital_injection": "🔴 股東注資"}
+                {"memo_only": "🟡 只記帳", "capital_injection": "🔴 股東注資",
+                 "director_personal": "🔴 院長私人帳務"}
             ).fillna("金流備註")
         else:
             df["分類"] = "金流備註"

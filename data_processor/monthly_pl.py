@@ -173,6 +173,8 @@ class ZepeiMonthly:
     x5_detail_items: list = field(default_factory=list)
     # 醫師薪資現金給付（v13：現金收入記 gross、存入前先扣的給薪額 → 隱形支出）
     cash_salary_pay_items: list = field(default_factory=list)
+    # 🔴 院長私人帳務排除明細（診斷顯示用，不入合計）
+    private_excluded_items: list = field(default_factory=list)
 
     @property
     def cash_salary_pay_total(self) -> int:
@@ -286,6 +288,9 @@ class ZefengMonthly:
     # 手 KEY x10
     x10_income_items: list = field(default_factory=list)
     x10_expense_items: list = field(default_factory=list)
+
+    # 🔴 院長私人帳務排除明細（診斷顯示用，不入合計）
+    private_excluded_items: list = field(default_factory=list)
 
     @property
     def esun_inflow_total(self) -> int:
@@ -436,6 +441,45 @@ def _fetch_cash_ann(sb, account: str, month_start: str, month_end: str,
     return [r for r in rows if not r.get("category")]
 
 
+def _make_private_excluder(sb, account: str, month_start: str, month_end: str):
+    """category='director_personal'（🔴 院長私人帳務）排除器。
+
+    院長手 KEY 標記帳戶裡的私人進出（form 不拘），符合的銀行交易
+    完全排除於實帳金流與損益分析的收入與支出。
+    比對 (entry_date, |amount|) 精準優先；同月金額唯一時也接受（退路，
+    包容 entry_date 與實際交易日差幾天）。
+
+    Returns:
+        excluded(tx) -> dict | None：命中回傳該備註列，未命中回 None。
+    """
+    try:
+        rows = (
+            sb.table("manual_annotation")
+            .select("entry_date, amount, description, form")
+            .eq("category", "director_personal").eq("account", account)
+            .gte("entry_date", month_start).lt("entry_date", month_end)
+            .execute().data
+        )
+    except Exception:
+        rows = []
+    by_key = {(r["entry_date"], int(r["amount"] or 0)): r for r in rows}
+    by_amt: dict[int, list] = {}
+    for r in rows:
+        by_amt.setdefault(int(r["amount"] or 0), []).append(r)
+
+    def excluded(tx: dict) -> dict | None:
+        amt = abs(int(tx.get("amount") or 0))
+        hit = by_key.get((tx.get("transaction_date"), amt))
+        if hit is not None:
+            return hit
+        cands = by_amt.get(amt, [])
+        if len(cands) == 1:
+            return cands[0]
+        return None
+
+    return excluded
+
+
 def _cash_ann_amounts(ann: dict) -> tuple[int, int]:
     """回傳 (記帳收入 gross, 現金給薪扣除)。舊式備註 gross=amount、扣除=0。"""
     gross = int(ann.get("gross_amount") or 0)
@@ -458,9 +502,19 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
     # ─── 玉山健保戶：每筆都記 ───
     esun_id = _get_bank_account_id(sb, clinic_id, "健保戶")
     if esun_id:
+        is_private = _make_private_excluder(
+            sb, "澤沛玉山", service_month, next_month,
+        )
         for tx in _fetch_bank_transactions(sb, esun_id, service_month):
             amt = tx["amount"]
             item = _bank_item(tx, attribution_month=service_month)
+            hit = is_private(tx)
+            if hit is not None:
+                item["amount"] = abs(item["amount"])
+                item["direction"] = "入" if amt > 0 else "出"
+                item["private_note"] = hit.get("description") or ""
+                m.private_excluded_items.append(item)
+                continue
             if amt > 0:
                 m.esun_inflow_items.append(item)
             elif amt < 0:
@@ -496,12 +550,22 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
         for r in ann_cash:
             ann_by_amt.setdefault(int(r["amount"] or 0), []).append(r)
 
+        is_private_ctbc = _make_private_excluder(
+            sb, "澤沛中信", service_month, next_month,
+        )
         for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
             amt = tx["amount"]
             note = tx.get("note") or ""
             kind = _zepei_settle_kind(note) if amt < 0 else None
             attr = prev_m if kind else service_month
             item = _bank_item(tx, attribution_month=attr, settle_kind=kind)
+            hit = is_private_ctbc(tx)
+            if hit is not None:
+                item["amount"] = abs(item["amount"])
+                item["direction"] = "入" if amt > 0 else "出"
+                item["private_note"] = hit.get("description") or ""
+                m.private_excluded_items.append(item)
+                continue
             if amt > 0:
                 if (tx.get("transaction_date"), int(amt)) in cap_keys:
                     continue  # 股東注資排除（不計入收入）
@@ -608,6 +672,11 @@ def calculate_zefeng_monthly(
     zhou_accounts = _read_zhou_accounts(sb)
     esun_id = _get_bank_account_id(sb, clinic_id, "健保戶")
     if esun_id:
+        # 🔴 院長私人帳務（manual_annotation category='director_personal'）
+        # 手 KEY 標記的私人進出 → 收入/支出都排除
+        is_private = _make_private_excluder(
+            sb, "澤豐玉山", service_month, next_month,
+        )
         for tx in _fetch_bank_transactions(sb, esun_id, service_month):
             amt = tx["amount"]
             cp = tx.get("counterparty") or ""
@@ -617,6 +686,13 @@ def calculate_zefeng_monthly(
                     or _is_zefeng_ctbc_internal(cp)):
                 continue
             item = _bank_item(tx, attribution_month=service_month)
+            hit = is_private(tx)
+            if hit is not None:
+                item["amount"] = abs(item["amount"])
+                item["direction"] = "入" if amt > 0 else "出"
+                item["private_note"] = hit.get("description") or ""
+                m.private_excluded_items.append(item)
+                continue
             if amt > 0:
                 m.esun_inflow_items.append(item)
             elif amt < 0:
