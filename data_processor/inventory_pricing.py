@@ -70,7 +70,8 @@ ALIAS_GROUPS: list[list[str]] = [
     ["健步虎潛丸(藥丸)", "健步虎潛丸-藥丸"],
     ["右歸丸(藥丸)", "右歸丸-藥丸"],
     ["加味逍遙丸(藥丸)", "加味逍遙丸-藥丸"],
-    # 自費 EPA 魚油
+    # 自費 EPA 魚油（一般版與 mini 版是不同商品，分兩群組）
+    ["EPA魚油", "EPA90魚油"],   # 院長 2026-09-03：調貨「EPA魚油」↔ 價目表「EPA90魚油」
     [
         "魚油mini", "EPA魚油mini", "EPA魚油MINI",
         "EPA90魚油MINI", "EPA90魚油mini",
@@ -138,10 +139,14 @@ ALIAS_GROUPS: list[list[str]] = [
 
 
 def _norm(s: str | None) -> str:
-    """NFKC 正規化 + 去前後空白；用於比對 key。"""
+    """NFKC 正規化 + 去前後空白 + casefold；用於比對 key。
+
+    casefold 讓英文大小寫不影響比對（EPA/epa、mini/Mini/MINI），
+    索引建立與查詢兩側都經過本函式，兩側一致。
+    """
     if not s:
         return ""
-    return unicodedata.normalize("NFKC", str(s)).strip()
+    return unicodedata.normalize("NFKC", str(s)).strip().casefold()
 
 
 # ─── 水藥包辨識（院長 2026-06-03）────────────────────────
