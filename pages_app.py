@@ -1043,6 +1043,21 @@ def page_overview():
                 "存入銀行前先扣的醫師薪資列此為支出（淨額 = 實際存入）。"
             )
             _show_items(pl_fz.x14_items)
+    if getattr(pl_fz, "private_unmatched_items", None):
+        st.error(
+            f"🚨 有 {len(pl_fz.private_unmatched_items)} 筆「院長私人帳務」"
+            "標記**沒配對到任何銀行交易**，該筆金流仍被計入收支！"
+            "常見原因：①實際扣款含跨行手續費（如 KEY 3,000,000 實扣 "
+            "3,000,015，差額 ≤30 且同日可自動吸收，其餘須改 KEY 成實扣金額）"
+            "②單筆限額被拆成多筆轉帳（一筆標記只排一筆，須分開 KEY）"
+            "③日期/帳戶選錯。請打開下方玉山出入帳明細核對實際金額後修正備註。"
+        )
+        st.dataframe(pd.DataFrame([
+            {"日期": r.get("entry_date"), "形式": r.get("form"),
+             "金額": r.get("amount"), "帳戶": r.get("account"),
+             "備註": r.get("description")}
+            for r in pl_fz.private_unmatched_items
+        ]), use_container_width=True, hide_index=True)
     if getattr(pl_fz, "private_excluded_items", None):
         with st.expander(
             f"🔴 院長私人帳務排除明細"
@@ -1120,6 +1135,18 @@ def page_overview():
                 "存入銀行前先扣的醫師薪資列此為支出（淨額 = 實際存入）。"
             )
             _show_items(pl_fp.cash_salary_pay_items)
+    if getattr(pl_fp, "private_unmatched_items", None):
+        st.error(
+            f"🚨 有 {len(pl_fp.private_unmatched_items)} 筆「院長私人帳務」"
+            "標記沒配對到任何銀行交易，該筆金流仍被計入收支！"
+            "請核對實際扣款金額（含手續費）、日期與帳戶後修正備註。"
+        )
+        st.dataframe(pd.DataFrame([
+            {"日期": r.get("entry_date"), "形式": r.get("form"),
+             "金額": r.get("amount"), "帳戶": r.get("account"),
+             "備註": r.get("description")}
+            for r in pl_fp.private_unmatched_items
+        ]), use_container_width=True, hide_index=True)
     if getattr(pl_fp, "private_excluded_items", None):
         with st.expander(
             f"🔴 院長私人帳務排除明細"
@@ -3123,6 +3150,9 @@ def _section_manual_annotation():
         "- **院長私人帳務** — 診所帳戶（如澤豐玉山）裡發生的院長私人進出；"
         "填日期＋金額＋帳戶，該筆銀行交易會**完全排除**於月度實帳金流與"
         "月度損益的收入與支出（實帳金流頁有排除明細可核對）。"
+        "⚠️ 金額請填**銀行實際扣款/入帳金額**：跨行轉帳手續費併入扣款時"
+        "（同日差 ≤30 元會自動吸收，超過請填實扣額如 3,000,015）；"
+        "拆成多筆轉帳要分開 KEY（一筆標記只排一筆交易）。"
     )
 
     if st.session_state.pop("_ann_just_saved", None):

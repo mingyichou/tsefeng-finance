@@ -175,6 +175,8 @@ class ZepeiMonthly:
     cash_salary_pay_items: list = field(default_factory=list)
     # 🔴 院長私人帳務排除明細（診斷顯示用，不入合計）
     private_excluded_items: list = field(default_factory=list)
+    # 🔴 標記了但沒配對到任何交易的備註（UI 警示用）
+    private_unmatched_items: list = field(default_factory=list)
 
     @property
     def cash_salary_pay_total(self) -> int:
@@ -291,6 +293,8 @@ class ZefengMonthly:
 
     # 🔴 院長私人帳務排除明細（診斷顯示用，不入合計）
     private_excluded_items: list = field(default_factory=list)
+    # 🔴 標記了但沒配對到任何交易的備註（UI 警示用）
+    private_unmatched_items: list = field(default_factory=list)
 
     @property
     def esun_inflow_total(self) -> int:
@@ -441,42 +445,78 @@ def _fetch_cash_ann(sb, account: str, month_start: str, month_end: str,
     return [r for r in rows if not r.get("category")]
 
 
+PRIVATE_FEE_TOLERANCE = 30   # 跨行轉帳手續費（15/30 元）併入扣款的容差
+
+
 def _make_private_excluder(sb, account: str, month_start: str, month_end: str):
     """category='director_personal'（🔴 院長私人帳務）排除器。
 
-    院長手 KEY 標記帳戶裡的私人進出（form 不拘），符合的銀行交易
-    完全排除於實帳金流與損益分析的收入與支出。
-    比對 (entry_date, |amount|) 精準優先；同月金額唯一時也接受（退路，
-    包容 entry_date 與實際交易日差幾天）。
+    院長手 KEY 標記帳戶裡的私人進出，符合的銀行交易完全排除於
+    實帳金流與損益分析的收入與支出。
+
+    比對順序（每筆備註只消耗一次，避免同額多筆交易被同一備註全排掉）：
+      1. (entry_date, |amount|) 精準
+      2. 金額唯一（容日期差幾天）
+      3. 同日 + 金額差 ≤ 30（吸收跨行轉帳手續費併入扣款，如
+         KEY 3,000,000 實扣 3,000,015）
+    form 有填（轉入/存現=入、轉出/領現=出）時方向必須相符。
 
     Returns:
         excluded(tx) -> dict | None：命中回傳該備註列，未命中回 None。
+        excluded.unmatched() -> list[dict]：跑完所有交易後仍未配對的備註
+        （供 UI 警示——通常是金額含手續費不符或被拆成多筆轉帳）。
     """
     try:
         rows = (
             sb.table("manual_annotation")
-            .select("entry_date, amount, description, form")
+            .select("id, entry_date, amount, description, form")
             .eq("category", "director_personal").eq("account", account)
             .gte("entry_date", month_start).lt("entry_date", month_end)
             .execute().data
         )
     except Exception:
         rows = []
-    by_key = {(r["entry_date"], int(r["amount"] or 0)): r for r in rows}
-    by_amt: dict[int, list] = {}
-    for r in rows:
-        by_amt.setdefault(int(r["amount"] or 0), []).append(r)
+    used: set[int] = set()
+
+    def _dir_ok(r: dict, tx_amount: int) -> bool:
+        form = r.get("form") or ""
+        if form in ("轉入", "存現"):
+            return tx_amount > 0
+        if form in ("轉出", "領現"):
+            return tx_amount < 0
+        return True
 
     def excluded(tx: dict) -> dict | None:
-        amt = abs(int(tx.get("amount") or 0))
-        hit = by_key.get((tx.get("transaction_date"), amt))
-        if hit is not None:
-            return hit
-        cands = by_amt.get(amt, [])
+        raw = int(tx.get("amount") or 0)
+        amt = abs(raw)
+        tx_date = tx.get("transaction_date")
+        avail = [r for r in rows
+                 if id(r) not in used and _dir_ok(r, raw)]
+        # 1. 精準 (日期+金額)
+        for r in avail:
+            if r["entry_date"] == tx_date and int(r["amount"] or 0) == amt:
+                used.add(id(r))
+                return r
+        # 2. 金額唯一（容日期差）
+        cands = [r for r in avail if int(r["amount"] or 0) == amt]
         if len(cands) == 1:
+            used.add(id(cands[0]))
+            return cands[0]
+        # 3. 同日 + 手續費容差
+        cands = [
+            r for r in avail
+            if r["entry_date"] == tx_date
+            and abs(int(r["amount"] or 0) - amt) <= PRIVATE_FEE_TOLERANCE
+        ]
+        if len(cands) == 1:
+            used.add(id(cands[0]))
             return cands[0]
         return None
 
+    def unmatched() -> list[dict]:
+        return [r for r in rows if id(r) not in used]
+
+    excluded.unmatched = unmatched
     return excluded
 
 
@@ -520,6 +560,9 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             elif amt < 0:
                 item["amount"] = -amt
                 m.esun_outflow_items.append(item)
+        m.private_unmatched_items.extend(
+            {**r, "account": "澤沛玉山"} for r in is_private.unmatched()
+        )
 
     # ─── 中信進出戶：每筆都記，出帳時標註 settle_kind ───
     ctbc_id = _get_bank_account_id(sb, clinic_id, "進出戶")
@@ -603,6 +646,9 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             elif amt < 0:
                 item["amount"] = -amt
                 m.ctbc_outflow_items.append(item)
+        m.private_unmatched_items.extend(
+            {**r, "account": "澤沛中信"} for r in is_private_ctbc.unmatched()
+        )
 
     # ─── 手 KEY x10 ───
     me_in = (
@@ -698,6 +744,9 @@ def calculate_zefeng_monthly(
             elif amt < 0:
                 item["amount"] = -amt
                 m.esun_outflow_items.append(item)
+        m.private_unmatched_items.extend(
+            {**r, "account": "澤豐玉山"} for r in is_private.unmatched()
+        )
 
     # ─── 中信進出戶（混戶）：只抓 x6 / x8 ───
     ctbc_id = _get_bank_account_id(sb, clinic_id, "進出戶")
