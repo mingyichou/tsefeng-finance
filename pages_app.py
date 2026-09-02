@@ -1009,6 +1009,7 @@ def page_overview():
         {"項目": "x10 手 KEY 支出", "小計": pl_fz.x10_expense_total, "歸屬": "本月"},
         {"項目": "x12 澤豐合約支出", "小計": pl_fz.x12_zefeng_contract_expense, "歸屬": "本月"},
         {"項目": "x13 周院長薪資（兩院總和）", "小計": pl_fz.x13_zhou_doctor_salary, "歸屬": "前月"},
+        {"項目": "x14 醫師薪資現金給付", "小計": getattr(pl_fz, "x14_cash_salary_pay", 0), "歸屬": "前月"},
     ])
     st.dataframe(fz_ex_summary, use_container_width=True, hide_index=True)
 
@@ -1033,6 +1034,15 @@ def page_overview():
     if pl_fz.x13_items:
         with st.expander("📑 x13 周院長薪資明細（歸屬前月）"):
             _show_items(pl_fz.x13_items)
+    if getattr(pl_fz, "x14_items", None):
+        with st.expander(
+            f"📑 x14 醫師薪資現金給付明細（{len(pl_fz.x14_items)} 筆）"
+        ):
+            st.caption(
+                "來自罐頭「澤豐現金收入」的現金給薪扣除：現金收入記總額、"
+                "存入銀行前先扣的醫師薪資列此為支出（淨額 = 實際存入）。"
+            )
+            _show_items(pl_fz.x14_items)
 
     # ════════════════════════════════════════════════════════
     # 2. 澤沛中醫診所實帳收支
@@ -1083,9 +1093,19 @@ def page_overview():
         {"項目": "　└ x6 豐沛金流（→澤豐）", "小計": pl_fp.fengpei_outflow, "歸屬": "前月"},
         {"項目": "　└ x7 合約結算（→周院長）", "小計": pl_fp.contract_settle_outflow, "歸屬": "前月"},
         {"項目": "x10 手 KEY 支出", "小計": pl_fp.x10_expense_total, "歸屬": "本月"},
+        {"項目": "醫師薪資現金給付", "小計": getattr(pl_fp, "cash_salary_pay_total", 0), "歸屬": "前月"},
     ])
     st.dataframe(fp_ex_summary, use_container_width=True, hide_index=True)
     st.caption("ℹ️ x5 / x6 / x7 已包含於「中信逐筆出帳」中，分類項僅供識別不重複加總。")
+    if getattr(pl_fp, "cash_salary_pay_items", None):
+        with st.expander(
+            f"📑 醫師薪資現金給付明細（{len(pl_fp.cash_salary_pay_items)} 筆）"
+        ):
+            st.caption(
+                "來自罐頭「澤沛現金收入」的現金給薪扣除：現金收入記總額、"
+                "存入銀行前先扣的醫師薪資列此為支出（淨額 = 實際存入）。"
+            )
+            _show_items(pl_fp.cash_salary_pay_items)
 
     if pl_fp.esun_outflow_items:
         with st.expander(f"📑 玉山出帳明細（{len(pl_fp.esun_outflow_items)} 筆）"):
@@ -1456,9 +1476,14 @@ def _render_pl_table(by_clinic_month: dict, clinic_short: str,
     # === 支出面 ===
     def _doctor_salary_cell(p):
         miss = getattr(p, "doctor_salary_missing", None) or []
+        csc = getattr(p, "cash_salary_check", None)
+        flags = ""
         if miss:
-            names = "、".join(m["doctor"] for m in miss)
-            return f"{_fmt_amt(p.h_doctor)} ⚠️缺{names}"
+            flags += " ⚠️缺" + "、".join(m["doctor"] for m in miss)
+        if csc and not csc.get("ok"):
+            flags += " 🚨現金給薪異常"
+        if flags:
+            return f"{_fmt_amt(p.h_doctor)}{flags}"
         return p.h_doctor
 
     _row("H 醫師薪資", _doctor_salary_cell, section="支出")
@@ -1594,9 +1619,24 @@ def _render_pl_breakdown(by_clinic_month: dict, clinic_short: str,
                 for m in miss
             )
             st.warning(
-                f"⚠️ H 醫師薪資缺漏：{lines}。"
+                f"⚠️ H 醫師薪資缺漏（數據異常）：{lines}。"
                 "該筆薪轉（若存在）暫列於護理師&助理薪資。"
             )
+
+        csc = getattr(pl, "cash_salary_check", None)
+        if csc:
+            if csc.get("ok"):
+                st.success(
+                    f"✅ 現金給薪核對一致：手 KEY 扣除 {csc['keyed']:,} = "
+                    f"系統計算領現合計 {csc['computed']:,}"
+                )
+            else:
+                st.error(
+                    f"🚨 現金給薪數據異常：手 KEY「現金給薪扣除」"
+                    f"{csc['keyed']:,} ≠ 系統計算領現合計 {csc['computed']:,}"
+                    f"（差 {csc['keyed'] - csc['computed']:+,}）。"
+                    "請核對罐頭輸入金額與醫師薪資計算。"
+                )
 
         sections = [
             ("H 醫師薪資", pl.doctor_salary_items),
@@ -2900,12 +2940,144 @@ def _section_staff_salary():
 
 
 _ANN_CATEGORY_LABELS = {
-    None: "純備註（影響金流辨識）",
+    None: "金流備註",
     "memo_only": "🟡 只記帳（不影響金流，只進月度損益分析）",
     "capital_injection": "🔴 股東注資（排除於月度損益分析收入）",
 }
 _ANN_CATEGORY_OPTIONS = list(_ANN_CATEGORY_LABELS.values())
 _ANN_CATEGORY_BY_LABEL = {v: k for k, v in _ANN_CATEGORY_LABELS.items()}
+
+
+def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
+    """金流補充備註 — 每月罐頭快速輸入（選月份＋填數字即存檔）。
+
+    3 個模板：
+      1. 傳統整復推拿收入 — 澤豐/中信/存現/只記帳（memo_only）
+      2. 澤豐現金收入 — 金流備註 + 現金給薪扣除（v13）
+      3. 澤沛現金收入 — 金流備註 + 現金給薪扣除（v13）
+    現金收入模板：amount=實際存入(收入−給薪扣除) 供銀行對帳；
+    gross_amount/cash_salary_deduction 供實帳與損益記帳。
+    entry_date=收入次月 1 日（現金慣例次月初存入，配對走同月金額比對）。
+    同月重存 = 覆蓋更新既有那筆。
+    """
+    from datetime import date as _date
+
+    st.markdown("**⚡ 每月罐頭快速輸入**")
+
+    # 月份選項：近 14 個「收入月份」（預設上個月）
+    today = _date.today()
+    cur = today.replace(day=1)
+    months: list[str] = []
+    for _ in range(14):
+        months.append(cur.isoformat())
+        cur = (cur - pd.Timedelta(days=1)).replace(day=1)
+
+    def _fmt_m(iso: str) -> str:
+        y, m = int(iso[:4]), int(iso[5:7])
+        return f"{y - 1911}年{m}月（{iso[:7]}）"
+
+    def _next_month_first(iso: str) -> str:
+        d = _date.fromisoformat(iso)
+        return (_date(d.year + 1, 1, 1) if d.month == 12
+                else _date(d.year, d.month + 1, 1)).isoformat()
+
+    def _save(payload: dict, desc_prefix: str, ok_msg: str):
+        """依 description 前綴找同月既有列 → update；否則 insert。"""
+        exist = next(
+            (r for r in rows
+             if (r.get("description") or "").startswith(desc_prefix)),
+            None,
+        )
+        try:
+            if exist:
+                sb.table("manual_annotation").update(payload).eq(
+                    "id", exist["id"]).execute()
+            else:
+                sb.table("manual_annotation").insert(payload).execute()
+            st.session_state["_ann_just_saved"] = True
+            st.rerun()
+        except Exception as e:
+            if "gross_amount" in str(e) or "cash_salary_deduction" in str(e):
+                st.error(
+                    "儲存失敗：資料庫缺 v13 欄位。"
+                    "請先到 Supabase SQL Editor 執行 migration_v12_to_v13.sql。"
+                )
+            else:
+                st.error(f"儲存失敗：{e}")
+
+    tab_ma, tab_fz, tab_fp = st.tabs(
+        ["🙌 傳統整復推拿收入", "💰 澤豐現金收入", "💰 澤沛現金收入"]
+    )
+
+    with tab_ma:
+        st.caption("澤豐｜中信｜存現｜🟡 只記帳（僅進月度損益分析，不參與金流核對）")
+        col1, col2 = st.columns(2)
+        with col1:
+            m_ma = st.selectbox("收入月份", months, format_func=_fmt_m, index=1,
+                                key="annq_ma_month")
+        with col2:
+            amt_ma = st.number_input("金額", min_value=0, step=1000,
+                                     key="annq_ma_amt")
+        if st.button("💾 存檔", type="primary", key="annq_ma_save"):
+            if amt_ma <= 0:
+                st.error("金額必須 > 0")
+            else:
+                mo = int(m_ma[5:7])
+                desc = f"澤豐{mo}月傳統整復推拿收入"
+                _save({
+                    "entry_date": m_ma, "scope": "診所",
+                    "clinic_id": short_to_cid.get("澤豐"),
+                    "form": "存現", "amount": int(amt_ma),
+                    "account": "澤豐&個人中信", "description": desc,
+                    "category": "memo_only",
+                }, desc, "已存傳統整復推拿收入")
+
+    def _cash_income_tab(clinic_short: str, account: str, key_prefix: str):
+        st.caption(
+            f"{clinic_short}｜中信｜存現｜金流備註。"
+            "**現金收入**＝該月記帳總額；**現金給薪扣除**＝以現金支付的醫師薪資；"
+            "實際存入銀行＝現金收入 − 現金給薪扣除（系統以此對帳）。"
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            m_sel = st.selectbox("收入月份", months, format_func=_fmt_m, index=1,
+                                 key=f"annq_{key_prefix}_month")
+        with col2:
+            gross = st.number_input("現金收入", min_value=0, step=1000,
+                                    key=f"annq_{key_prefix}_gross")
+        with col3:
+            deduct = st.number_input("現金給薪扣除", min_value=0, step=100,
+                                     key=f"annq_{key_prefix}_deduct")
+        deposit = int(gross) - int(deduct)
+        if gross > 0:
+            st.info(f"實際存入銀行核對金額：**NT {deposit:,}** "
+                    f"（{int(gross):,} − {int(deduct):,}）")
+        if st.button("💾 存檔", type="primary", key=f"annq_{key_prefix}_save"):
+            if gross <= 0:
+                st.error("現金收入必須 > 0")
+            elif deduct > gross:
+                st.error("現金給薪扣除不可大於現金收入")
+            else:
+                mo = int(m_sel[5:7])
+                desc_prefix = f"{clinic_short}{mo}月現金收入"
+                desc = (f"{desc_prefix}{int(gross):,}，"
+                        f"現金給薪扣除{int(deduct):,}")
+                _save({
+                    "entry_date": _next_month_first(m_sel), "scope": "診所",
+                    "clinic_id": short_to_cid.get(clinic_short),
+                    "form": "存現", "amount": deposit,
+                    "gross_amount": int(gross),
+                    "cash_salary_deduction": int(deduct),
+                    "account": account, "description": desc,
+                    "category": None,
+                }, desc_prefix, "已存現金收入")
+
+    with tab_fz:
+        _cash_income_tab("澤豐", "澤豐&個人中信", "fz")
+    with tab_fp:
+        _cash_income_tab("澤沛", "澤沛中信", "fp")
+
+    st.divider()
 
 
 def _section_manual_annotation():
@@ -2916,7 +3088,7 @@ def _section_manual_annotation():
         "例：某筆轉帳實際是「個人借款還款」、某筆存現是「投資收益」。"
         "可隨時查詢/修改/刪除。\n\n"
         "💡 **分類**：\n"
-        "- **純備註** — 預設值，會影響金流辨識（如澤豐現金入帳的對應說明）。\n"
+        "- **金流備註** — 預設值，會影響金流辨識（如澤豐現金入帳的對應說明）。\n"
         "- **只記帳** — 不參與任何金流核對，只在「月度損益分析」獨立統計（例：傳統整復推拿收入）。\n"
         "- **股東注資** — 對應澤沛中信實際入帳，但不算經營收入；在「月度損益分析」收入欄會被排除。"
     )
@@ -2948,9 +3120,9 @@ def _section_manual_annotation():
         if "category" in df.columns:
             df["分類"] = df["category"].map(
                 {"memo_only": "🟡 只記帳", "capital_injection": "🔴 股東注資"}
-            ).fillna("純備註")
+            ).fillna("金流備註")
         else:
-            df["分類"] = "純備註"
+            df["分類"] = "金流備註"
         cols = ["id", "entry_date", "分類", "scope", "form", "account",
                 "amount", "診所", "description"]
         present = [c for c in cols if c in df.columns]
@@ -2962,6 +3134,8 @@ def _section_manual_annotation():
     if not st.session_state.get("edit_mode"):
         st.info("⚠️ 唯讀模式。如需新增/修改/刪除，請啟用左下「編輯模式」。")
         return
+
+    _ann_quick_templates(sb, rows, short_to_cid)
 
     st.markdown("**新增 / 修改 / 刪除：**")
     edit_options = ["（新增）"] + [
@@ -4531,6 +4705,25 @@ def generate_doctor_payslip_html(
     </style>
     """
 
+    # 現金支付版金額（v13 公式，院長 2026-09 裁定）：
+    #   匯款金額 = 投保額 − 勞保扣 − 健保扣（玉山轉帳）
+    #   現金給付 = 實領總額 − 匯款金額（由前月現金收入支付）
+    remit = cash = 0
+    cash_formula_lines: list[str] = []
+    if cash_payment and ps:
+        remit = max(
+            int(ps.insurance_base or 0)
+            - int(ps.labor_deduction or 0) - int(ps.nhi_deduction or 0),
+            0,
+        )
+        cash = int(ps.take_home) - remit
+        cash_formula_lines = [
+            f"**▶ 匯款金額：投保額 {int(ps.insurance_base or 0):,} − "
+            f"勞保扣 {int(ps.labor_deduction or 0):,} − "
+            f"健保扣 {int(ps.nhi_deduction or 0):,} = {remit:,} 元**",
+            f"**▶ 現金給付：{int(ps.take_home):,} − {remit:,} = {cash:,} 元**",
+        ]
+
     html = [
         "<!DOCTYPE html><html><head><meta charset='utf-8'>",
         f"<title>{title}</title>", css, "</head><body>",
@@ -4549,6 +4742,9 @@ def generate_doctor_payslip_html(
             )
             for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
                 html.append(_md_line_to_html(line))
+            if c.role != "support" and cash_formula_lines:
+                for line in cash_formula_lines:
+                    html.append(_md_line_to_html(line))
             html.append("</div>")
         html.append("</div>")
         if ps and ps.support_clinic_id:
@@ -4574,12 +4770,13 @@ def generate_doctor_payslip_html(
         )
         for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
             html.append(_md_line_to_html(line))
+        if c.role != "support" and cash_formula_lines:
+            for line in cash_formula_lines:
+                html.append(_md_line_to_html(line))
         html.append("</div>")
 
     # ─── 現金支付版：匯款/現金分 2 行（現金先發時只簽現金，匯款走帳簿）───
     if cash_payment and ps:
-        remit = int(ps.insurance_base or 0)
-        cash = int(ps.take_home) - remit
         cash_style = " style='color:#c0392b'" if cash < 0 else ""
         html.append("<div class='total'>")
         html.append("<h2>💵 給付方式</h2>")
@@ -4597,7 +4794,10 @@ def generate_doctor_payslip_html(
         html.append("</table>")
         html.append(
             "<div style='color:#777;font-size:12px;margin-top:8px'>"
-            "匯款金額＝當月投保額；現金給付＝實領總額 − 匯款金額"
+            "匯款金額＝投保額 − 勞保扣 − 健保扣"
+            f"（{int(ps.insurance_base or 0):,} − {int(ps.labor_deduction or 0):,}"
+            f" − {int(ps.nhi_deduction or 0):,}）；"
+            "現金給付＝實領總額 − 匯款金額"
             f"（NT {int(ps.take_home):,} − NT {remit:,}）</div>"
         )
         if cash < 0:

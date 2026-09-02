@@ -166,7 +166,7 @@ def cashflow_income_rows(clinic: str, pl) -> list[tuple]:
 
 def cashflow_expense_rows(clinic: str, pl) -> list[tuple]:
     if clinic == "澤豐":
-        return [
+        rows = [
             ("玉山逐筆出帳", pl.esun_outflow_total),
             ("澤豐現金支出", pl.x3_zefeng_cash_expense),
             ("謝松坊薪資", pl.x9_offsite_staff_pay),
@@ -174,8 +174,11 @@ def cashflow_expense_rows(clinic: str, pl) -> list[tuple]:
             ("澤豐合約支出", pl.x12_zefeng_contract_expense),
             ("周院長薪資（兩院總和）", pl.x13_zhou_doctor_salary),
         ]
+        if getattr(pl, "x14_cash_salary_pay", 0):
+            rows.append(("醫師薪資現金給付", pl.x14_cash_salary_pay))
+        return rows
     # 澤沛：中信出帳含 3 筆結算，逐項列出（縮排子項，僅供股東對帳識別，不重複加總）
-    return [
+    rows = [
         ("玉山逐筆出帳", pl.esun_outflow_total),
         ("中信進出戶出帳（含結算）", pl.ctbc_outflow_total),
         ("現金結算（→周院長）", pl.cash_settle_outflow, True),
@@ -183,6 +186,9 @@ def cashflow_expense_rows(clinic: str, pl) -> list[tuple]:
         ("合約結算（→周院長）", pl.contract_settle_outflow, True),
         ("手 KEY 支出", pl.x10_expense_total),
     ]
+    if getattr(pl, "cash_salary_pay_total", 0):
+        rows.append(("醫師薪資現金給付", pl.cash_salary_pay_total))
+    return rows
 
 
 # ════════════════════════════════════════════════════════════

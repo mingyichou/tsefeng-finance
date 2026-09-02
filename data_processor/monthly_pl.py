@@ -171,6 +171,12 @@ class ZepeiMonthly:
     # 由澤沛現金支出檔上傳）— 僅供對帳顯示，不入合計
     # （實際金流已由中信 x5 settle 交易記帳，避免重複計算）
     x5_detail_items: list = field(default_factory=list)
+    # 醫師薪資現金給付（v13：現金收入記 gross、存入前先扣的給薪額 → 隱形支出）
+    cash_salary_pay_items: list = field(default_factory=list)
+
+    @property
+    def cash_salary_pay_total(self) -> int:
+        return sum(it.get("amount", 0) for it in self.cash_salary_pay_items)
 
     @property
     def x5_detail_total(self) -> int:
@@ -234,6 +240,7 @@ class ZepeiMonthly:
         return (
             self.esun_outflow_total + self.ctbc_outflow_total
             + self.x10_expense_total
+            + self.cash_salary_pay_total
         )
 
     @property
@@ -272,6 +279,9 @@ class ZefengMonthly:
     x12_items: list = field(default_factory=list)
     x13_zhou_doctor_salary: int = 0
     x13_items: list = field(default_factory=list)
+    # x14 醫師薪資現金給付（v13：x8 記 gross、存入前先扣的給薪額 → 隱形支出）
+    x14_cash_salary_pay: int = 0
+    x14_items: list = field(default_factory=list)
 
     # 手 KEY x10
     x10_income_items: list = field(default_factory=list)
@@ -311,6 +321,7 @@ class ZefengMonthly:
             + self.x10_expense_total
             + self.x12_zefeng_contract_expense
             + self.x13_zhou_doctor_salary
+            + self.x14_cash_salary_pay
         )
 
     @property
@@ -391,6 +402,49 @@ def _bank_item(
     }
 
 
+_ANN_CASH_COLS = ("entry_date, amount, description, form, clinic_id, "
+                  "category, gross_amount, cash_salary_deduction")
+_ANN_CASH_COLS_LEGACY = ("entry_date, amount, description, form, clinic_id, "
+                         "category")
+
+
+def _fetch_cash_ann(sb, account: str, month_start: str, month_end: str,
+                    clinic_id: int | None = None) -> list[dict]:
+    """抓現金入帳對應的金流備註（含 v13 gross 欄位；migration 未跑自動 fallback）。
+
+    clinic_id=None 抓「未指定診所」的列；給 int 抓該診所的列。
+    排除 memo_only（只記帳）與 capital_injection（股東注資）——
+    兩者都不該和銀行存款配對。
+    """
+    def _q(cols):
+        q = (
+            sb.table("manual_annotation").select(cols)
+            .eq("scope", "診所").in_("form", ["存現", "轉入"])
+            .eq("account", account)
+            .gte("entry_date", month_start).lt("entry_date", month_end)
+        )
+        if clinic_id is None:
+            q = q.is_("clinic_id", "null")
+        else:
+            q = q.eq("clinic_id", clinic_id)
+        return q.execute().data
+
+    try:
+        rows = _q(_ANN_CASH_COLS)
+    except Exception:
+        rows = _q(_ANN_CASH_COLS_LEGACY)
+    return [r for r in rows if not r.get("category")]
+
+
+def _cash_ann_amounts(ann: dict) -> tuple[int, int]:
+    """回傳 (記帳收入 gross, 現金給薪扣除)。舊式備註 gross=amount、扣除=0。"""
+    gross = int(ann.get("gross_amount") or 0)
+    deduct = int(ann.get("cash_salary_deduction") or 0)
+    if gross <= 0:
+        gross, deduct = int(ann.get("amount") or 0), 0
+    return gross, deduct
+
+
 # ============================================================================
 # 澤沛 — 全記
 # ============================================================================
@@ -426,6 +480,22 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             .execute().data
         )
         cap_keys = {(r["entry_date"], int(r["amount"] or 0)) for r in cap}
+
+        # v13 現金收入備註（罐頭「澤沛現金收入」）：存現 tx 配對後
+        # 收入改記 gross、給薪扣除記隱形支出（淨額 = 實際存入不變）
+        ann_cash = (
+            _fetch_cash_ann(sb, "澤沛中信", service_month, next_month,
+                            clinic_id=clinic_id)
+            + _fetch_cash_ann(sb, "澤沛中信", service_month, next_month,
+                              clinic_id=None)
+        )
+        ann_by_date_amt = {
+            (r["entry_date"], int(r["amount"] or 0)): r for r in ann_cash
+        }
+        ann_by_amt: dict[int, list] = {}
+        for r in ann_cash:
+            ann_by_amt.setdefault(int(r["amount"] or 0), []).append(r)
+
         for tx in _fetch_bank_transactions(sb, ctbc_id, service_month):
             amt = tx["amount"]
             note = tx.get("note") or ""
@@ -435,6 +505,36 @@ def calculate_zepei_monthly(sb, service_month: str, clinic_id: int) -> ZepeiMont
             if amt > 0:
                 if (tx.get("transaction_date"), int(amt)) in cap_keys:
                     continue  # 股東注資排除（不計入收入）
+                summary = tx.get("summary") or ""
+                channel = tx.get("channel") or ""
+                if "現金" in summary or "存款機" in channel:
+                    ann = ann_by_date_amt.get(
+                        (tx.get("transaction_date"), int(amt))
+                    )
+                    if ann is None:
+                        cands = ann_by_amt.get(int(amt), [])
+                        if len(cands) == 1:
+                            ann = cands[0]
+                    if ann is not None:
+                        gross, deduct = _cash_ann_amounts(ann)
+                        ann_attr = _extract_attr_month_from_desc(
+                            ann.get("description") or "", fallback=prev_m,
+                        )
+                        if gross != int(amt):
+                            item["amount"] = gross
+                            item["deposit_amount"] = int(amt)
+                            item["cash_salary"] = deduct
+                        item["attribution_month"] = ann_attr
+                        if deduct > 0:
+                            m.cash_salary_pay_items.append({
+                                "transaction_date": tx.get("transaction_date"),
+                                "description": (
+                                    "醫師薪資現金給付"
+                                    f"（{ann.get('description') or ''}）"
+                                ),
+                                "amount": deduct,
+                                "attribution_month": ann_attr,
+                            })
                 m.ctbc_inflow_items.append(item)
             elif amt < 0:
                 item["amount"] = -amt
@@ -543,23 +643,12 @@ def calculate_zefeng_monthly(
         #  ・「轉入」= 從別的帳戶轉進這個帳戶（如周院長個人戶轉入做為現金存款）
         # 比對 (entry_date, amount) 優先；同月份 amount 唯一時也接受 (退路)
         # 抓 clinic_id=澤豐 與 clinic_id 是 NULL 的兩種，避免院長補 KEY 沒選診所被漏抓
-        ann_q1 = (
-            sb.table("manual_annotation")
-            .select("entry_date, amount, description, form, clinic_id")
-            .eq("scope", "診所").in_("form", ["存現", "轉入"])
-            .eq("account", "澤豐&個人中信").eq("clinic_id", clinic_id)
-            .gte("entry_date", service_month).lt("entry_date", next_month)
-            .execute().data
+        ann_cash = (
+            _fetch_cash_ann(sb, "澤豐&個人中信", service_month, next_month,
+                            clinic_id=clinic_id)
+            + _fetch_cash_ann(sb, "澤豐&個人中信", service_month, next_month,
+                              clinic_id=None)
         )
-        ann_q2 = (
-            sb.table("manual_annotation")
-            .select("entry_date, amount, description, form, clinic_id")
-            .eq("scope", "診所").in_("form", ["存現", "轉入"])
-            .eq("account", "澤豐&個人中信").is_("clinic_id", "null")
-            .gte("entry_date", service_month).lt("entry_date", next_month)
-            .execute().data
-        )
-        ann_cash = ann_q1 + ann_q2
         # 兩個比對 map：精準 (date, amount) 與寬鬆 amount-only
         ann_by_date_amt: dict = {
             (r["entry_date"], int(r["amount"] or 0)): r for r in ann_cash
@@ -610,10 +699,26 @@ def calculate_zefeng_monthly(
                 attr = _extract_attr_month_from_desc(
                     ann.get("description") or "", fallback=prev_m,
                 )
-                m.x8_zefeng_cash_revenue += amt
-                m.x8_items.append(_bank_item(
-                    tx, attribution_month=attr,
-                ))
+                # v13：備註帶記帳總額 → 收入記 gross、給薪扣除記 x14 隱形支出
+                # （淨額 = 實際存入 = tx 金額，總帳不變）
+                gross, deduct = _cash_ann_amounts(ann)
+                item = _bank_item(tx, attribution_month=attr)
+                if gross != int(amt):
+                    item["amount"] = gross
+                    item["deposit_amount"] = int(amt)
+                    item["cash_salary"] = deduct
+                m.x8_zefeng_cash_revenue += gross
+                m.x8_items.append(item)
+                if deduct > 0:
+                    m.x14_cash_salary_pay += deduct
+                    m.x14_items.append({
+                        "transaction_date": tx.get("transaction_date"),
+                        "description": (
+                            f"醫師薪資現金給付（{ann.get('description') or ''}）"
+                        ),
+                        "amount": deduct,
+                        "attribution_month": attr,
+                    })
             # 其他入帳（玉山轉入、個人款項等）一律不記
 
         # 月末餘額

@@ -63,6 +63,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
+from .monthly_pl import (
+    _cash_ann_amounts,
+    _extract_attr_month_from_desc,
+    _fetch_cash_ann,
+)
+
 
 # ─── 常數 / 預設名單 ──────────────────────────────────────
 MIN_SERVICE_MONTH = "2026-01-01"  # 系統下限：民國 115 年 1 月
@@ -182,6 +188,9 @@ class ClinicMonthlyPL:
     # 醫師薪資比對不到玉山薪轉時的缺漏註記：
     # [{doctor, expected(實領 or None), reason}]；不入金額合計
     doctor_salary_missing: list = field(default_factory=list)
+    # v13 現金給薪交叉檢查：{"keyed": 手KEY扣除, "computed": 系統計算領現合計,
+    #   "ok": bool}；None = 該月無現金給薪
+    cash_salary_check: dict | None = None
 
     # === I 現金支出 ===
     cash_expense_items: list = field(default_factory=list)
@@ -315,19 +324,31 @@ def _has_doctor_name(text: str, doctor_names: list[str]) -> str | None:
     return None
 
 
-def _expected_doctor_net_salary(
+FULL_TRANSFER_DOCTORS = {"呂敏盛", "胡舒婷"}
+"""舊制全額匯款醫師（院長 2026-09 裁定）：實領全額玉山匯出。
+其餘（非周明毅）醫師走新制：匯款 = 投保額 − 勞保扣 − 健保扣，
+剩餘以前月現金收入支付（薪資領現）。"""
+
+
+def _expected_doctor_salary_payment(
     sb, clinic_id: int, service_month: str, doctor_names: list[str],
-) -> dict[str, int | None]:
-    """主聘=本院、非周明毅醫師的「系統實領」，供玉山薪轉金額比對。
+) -> dict[str, dict]:
+    """主聘=本院、非周明毅醫師的預期給付結構，供玉山薪轉金額比對。
 
     實領 = 該醫師 N 月兩院 doctor_salary_monthly.total_salary 合計
            − 勞保扣 − 健保扣（扣除額只記在主聘列，直接加總即可）。
     N 月薪資由主聘院在 N+1 月上旬玉山「整批薪轉」匯出。
 
+    - 舊制（FULL_TRANSFER_DOCTORS）：匯款 = 實領全額、領現 = 0
+    - 新制（其餘醫師）：匯款 = 投保額 − 勞保扣 − 健保扣、
+      領現 = 實領 − 匯款（無投保 → 匯款 0，全額領現）
+
     Returns:
-        {醫師名: 實領；該月薪資未計算則為 None}
+        {醫師名: {"transfer": 預期匯款(未計算=None), "cash": 預期領現}}
     """
-    from .doctor_config import active_dc_rows, fetch_doctor_clinic
+    from .doctor_config import (
+        active_dc_rows, fetch_doctor_clinic, insurance_for_month,
+    )
 
     docs = sb.table("doctors").select("id, name").execute().data
     did_to_name = {d["id"]: d["name"] for d in docs}
@@ -336,7 +357,12 @@ def _expected_doctor_net_salary(
         r for r in active_dc_rows(fetch_doctor_clinic(sb), service_month)
         if r["clinic_id"] == clinic_id and r["role"] != "support"
     ]
-    out: dict[str, int | None] = {}
+    ins_rows = sb.table("doctor_insurance_deductions").select(
+        "clinic_id, doctor_id, insurance_base, labor_deduction, "
+        "nhi_deduction, effective_from, effective_to"
+    ).execute().data
+
+    out: dict[str, dict] = {}
     for r in dc:
         name = did_to_name.get(r["doctor_id"])
         if not name or name == "周明毅" or name not in doctor_names:
@@ -348,14 +374,22 @@ def _expected_doctor_net_salary(
             .eq("service_month", service_month)
             .execute().data
         )
-        if rows:
-            out[name] = (
-                sum(int(x.get("total_salary") or 0) for x in rows)
-                - sum(int(x.get("labor_deduction") or 0) for x in rows)
-                - sum(int(x.get("nhi_deduction") or 0) for x in rows)
-            )
+        if not rows:
+            out[name] = {"transfer": None, "cash": 0}
+            continue
+        labor = sum(int(x.get("labor_deduction") or 0) for x in rows)
+        nhi = sum(int(x.get("nhi_deduction") or 0) for x in rows)
+        take_home = (
+            sum(int(x.get("total_salary") or 0) for x in rows) - labor - nhi
+        )
+        if name in FULL_TRANSFER_DOCTORS:
+            out[name] = {"transfer": take_home, "cash": 0}
         else:
-            out[name] = None
+            base = insurance_for_month(
+                ins_rows, clinic_id, r["doctor_id"], service_month,
+            )["base"]
+            transfer = max(base - labor - nhi, 0)
+            out[name] = {"transfer": transfer, "cash": take_home - transfer}
     return out
 
 
@@ -410,29 +444,42 @@ def _compute_revenue(
                 })
 
     # === C 現金總收入 — N+1 月入帳 ===
+    # v13：金流備註帶 gross_amount（罐頭「現金收入」）時，收入記記帳總額
+    # （實際存入 = 總額 − 現金給薪扣除；給薪部分由 H 醫師薪資「領現」認列）
+    ann_month_end = _month_offset(next_m, 1)
+
+    def _cash_item_from_match(tx, ann, source):
+        amt = int(tx.get("amount") or 0)
+        item = {
+            "transaction_date": tx.get("transaction_date"),
+            "summary": tx.get("summary") or "",
+            "amount": amt,
+            "source": source,
+        }
+        if ann is not None:
+            gross, deduct = _cash_ann_amounts(ann)
+            if gross != amt:
+                item["amount"] = gross
+                item["deposit_amount"] = amt
+                item["cash_salary"] = deduct
+        return item
+
     if is_zefeng:
         # 澤豐 = x8 中信現金入帳（需 manual_annotation 對應）
         if ctbc_id:
             ctbc_next = _fetch_bank_tx(sb, ctbc_id, next_m)
             ann = (
-                sb.table("manual_annotation")
-                .select("entry_date, amount, account, form, scope, "
-                        "description, clinic_id, category")
-                .eq("scope", "診所").in_("form", ["存現", "轉入"])
-                .eq("account", "澤豐&個人中信")
-                .gte("entry_date", next_m)
-                .lt("entry_date", _month_offset(next_m, 1))
-                .execute().data
+                _fetch_cash_ann(sb, "澤豐&個人中信", next_m, ann_month_end,
+                                clinic_id=clinic_id)
+                + _fetch_cash_ann(sb, "澤豐&個人中信", next_m, ann_month_end,
+                                  clinic_id=None)
             )
-            ann = [r for r in ann
-                   if (r.get("category") or "") != "memo_only"
-                   and (r.get("clinic_id") in (clinic_id, None))]
-            ann_keys = {(r["entry_date"], int(r["amount"] or 0)) for r in ann}
-            ann_amt_only: dict[int, int] = {}
+            ann_by_key = {
+                (r["entry_date"], int(r["amount"] or 0)): r for r in ann
+            }
+            ann_by_amt: dict[int, list] = {}
             for r in ann:
-                ann_amt_only[int(r["amount"] or 0)] = (
-                    ann_amt_only.get(int(r["amount"] or 0), 0) + 1
-                )
+                ann_by_amt.setdefault(int(r["amount"] or 0), []).append(r)
             for tx in ctbc_next:
                 amt = tx.get("amount") or 0
                 if amt <= 0:
@@ -441,15 +488,16 @@ def _compute_revenue(
                 channel = tx.get("channel") or ""
                 if "現金" not in summary and "存款機" not in channel:
                     continue
-                tx_key = (tx.get("transaction_date"), int(amt))
-                if tx_key not in ann_keys and ann_amt_only.get(int(amt), 0) != 1:
+                hit = ann_by_key.get((tx.get("transaction_date"), int(amt)))
+                if hit is None:
+                    cands = ann_by_amt.get(int(amt), [])
+                    if len(cands) == 1:
+                        hit = cands[0]
+                if hit is None:
                     continue
-                pl.cash_revenue_items.append({
-                    "transaction_date": tx.get("transaction_date"),
-                    "summary": summary,
-                    "amount": int(amt),
-                    "source": "澤豐中信現金",
-                })
+                pl.cash_revenue_items.append(
+                    _cash_item_from_match(tx, hit, "澤豐中信現金")
+                )
     else:
         # 澤沛 = 澤沛中信 inflow，排除 豐沛金流 + 股東注資
         if ctbc_id:
@@ -461,10 +509,22 @@ def _compute_revenue(
                 .eq("category", "capital_injection")
                 .eq("account", "澤沛中信")
                 .gte("entry_date", next_m)
-                .lt("entry_date", _month_offset(next_m, 1))
+                .lt("entry_date", ann_month_end)
                 .execute().data
             )
             cap_keys = {(r["entry_date"], int(r["amount"] or 0)) for r in cap}
+            ann = (
+                _fetch_cash_ann(sb, "澤沛中信", next_m, ann_month_end,
+                                clinic_id=clinic_id)
+                + _fetch_cash_ann(sb, "澤沛中信", next_m, ann_month_end,
+                                  clinic_id=None)
+            )
+            ann_by_key = {
+                (r["entry_date"], int(r["amount"] or 0)): r for r in ann
+            }
+            ann_by_amt = {}
+            for r in ann:
+                ann_by_amt.setdefault(int(r["amount"] or 0), []).append(r)
             for tx in ctbc_next:
                 amt = tx.get("amount") or 0
                 if amt <= 0:
@@ -478,12 +538,16 @@ def _compute_revenue(
                 summary = tx.get("summary") or ""
                 channel = tx.get("channel") or ""
                 if "現金" in summary or "存款機" in channel:
-                    pl.cash_revenue_items.append({
-                        "transaction_date": tx.get("transaction_date"),
-                        "summary": summary,
-                        "amount": int(amt),
-                        "source": "澤沛中信現金",
-                    })
+                    hit = ann_by_key.get(
+                        (tx.get("transaction_date"), int(amt))
+                    )
+                    if hit is None:
+                        cands = ann_by_amt.get(int(amt), [])
+                        if len(cands) == 1:
+                            hit = cands[0]
+                    pl.cash_revenue_items.append(
+                        _cash_item_from_match(tx, hit, "澤沛中信現金")
+                    )
 
     # === D 傳統整復推拿（澤豐 only） ===
     if is_zefeng:
@@ -685,42 +749,82 @@ def _compute_expense(
             # doctor_hit == 周明毅 → 跳過(走 doctor_salary_monthly)
 
         # ② 金額比對備援：玉山 csv 備註只有「整批薪轉」無醫師名時，
-        #    用「系統實領」比對未識別薪轉金額 → 歸醫師薪資。
-        #    比對不到（11504 及之前計算值可能與實匯不同）→ 記缺漏註記。
-        expected_net = _expected_doctor_net_salary(
+        #    用「預期匯款」比對未識別薪轉金額 → 歸醫師薪資。
+        #    v13 給薪制：舊制醫師匯款=實領全額；新制醫師匯款=投保額−勞健扣、
+        #    其餘「薪資領現」由前月現金收入支付（獨立認列一筆）。
+        #    比對不到（11504 及之前計算值可能與實匯不同）→ 記缺漏註記=數據異常。
+        expected_pay = _expected_doctor_salary_payment(
             sb, clinic_id, sm, doctor_names,
         )
         matched = {it.get("doctor") for it in pl.doctor_salary_items}
-        for name, net in expected_net.items():
+        computed_cash_total = 0
+        for name, exp in expected_pay.items():
+            transfer, cash_part = exp["transfer"], exp["cash"]
+            if transfer is not None and cash_part > 0:
+                computed_cash_total += cash_part
+                # 領現部分不經銀行，直接依系統計算認列
+                pl.doctor_salary_items.append({
+                    "doctor": name,
+                    "annotation": "薪資領現（前月現金收入支付）",
+                    "amount": cash_part,
+                    "source": "現金給付(系統計算)",
+                })
             if name in matched:
                 continue
-            if net == 0:
-                continue  # 該月無薪資（如未看診），不算缺
-            if net is not None:
-                idx = next(
-                    (i for i, p in enumerate(pending) if p["amount"] == net),
-                    None,
-                )
-                if idx is not None:
-                    p = pending.pop(idx)
-                    pl.doctor_salary_items.append({
-                        "doctor": name,
-                        "transaction_date": p["transaction_date"],
-                        "annotation": p["annotation"],
-                        "amount": p["amount"],
-                        "source": "玉山轉帳+金額比對(系統實領)",
-                    })
-                    continue
+            if transfer is None:
+                pl.doctor_salary_missing.append({
+                    "doctor": name, "expected": None,
+                    "reason": "系統薪資未計算",
+                })
+                continue
+            if transfer == 0:
+                continue  # 全額領現（無投保）或該月無薪資，銀行端無需比對
+            idx = next(
+                (i for i, p in enumerate(pending) if p["amount"] == transfer),
+                None,
+            )
+            if idx is not None:
+                p = pending.pop(idx)
+                pl.doctor_salary_items.append({
+                    "doctor": name,
+                    "transaction_date": p["transaction_date"],
+                    "annotation": p["annotation"],
+                    "amount": p["amount"],
+                    "source": "玉山轉帳+金額比對(預期匯款)",
+                })
+                continue
             pl.doctor_salary_missing.append({
                 "doctor": name,
-                "expected": net,
-                "reason": ("系統薪資未計算" if net is None
-                           else "玉山無相符薪轉金額"),
+                "expected": transfer,
+                "reason": "玉山無相符薪轉金額(預期匯款)",
             })
 
         # 剩餘未識別薪轉 → 護理師&助理
         for p in pending:
             pl.nurse_salary_items.append({**p, "source": "玉山轉帳"})
+
+        # ③ v13 現金給薪交叉檢查：手 KEY「現金給薪扣除」vs 系統計算領現合計
+        acc_name = "澤豐&個人中信" if is_zefeng else "澤沛中信"
+        ann_end = _month_offset(next_m, 1)
+        keyed_cash = 0
+        for r in (
+            _fetch_cash_ann(sb, acc_name, next_m, ann_end, clinic_id=clinic_id)
+            + _fetch_cash_ann(sb, acc_name, next_m, ann_end, clinic_id=None)
+        ):
+            deduct = int(r.get("cash_salary_deduction") or 0)
+            if deduct <= 0:
+                continue
+            attr = _extract_attr_month_from_desc(
+                r.get("description") or "", fallback=sm,
+            )
+            if attr == sm:
+                keyed_cash += deduct
+        if keyed_cash or computed_cash_total:
+            pl.cash_salary_check = {
+                "keyed": keyed_cash,
+                "computed": computed_cash_total,
+                "ok": keyed_cash == computed_cash_total,
+            }
 
     # H c 編制外人員 (謝松坊 etc)：staff_salary_summary service_month=N月
     if external_names:
