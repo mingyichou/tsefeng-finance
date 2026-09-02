@@ -206,7 +206,7 @@ def parse_cash_expense_split(
             rec["raw_row_hash"] = _row_hash_cash(rec)
             cash_records.append(rec)
 
-    return cash_records, check_records
+    return cash_records, _merge_check_records(check_records)
 
 
 # ─── 合約支出（橫向月度表 → 長表）─────────────────────
@@ -333,6 +333,36 @@ _BANK_MAP = {
 }
 
 
+def _merge_check_records(records: list[dict]) -> list[dict]:
+    """同 (issue_month, vendor, bank) 多張支票 → 合併加總。
+
+    check_expense 表 UNIQUE(issue_month, vendor, bank)（當初假設每月每廠商
+    每銀行一張支票）；廠商同月開兩張（如 11508 順天中信 10,479+1,449）時，
+    同批 upsert 重複鍵會報 21000「cannot affect row a second time」。
+    以檔案為準合併金額，note 保留各張明細供對帳。
+    """
+    merged: dict[tuple, dict] = {}
+    for r in records:
+        key = (r["issue_month"], r["vendor"], r["bank"])
+        cur = merged.get(key)
+        if cur is None:
+            merged[key] = dict(r, _amounts=[r["amount"]])
+            continue
+        cur["_amounts"].append(r["amount"])
+        cur["amount"] += r["amount"]
+        extra_note = r.get("note")
+        if extra_note and extra_note not in (cur.get("note") or ""):
+            cur["note"] = f"{cur['note']}；{extra_note}" if cur.get("note") else extra_note
+    out = []
+    for rec in merged.values():
+        amounts = rec.pop("_amounts")
+        if len(amounts) > 1:
+            detail = f"{len(amounts)}張合併：" + "+".join(f"{a:,}" for a in amounts)
+            rec["note"] = f"{rec['note']}；{detail}" if rec.get("note") else detail
+        out.append(rec)
+    return out
+
+
 def parse_check_expense(file_obj: IO, source_filename: str) -> list[dict]:
     """
     解析 @@支票支出115.xlsx 共用檔。
@@ -402,7 +432,7 @@ def parse_check_expense(file_obj: IO, source_filename: str) -> list[dict]:
                 ),
             })
 
-    return records
+    return _merge_check_records(records)
 
 
 # ─── 調貨整理 (inventory_transfer) ───────────────────────
