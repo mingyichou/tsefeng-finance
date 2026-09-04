@@ -10,6 +10,7 @@ from __future__ import annotations
 import unicodedata
 from collections import Counter
 
+from data_processor.bank_dedupe import find_duplicate_groups
 from data_processor.monthly_pl import _next_month, _prev_month
 
 # 澤豐合約支出「每月必填」的 10 個廠商（對應合約支出檔 R0 表頭）。
@@ -122,11 +123,20 @@ def compute_cashflow_health(sb, service_month: str) -> dict:
     fp_id = next((c["id"] for c in clinic_resp if c["short_name"] == "澤沛"), None)
 
     tx_rows = (
-        sb.table("bank_transactions").select("account_id")
+        sb.table("bank_transactions")
+        .select("id, account_id, transaction_date, amount, balance, summary")
         .gte("transaction_date", service_month).lt("transaction_date", next_m)
         .execute().data
     )
     tx_counts = Counter(r["account_id"] for r in tx_rows)
+    # 重複交易（同帳戶同日同額同餘額同摘要）：Excel 存過的 CSV 重傳曾造成整月重複
+    # （2026-09-05）。有重複 → 該帳戶該月視為不完整（數字被灌水，不可出報表）。
+    dup_groups = find_duplicate_groups(tx_rows)
+    dup_counts: Counter = Counter()
+    dup_extra: Counter = Counter()
+    for g in dup_groups:
+        dup_counts[g[0]["account_id"]] += 1
+        dup_extra[g[0]["account_id"]] += len(g) - 1
 
     bank_table: list[dict] = []
     issues: list[str] = []
@@ -140,14 +150,22 @@ def compute_cashflow_health(sb, service_month: str) -> dict:
         if acc.get("is_personal_mixed"):
             atype = f"{atype}（混戶）"
         n = tx_counts.get(acc["id"], 0)
+        n_dup = dup_counts.get(acc["id"], 0)
         bank_table.append({
             "診所": clinic,
             "戶別": f"{bank} {atype}",
             f"{sm_label} 筆數": n,
-            "狀態": "✅" if n > 0 else "⚠️ 缺",
+            "疑似重複": f"⚠️ {n_dup} 組（多 {dup_extra[acc['id']]} 筆）" if n_dup else "—",
+            "狀態": "⚠️ 缺" if n == 0 else ("⚠️ 重複" if n_dup else "✅"),
         })
+        msg = None
         if n == 0:
             msg = f"{clinic} {bank} {atype}：{sm_label} CSV 未上傳"
+        elif n_dup:
+            msg = (f"{clinic} {bank} {atype}：{sm_label} 有 {n_dup} 組重複交易"
+                   f"（多 {dup_extra[acc['id']]} 筆；同日同額同餘額同摘要），"
+                   "請到資料匯入區「🧹 銀行交易重複偵測與清理」清除")
+        if msg:
             issues.append(msg)
             if acc["clinic_id"] == fz_id:
                 issues_fz.append(msg)

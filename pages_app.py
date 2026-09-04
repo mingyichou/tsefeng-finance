@@ -25,7 +25,10 @@ def _data_version(sb) -> tuple:
     manual_annotation 另做**內容雜湊**：金流備註常被就地修改（UPDATE
     金額/分類/日期，筆數不變），只算筆數會讓修改後 30 分鐘內看到舊結果
     （2026-09-02 院長私人帳務改金額不生效的根因）。表小（數十筆），
-    全表雜湊便宜。"""
+    全表雜湊便宜。
+
+    bank_transactions 也可能被就地補值（重傳修正檔補匯款帳號 / 註記，筆數不變）
+    → 匯入端與重複清理工具在 UPDATE / DELETE 後直接 st.cache_data.clear()。"""
     def c(t):
         try:
             return (sb.table(t).select("id", count="exact")
@@ -1900,6 +1903,11 @@ def page_import():
 
     st.divider()
 
+    # ─── 銀行交易重複偵測與清理 ──────────────────────
+    _section_bank_dedupe()
+
+    st.divider()
+
     # ─── 醫療費用付款通知書 HTML（批次）───────────────
     _section_nhi_notices()
 
@@ -2170,6 +2178,121 @@ def _section_ctbc_csv():
         key=f"ctbc_import_{account_choice}",
     ):
         _import_bank_records(sb, records)
+
+
+def _section_bank_dedupe():
+    """銀行交易重複偵測與清理（清掉 Excel 重傳造成的整月重複列；2026-09-05）"""
+    from collections import Counter
+    from data_processor.bank_dedupe import (
+        fetch_bank_rows_paged, find_duplicate_groups, choose_merge,
+    )
+
+    st.subheader("🧹 銀行交易重複偵測與清理")
+    st.caption(
+        "同一帳戶「交易日期＋金額＋餘額＋摘要」相同即視為同一筆交易。"
+        "用 Excel 存過再重傳的 CSV（日期 2026/08/26 會被改成 2026/8/26）在舊版程式會整月重複匯入；"
+        "匯入端現已防呆（已存在的交易只補值不新增），這裡負責掃出並清掉已經重複的資料。"
+    )
+
+    sb = get_authed_client()
+    if st.button("🔍 掃描全部帳戶", key="bank_dedupe_scan"):
+        try:
+            with st.spinner("掃描中..."):
+                rows = fetch_bank_rows_paged(sb)
+                groups = find_duplicate_groups(rows)
+        except Exception as e:
+            st.error(f"掃描失敗：{e}")
+            return
+        st.session_state["bank_dedupe_groups"] = groups
+        st.session_state["bank_dedupe_total"] = len(rows)
+
+    groups = st.session_state.get("bank_dedupe_groups")
+    if groups is None:
+        return
+    total = st.session_state.get("bank_dedupe_total", 0)
+    if not groups:
+        st.success(f"✅ 已掃描 {total:,} 筆交易，沒有重複")
+        return
+
+    try:
+        accounts = sb.table("bank_accounts").select(
+            "id, clinic_id, bank, account_type, is_personal_mixed"
+        ).execute().data
+        clinics = sb.table("clinics").select("id, short_name").execute().data
+    except Exception as e:
+        st.error(f"讀取帳戶失敗：{e}")
+        return
+    cid_short = {c["id"]: c["short_name"] for c in clinics}
+    acc_label = {
+        a["id"]: (f"{cid_short.get(a['clinic_id'], '?')} {a['bank']} {a['account_type']}"
+                  + ("（混戶）" if a.get("is_personal_mixed") else ""))
+        for a in accounts
+    }
+
+    def _fmt_changes(changes: dict) -> str:
+        return "；".join(f"{f}: {old or '(空)'} → {new}" for f, (old, new) in changes.items())
+
+    plans = [choose_merge(g) for g in groups]
+    n_delete = sum(len(p["delete"]) for p in plans)
+    st.warning(
+        f"⚠️ 已掃描 {total:,} 筆，發現 **{len(groups)} 組**重複交易，多餘 **{n_delete} 筆**"
+    )
+
+    by_am: Counter = Counter()
+    for p in plans:
+        k = p["keep"]
+        by_am[(acc_label.get(k["account_id"], str(k["account_id"])),
+               str(k["transaction_date"])[:7])] += len(p["delete"])
+    st.dataframe(pd.DataFrame(
+        [{"帳戶": a, "月份": m, "多餘筆數": n} for (a, m), n in sorted(by_am.items())]
+    ), use_container_width=True, hide_index=True)
+
+    detail = []
+    for p in plans:
+        k = p["keep"]
+        detail.append({
+            "帳戶": acc_label.get(k["account_id"], str(k["account_id"])),
+            "日期": k["transaction_date"],
+            "摘要": k.get("summary"),
+            "金額": k.get("amount"),
+            "餘額": k.get("balance"),
+            "重複筆數": 1 + len(p["delete"]),
+            "保留 id": k["id"],
+            "刪除 id": ", ".join(str(r["id"]) for r in p["delete"]),
+            "合併補值": _fmt_changes(p["changes"]),
+        })
+    with st.expander("逐組明細", expanded=True):
+        st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
+
+    st.caption(
+        "清理規則：每組保留最早匯入的 1 筆（其雜湊為銀行原始格式），其餘刪除；"
+        "匯款帳號／註記等欄位取最新非空值合併到保留列。刪除後請再掃描一次確認。"
+    )
+    if st.button(
+        f"🗑️ 刪除多餘 {n_delete} 筆並合併補值",
+        type="primary", key="bank_dedupe_apply",
+    ):
+        n_upd = n_del = 0
+        errors = []
+        for p in plans:
+            try:
+                if p["changes"]:
+                    vals = {f: new for f, (_old, new) in p["changes"].items()}
+                    (sb.table("bank_transactions").update(vals)
+                     .eq("id", p["keep"]["id"]).execute())
+                    n_upd += 1
+                ids = [r["id"] for r in p["delete"]]
+                sb.table("bank_transactions").delete().in_("id", ids).execute()
+                n_del += len(ids)
+            except Exception as e:
+                errors.append(f"保留 id={p['keep']['id']} 這組：{e}")
+        st.cache_data.clear()  # 刪除 / 補值後所有月度計算重算
+        st.session_state.pop("bank_dedupe_groups", None)
+        if errors:
+            st.error("部分清理失敗：")
+            for err in errors:
+                st.code(err)
+        st.success(f"✅ 已刪除 {n_del} 筆重複、合併補值 {n_upd} 筆。請再按「🔍 掃描全部帳戶」確認。")
 
 
 def _section_nhi_notices():
@@ -4174,16 +4297,44 @@ def _import_cash_records(sb, records: list[dict]):
 
 
 def _import_bank_records(sb, records: list[dict]):
-    """寫入 bank_transactions（用 upsert + ignore_duplicates 防重複）"""
+    """寫入 bank_transactions（邏輯鍵比對 → 補值 / 新增；raw_row_hash UNIQUE 為最後防線）
+
+    2026-09-05 起：先以「帳戶＋日期＋金額＋餘額＋摘要」比對資料庫既有列 ——
+      已存在 → 只補值（匯款帳號 / 註記 / 備註 / 通路 / 帳務日；來檔非空才覆蓋）
+      不存在 → 新增
+    「補了匯款帳號再重傳」會更新既有列，不會再整月重複匯入
+    （即使檔案被 Excel 存過、日期格式改變）。
+    """
+    from data_processor.bank_dedupe import fetch_bank_rows_paged, plan_import
+
+    records = [r for r in records if r.get("transaction_date")]
+    if not records:
+        st.warning("沒有可匯入的交易記錄")
+        return
+    account_ids = sorted({r["account_id"] for r in records})
+    dates = [r["transaction_date"] for r in records]
+    d0, d1 = min(dates), max(dates)
+
+    try:
+        existing = fetch_bank_rows_paged(sb, account_ids, d0, d1)
+    except Exception as e:
+        st.error(f"讀取資料庫既有交易失敗，未匯入：{e}")
+        return
+    plan = plan_import(existing, records)
+
     inserted = 0
-    skipped = 0
+    skipped_hash = 0
+    updated = 0
     errors = []
+    update_rows = []
+    to_insert = plan["inserts"]
+    total_ops = max(len(to_insert) + len(plan["updates"]), 1)
+    done = 0
     progress = st.progress(0, text="匯入中...")
-    total = len(records)
 
     BATCH_SIZE = 50
-    for i in range(0, total, BATCH_SIZE):
-        batch = records[i:i + BATCH_SIZE]
+    for i in range(0, len(to_insert), BATCH_SIZE):
+        batch = to_insert[i:i + BATCH_SIZE]
         try:
             resp = (
                 sb.table("bank_transactions")
@@ -4192,12 +4343,36 @@ def _import_bank_records(sb, records: list[dict]):
             )
             new_count = len(resp.data) if resp.data else 0
             inserted += new_count
-            skipped += len(batch) - new_count
+            skipped_hash += len(batch) - new_count
         except Exception as e:
-            errors.append(f"批次 {i}-{i+len(batch)}：{e}")
-        progress.progress(min((i + BATCH_SIZE) / total, 1.0))
+            errors.append(f"新增批次 {i}-{i+len(batch)}：{e}")
+        done += len(batch)
+        progress.progress(min(done / total_ops, 1.0))
+
+    for u in plan["updates"]:
+        vals = {f: new for f, (_old, new) in u["changes"].items()}
+        try:
+            sb.table("bank_transactions").update(vals).eq("id", u["id"]).execute()
+            updated += 1
+            row = u["row"]
+            update_rows.append({
+                "日期": row.get("transaction_date"),
+                "摘要": row.get("summary"),
+                "金額": row.get("amount"),
+                "補值": "；".join(
+                    f"{f}: {old or '(空)'} → {new}" for f, (old, new) in u["changes"].items()
+                ),
+            })
+        except Exception as e:
+            errors.append(f"補值 id={u['id']}：{e}")
+        done += 1
+        progress.progress(min(done / total_ops, 1.0))
 
     progress.empty()
+
+    if updated:
+        # 就地補值不改筆數，_data_version 的 count 指紋抓不到 → 直接清快取
+        st.cache_data.clear()
 
     if errors:
         st.error("部分匯入失敗：")
@@ -4205,9 +4380,26 @@ def _import_bank_records(sb, records: list[dict]):
             st.code(err)
     if inserted:
         st.success(f"✅ 新增 {inserted} 筆")
-    if skipped:
-        st.info(f"ℹ️ 跳過重複 {skipped} 筆")
-    if inserted and not errors:
+    if updated:
+        st.info(f"✏️ 補值更新 {updated} 筆（資料庫已有這些交易，只補上檔案裡的新資料）")
+        st.dataframe(pd.DataFrame(update_rows), use_container_width=True, hide_index=True)
+    n_skip = len(plan["skips"]) + skipped_hash
+    if n_skip:
+        st.info(f"ℹ️ 跳過 {n_skip} 筆（資料庫已有且無變更）")
+    unmatched = plan["unmatched_existing"]
+    if unmatched:
+        st.warning(
+            f"⚠️ 資料庫在 {d0} ~ {d1} 另有 {len(unmatched)} 筆交易不在本檔案內。"
+            "若本檔案是該區間的完整匯出，這些多半是先前重複匯入的殘留列，"
+            "請用本頁「🧹 銀行交易重複偵測與清理」處理。"
+        )
+        st.dataframe(
+            pd.DataFrame(unmatched)[
+                ["id", "transaction_date", "summary", "amount", "balance", "counterparty"]
+            ],
+            use_container_width=True, hide_index=True,
+        )
+    if (inserted or updated) and not errors:
         st.balloons()
 
 

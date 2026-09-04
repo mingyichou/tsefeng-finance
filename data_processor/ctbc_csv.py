@@ -21,12 +21,16 @@ CSV 欄位：
 注意：
 - 中信 CSV 不含 transaction_time、posting_date
 - raw_row_hash 用 (date, amount, balance, summary, note) 組合即可保持唯一
+- 日期一律零補位標準化（bank_dedupe.canonical_date）：Excel 存過的檔重傳不會
+  因 2026/8/3 ≠ 2026/08/03 而整月重複（2026-09-05 玉山事故同因）
 """
 
 import hashlib
 from typing import IO
 
 import pandas as pd
+
+from data_processor.bank_dedupe import canonical_date
 
 
 EXPECTED_COLUMNS = [
@@ -49,9 +53,8 @@ def _to_int(val) -> int | None:
 
 
 def _normalize_date(s) -> str | None:
-    if s is None or pd.isna(s):
-        return None
-    return str(s).strip().replace("/", "-")
+    """任何常見日期寫法 → YYYY-MM-DD（零補位；Excel 存過的檔也標準化）"""
+    return canonical_date(s)
 
 
 def _normalize_str(s) -> str | None:

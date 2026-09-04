@@ -17,12 +17,19 @@
   餘額                  → balance (去千分位逗號)
   備註                  → memo (含月份代碼如 11502)
   轉出入銀行代號/帳號   → counterparty ('--' → NULL)
+
+⚠️ 日期 / 時間一律標準化（零補位，見 bank_dedupe.canonical_date/time）：
+   院長用 Excel 存過的 CSV 會把 2026/08/26 變成 2026/8/26；若不標準化，
+   raw_row_hash 整月不同 → 重傳即整月重複匯入（2026-09-05 事故）。
+   銀行原始檔本來就是零補位，既有 hash 不受影響。
 """
 
 import hashlib
 from typing import IO
 
 import pandas as pd
+
+from data_processor.bank_dedupe import canonical_date, canonical_time
 
 
 EXPECTED_COLUMNS = [
@@ -47,10 +54,8 @@ def _to_int(val) -> int | None:
 
 
 def _normalize_date(s) -> str | None:
-    """YYYY/MM/DD → YYYY-MM-DD"""
-    if s is None or pd.isna(s):
-        return None
-    return str(s).strip().replace("/", "-")
+    """任何常見日期寫法 → YYYY-MM-DD（零補位；Excel 存過的 2026/8/3 也標準化）"""
+    return canonical_date(s)
 
 
 def _normalize_str(s) -> str | None:
@@ -127,7 +132,7 @@ def parse_esun_csv(file_obj: IO, account_id: int) -> list[dict]:
             "account_id": account_id,
             "posting_date": _normalize_date(row.get("帳務日期")),
             "transaction_date": _normalize_date(row.get("實際交易日期")),
-            "transaction_time": _normalize_str(row.get("實際交易時間")),
+            "transaction_time": canonical_time(row.get("實際交易時間")),
             "summary": _normalize_str(row.get("摘要")),
             "amount": amount,
             "balance": _to_int(row.get("餘額")),
