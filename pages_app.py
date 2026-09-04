@@ -3,6 +3,8 @@
 每個 page_xxx() 對應 sidebar 一個選單項
 """
 
+import re
+
 import streamlit as st
 import pandas as pd
 from db import get_authed_client
@@ -3151,6 +3153,43 @@ _ANN_CATEGORY_OPTIONS = list(_ANN_CATEGORY_LABELS.values())
 _ANN_CATEGORY_BY_LABEL = {v: k for k, v in _ANN_CATEGORY_LABELS.items()}
 
 
+# 罐頭快速輸入列的描述格式（_ann_quick_templates 產生）：
+#   「澤豐8月傳統整復推拿收入」／「澤豐8月現金收入1,234,567，現金給薪扣除12,000」
+_CANNED_RE = re.compile(r"^(澤豐|澤沛)(\d{1,2})月(現金收入|傳統整復推拿收入)")
+
+
+def _canned_info(row: dict) -> dict | None:
+    """罐頭快速輸入列 → {"kind", "clinic", "income_month"(ISO 1 日)}；非罐頭列 → None。
+
+    收入月份以 entry_date 推得（現金收入：entry_date=收入次月 1 日 → 前月；
+    推拿：entry_date=收入月 1 日），不靠描述文字的月份數字，跨年也正確
+    （舊版只比描述前綴「澤豐8月現金收入」，明年 8 月會蓋掉今年 8 月）。
+    """
+    from datetime import date, timedelta
+    m = _CANNED_RE.match(str(row.get("description") or "").strip())
+    if not m:
+        return None
+    try:
+        d = date.fromisoformat(str(row.get("entry_date") or "")[:10]).replace(day=1)
+    except ValueError:
+        return None
+    kind = m.group(3)
+    if kind == "現金收入":
+        d = (d - timedelta(days=1)).replace(day=1)
+    return {"kind": kind, "clinic": m.group(1), "income_month": d.isoformat()}
+
+
+def _find_canned(rows: list[dict], kind: str, clinic: str, income_month: str) -> dict | None:
+    """找同類型、同診所、同收入月份的既有罐頭列（多筆時取 id 最小）。"""
+    hits = []
+    for r in rows:
+        info = _canned_info(r)
+        if info and info["kind"] == kind and info["clinic"] == clinic \
+                and info["income_month"] == income_month:
+            hits.append(r)
+    return min(hits, key=lambda r: r["id"]) if hits else None
+
+
 def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
     """金流補充備註 — 每月罐頭快速輸入（選月份＋填數字即存檔）。
 
@@ -3161,19 +3200,13 @@ def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
     現金收入模板：amount=實際存入(收入−給薪扣除) 供銀行對帳；
     gross_amount/cash_salary_deduction 供實帳與損益記帳。
     entry_date=收入次月 1 日（現金慣例次月初存入，配對走同月金額比對）。
-    同月重存 = 覆蓋更新既有那筆。
+    同月重存 = 覆蓋更新既有那筆（以 entry_date 推得的收入月份比對，跨年安全）。
+    2026-09-05：加「已輸入的罐頭紀錄」表格；選同一收入月份自動帶入既有數字
+    （存檔＝覆蓋）＋「刪除此月紀錄」。罐頭列在通用表單只能刪不能改。
     """
-    from datetime import date as _date
+    from datetime import date as _date, timedelta as _td
 
     st.markdown("**⚡ 每月罐頭快速輸入**")
-
-    # 月份選項：近 14 個「收入月份」（預設上個月）
-    today = _date.today()
-    cur = today.replace(day=1)
-    months: list[str] = []
-    for _ in range(14):
-        months.append(cur.isoformat())
-        cur = (cur - pd.Timedelta(days=1)).replace(day=1)
 
     def _fmt_m(iso: str) -> str:
         y, m = int(iso[:4]), int(iso[5:7])
@@ -3184,13 +3217,56 @@ def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
         return (_date(d.year + 1, 1, 1) if d.month == 12
                 else _date(d.year, d.month + 1, 1)).isoformat()
 
-    def _save(payload: dict, desc_prefix: str, ok_msg: str):
-        """依 description 前綴找同月既有列 → update；否則 insert。"""
-        exist = next(
-            (r for r in rows
-             if (r.get("description") or "").startswith(desc_prefix)),
-            None,
-        )
+    # ── 已輸入的罐頭紀錄（查看）────────────────────────────
+    canned = [(_canned_info(r), r) for r in rows if _canned_info(r)]
+    canned.sort(key=lambda t: (t[0]["income_month"], t[0]["clinic"], t[0]["kind"]),
+                reverse=True)
+    if canned:
+        tbl = []
+        for info, r in canned:
+            amount = int(r.get("amount") or 0)
+            if info["kind"] == "現金收入":
+                gross = int(r.get("gross_amount") or 0)
+                deduct = int(r.get("cash_salary_deduction") or 0)
+                if gross <= 0:  # 舊式備註：amount 即收入
+                    gross, deduct = amount, 0
+                tbl.append({
+                    "id": r["id"], "類型": f"💰 {info['clinic']}現金收入",
+                    "收入月份": _fmt_m(info["income_month"]),
+                    "現金收入": gross, "現金給薪扣除": deduct, "實存(對帳金額)": amount,
+                    "存入日": r.get("entry_date"), "帳戶": r.get("account"),
+                    "描述": r.get("description"),
+                })
+            else:
+                tbl.append({
+                    "id": r["id"], "類型": "🙌 澤豐傳統整復推拿收入",
+                    "收入月份": _fmt_m(info["income_month"]),
+                    "現金收入": amount, "現金給薪扣除": None, "實存(對帳金額)": None,
+                    "存入日": r.get("entry_date"), "帳戶": r.get("account"),
+                    "描述": r.get("description"),
+                })
+        with st.expander(f"📋 已輸入的罐頭紀錄（{len(canned)} 筆）", expanded=True):
+            st.caption(
+                "要修改或刪除：在下方分頁選同一個「收入月份」，數字會自動帶入，"
+                "改完按存檔＝覆蓋；或勾「確認刪除」後按「🗑️ 刪除」。"
+            )
+            st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True)
+    else:
+        st.caption("📋 尚無罐頭紀錄")
+
+    # 月份選項：近 14 個「收入月份」∪ 既有罐頭紀錄的月份（預設上個月）
+    today = _date.today()
+    cur = today.replace(day=1)
+    recent: list[str] = []
+    for _ in range(14):
+        recent.append(cur.isoformat())
+        cur = (cur - _td(days=1)).replace(day=1)
+    months = sorted(set(recent) | {info["income_month"] for info, _ in canned},
+                    reverse=True)
+    default_idx = months.index(recent[1]) if recent[1] in months else 0
+
+    def _save(payload: dict, exist: dict | None):
+        """同收入月份已有罐頭列 → update；否則 insert。"""
         try:
             if exist:
                 sb.table("manual_annotation").update(payload).eq(
@@ -3208,6 +3284,17 @@ def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
             else:
                 st.error(f"儲存失敗：{e}")
 
+    def _delete_button(exist: dict, key: str, label: str):
+        """刪除既有罐頭列：勾「確認刪除」後按鈕才可按。"""
+        ok = st.checkbox("確認刪除", key=f"{key}_confirm")
+        if st.button(f"🗑️ 刪除 {label}", key=key, disabled=not ok):
+            try:
+                sb.table("manual_annotation").delete().eq("id", exist["id"]).execute()
+                st.session_state["_ann_just_deleted"] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"刪除失敗：{e}")
+
     tab_ma, tab_fz, tab_fp = st.tabs(
         ["🙌 傳統整復推拿收入", "💰 澤豐現金收入", "💰 澤沛現金收入"]
     )
@@ -3216,24 +3303,38 @@ def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
         st.caption("澤豐｜中信｜存現｜🟡 只記帳（僅進月度損益分析，不參與金流核對）")
         col1, col2 = st.columns(2)
         with col1:
-            m_ma = st.selectbox("收入月份", months, format_func=_fmt_m, index=1,
-                                key="annq_ma_month")
+            m_ma = st.selectbox("收入月份", months, format_func=_fmt_m,
+                                index=default_idx, key="annq_ma_month")
+        exist_ma = _find_canned(rows, "傳統整復推拿收入", "澤豐", m_ma)
         with col2:
-            amt_ma = st.number_input("金額", min_value=0, step=1000,
-                                     key="annq_ma_amt")
-        if st.button("💾 存檔", type="primary", key="annq_ma_save"):
-            if amt_ma <= 0:
-                st.error("金額必須 > 0")
-            else:
-                mo = int(m_ma[5:7])
-                desc = f"澤豐{mo}月傳統整復推拿收入"
-                _save({
-                    "entry_date": m_ma, "scope": "診所",
-                    "clinic_id": short_to_cid.get("澤豐"),
-                    "form": "存現", "amount": int(amt_ma),
-                    "account": "澤豐&個人中信", "description": desc,
-                    "category": "memo_only",
-                }, desc, "已存傳統整復推拿收入")
+            # key 帶月份：換月即換新 widget，預設值自動帶入既有紀錄
+            amt_ma = st.number_input(
+                "金額", min_value=0, step=1000,
+                value=int(exist_ma.get("amount") or 0) if exist_ma else 0,
+                key=f"annq_ma_amt_{m_ma}",
+            )
+        if exist_ma:
+            st.info(f"📌 {_fmt_m(m_ma)} 已有紀錄（id={exist_ma['id']}）："
+                    f"金額 {int(exist_ma.get('amount') or 0):,}。改數字後存檔＝覆蓋。")
+        c_save, c_del = st.columns(2)
+        with c_save:
+            if st.button("💾 存檔", type="primary", key="annq_ma_save"):
+                if amt_ma <= 0:
+                    st.error("金額必須 > 0")
+                else:
+                    mo = int(m_ma[5:7])
+                    desc = f"澤豐{mo}月傳統整復推拿收入"
+                    _save({
+                        "entry_date": m_ma, "scope": "診所",
+                        "clinic_id": short_to_cid.get("澤豐"),
+                        "form": "存現", "amount": int(amt_ma),
+                        "account": "澤豐&個人中信", "description": desc,
+                        "category": "memo_only",
+                    }, exist_ma)
+        with c_del:
+            if exist_ma:
+                _delete_button(exist_ma, f"annq_ma_del_{m_ma}",
+                               f"{_fmt_m(m_ma)} 傳統整復推拿收入")
 
     def _cash_income_tab(clinic_short: str, account: str, key_prefix: str):
         st.caption(
@@ -3243,37 +3344,55 @@ def _ann_quick_templates(sb, rows: list[dict], short_to_cid: dict):
         )
         col1, col2, col3 = st.columns(3)
         with col1:
-            m_sel = st.selectbox("收入月份", months, format_func=_fmt_m, index=1,
-                                 key=f"annq_{key_prefix}_month")
+            m_sel = st.selectbox("收入月份", months, format_func=_fmt_m,
+                                 index=default_idx, key=f"annq_{key_prefix}_month")
+        exist = _find_canned(rows, "現金收入", clinic_short, m_sel)
+        ex_gross = ex_deduct = 0
+        if exist:
+            ex_gross = int(exist.get("gross_amount") or 0)
+            ex_deduct = int(exist.get("cash_salary_deduction") or 0)
+            if ex_gross <= 0:  # 舊式備註
+                ex_gross, ex_deduct = int(exist.get("amount") or 0), 0
         with col2:
             gross = st.number_input("現金收入", min_value=0, step=1000,
-                                    key=f"annq_{key_prefix}_gross")
+                                    value=ex_gross,
+                                    key=f"annq_{key_prefix}_gross_{m_sel}")
         with col3:
             deduct = st.number_input("現金給薪扣除", min_value=0, step=100,
-                                     key=f"annq_{key_prefix}_deduct")
+                                     value=ex_deduct,
+                                     key=f"annq_{key_prefix}_deduct_{m_sel}")
         deposit = int(gross) - int(deduct)
+        if exist:
+            st.info(f"📌 {_fmt_m(m_sel)} 已有紀錄（id={exist['id']}，存入日 {exist.get('entry_date')}）："
+                    f"現金收入 {ex_gross:,}、給薪扣除 {ex_deduct:,}、"
+                    f"實存 {int(exist.get('amount') or 0):,}。改數字後存檔＝覆蓋。")
         if gross > 0:
             st.info(f"實際存入銀行核對金額：**NT {deposit:,}** "
                     f"（{int(gross):,} − {int(deduct):,}）")
-        if st.button("💾 存檔", type="primary", key=f"annq_{key_prefix}_save"):
-            if gross <= 0:
-                st.error("現金收入必須 > 0")
-            elif deduct > gross:
-                st.error("現金給薪扣除不可大於現金收入")
-            else:
-                mo = int(m_sel[5:7])
-                desc_prefix = f"{clinic_short}{mo}月現金收入"
-                desc = (f"{desc_prefix}{int(gross):,}，"
-                        f"現金給薪扣除{int(deduct):,}")
-                _save({
-                    "entry_date": _next_month_first(m_sel), "scope": "診所",
-                    "clinic_id": short_to_cid.get(clinic_short),
-                    "form": "存現", "amount": deposit,
-                    "gross_amount": int(gross),
-                    "cash_salary_deduction": int(deduct),
-                    "account": account, "description": desc,
-                    "category": None,
-                }, desc_prefix, "已存現金收入")
+        c_save, c_del = st.columns(2)
+        with c_save:
+            if st.button("💾 存檔", type="primary", key=f"annq_{key_prefix}_save"):
+                if gross <= 0:
+                    st.error("現金收入必須 > 0")
+                elif deduct > gross:
+                    st.error("現金給薪扣除不可大於現金收入")
+                else:
+                    mo = int(m_sel[5:7])
+                    desc = (f"{clinic_short}{mo}月現金收入{int(gross):,}，"
+                            f"現金給薪扣除{int(deduct):,}")
+                    _save({
+                        "entry_date": _next_month_first(m_sel), "scope": "診所",
+                        "clinic_id": short_to_cid.get(clinic_short),
+                        "form": "存現", "amount": deposit,
+                        "gross_amount": int(gross),
+                        "cash_salary_deduction": int(deduct),
+                        "account": account, "description": desc,
+                        "category": None,
+                    }, exist)
+        with c_del:
+            if exist:
+                _delete_button(exist, f"annq_{key_prefix}_del_{m_sel}",
+                               f"{_fmt_m(m_sel)} {clinic_short}現金收入")
 
     with tab_fz:
         _cash_income_tab("澤豐", "澤豐&個人中信", "fz")
@@ -3326,6 +3445,7 @@ def _section_manual_annotation():
     if rows:
         df = pd.DataFrame(rows)
         df["診所"] = df["clinic_id"].map(cid_to_short).fillna("—")
+        df["來源"] = ["⚡ 罐頭" if _canned_info(r) else "✍️ 手KEY" for r in rows]
         if "category" in df.columns:
             df["分類"] = df["category"].map(
                 {"memo_only": "🟡 只記帳", "capital_injection": "🔴 股東注資",
@@ -3333,7 +3453,7 @@ def _section_manual_annotation():
             ).fillna("金流備註")
         else:
             df["分類"] = "金流備註"
-        cols = ["id", "entry_date", "分類", "scope", "form", "account",
+        cols = ["id", "entry_date", "來源", "分類", "scope", "form", "account",
                 "amount", "診所", "description"]
         present = [c for c in cols if c in df.columns]
         st.markdown(f"**現有 {len(rows)} 筆：**")
@@ -3349,7 +3469,7 @@ def _section_manual_annotation():
 
     st.markdown("**新增 / 修改 / 刪除：**")
     edit_options = ["（新增）"] + [
-        f"id={r['id']} {r.get('entry_date', '')} "
+        f"id={r['id']} {'⚡' if _canned_info(r) else ''}{r.get('entry_date', '')} "
         f"{r.get('form') or ''} {r.get('amount') or 0} "
         f"{(r.get('description') or '')[:25]}"
         for r in rows
@@ -3368,6 +3488,12 @@ def _section_manual_annotation():
             sel = next((r for r in rows if r["id"] == sid), None)
         except Exception:
             sel = None
+    is_canned = bool(sel and _canned_info(sel))
+    if is_canned:
+        st.warning(
+            "⚡ 此筆是「每月罐頭快速輸入」的紀錄：請到上方罐頭區選同一收入月份修改"
+            "（此處只提供刪除，避免改壞系統辨識用的描述與現金收入／給薪扣除欄位）。"
+        )
 
     forms = ["轉入", "轉出", "存現", "領現"]
     scopes = ["診所", "個人"]
@@ -3444,7 +3570,7 @@ def _section_manual_annotation():
 
     save_col, del_col = st.columns(2)
     with save_col:
-        if st.button("💾 儲存", type="primary", key="ann_save"):
+        if not is_canned and st.button("💾 儲存", type="primary", key="ann_save"):
             if amount <= 0 or not description:
                 st.error("金額必須 > 0 且須填備註")
                 return
