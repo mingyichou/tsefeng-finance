@@ -1,24 +1,35 @@
 """
-醫師薪資計算引擎（Phase 3.5）
+醫師薪資計算引擎（Phase 3.5；v15 雙軌制）
 
 從 DB 讀資料、計算月度薪資、寫入 doctor_salary_monthly。
 
 資料來源：
-  - doctors                          → 診薪 fallback（v12 前的單一值）
-  - doctor_session_fees              → 診薪（日期版本化，取該月月底有效值）
-  - doctor_clinic                    → role + director_allowance（日期版本化，
-                                       該月有重疊的角色列才參與計算）
-  - doctor_visit_stats               → 診數 + 各類健保人次（業績獎金）
+  - doctors                          → 診薪 fallback、salary_scheme（legacy/dual）
+  - doctor_session_fees              → 薪資參數（日期版本化，取該月月底有效值）：
+                                       診薪 + 新制參數（執照費/開診費/健保%/銷售三段%/操作%）
+  - doctor_clinic                    → role + director_allowance（日期版本化）
+  - doctor_visit_stats               → 診數 + 各類健保人次（舊制業績獎金）
   - doctor_cash_monthly (view)       → 自費月度總計（抽成基底）
-  - doctor_commission_rules          → 抽成率（預設）
+  - doctor_outpatient_summary        → 複針/A91 人數；健保總額/藥費（新制健保業績獎金）
+  - doctor_commission_rules          → 抽成率（預設 20/40/10/50、診察費 0）
   - doctor_commission_overrides      → 醫師個別覆寫（如周醫師診察費 50%）
-  - doctor_insurance_deductions      → 勞健保扣除額（勞保按日比例、健保當月在保全額）
-  - bonus_rules                      → 業績獎金門檻 15.1（讀取但邏輯硬寫）
+  - doctor_insurance_deductions      → 勞健保扣除額
+  - bonus_rules                      → 業績獎金門檻 15.1
 
-公式：
-  應付 = director_allowance + session_pay + commission_total + bonus_total
-       (+ acu_complex_bonus + a91_bonus 從 4月起 — Sprint 2.4 完成才有)
-  實領 = 應付 − labor_deduction − nhi_deduction
+舊制（legacy；周明毅/呂敏盛/胡舒婷）：
+  應付 = director_allowance + 診薪×診數 + 自費抽成 + 業績獎金(每診平均≥15.1) + 複針 + A91
+
+新制雙軌（dual；115/10 起入職，院長 2026-09-13 裁定）：哪個高領哪個
+  保障薪 = 診薪×診數 + 自費獎金(固定 20%/40%/10%/50%) + A91 獎金 + 複針獎金
+  業績薪 = 執照費 + 開診費×診數 + 健保業績獎金 + 自費獎金(業績版)
+    健保業績獎金 = (健保總額 − 藥費) × 健保抽成比例（預設 34%）
+    自費獎金(業績版) = 銷售獎金(累進：≤10萬 20%、10~15萬 23%、>15萬 25%)
+                     + 操作獎金(針灸+傷科+脫臼 × 40%) + 三伏貼(檢驗費×10%) + 診斷書(其它×50%)
+  A91/複針已含在健保點數內 → 業績薪不另計；舊制的「每診平均≥15.1 業績獎金」與院長津貼
+  皆不在新制公式內。跨院時保障/業績都以**兩院合計**比較；銷售累進以兩院合計銷售額計算後
+  按各院銷售額分攤；執照費記在主聘列。
+
+  實領 = 應付 − 勞保扣 − 健保扣（兩制相同）
 """
 
 from __future__ import annotations
@@ -27,16 +38,17 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from .doctor_config import (
+    DEFAULT_SALARY_PARAMS,
     active_dc_rows,
     fetch_doctor_clinic,
     fetch_session_fees,
     insurance_for_month,
     parse_date,
-    resolve_session_fee,
+    resolve_salary_params,
 )
 
 
-# ─── 業績獎金固定常數 ────────────────────────────────────
+# ─── 業績獎金固定常數（舊制）────────────────────────────
 PERF_INTERNAL_BASE = 7
 PERF_INTERNAL_RATE = 150
 PERF_PURE_BASE = 6
@@ -53,6 +65,17 @@ A91_RATE = 14                # A91 整合醫療 × 14 元/人
 ACU_A91_EFFECTIVE_FROM = "2026-04-01"   # 4月起套用
 
 
+# ─── 雙軌制（115/10 起新進醫師）────────────────────────
+DUAL_SCHEME_FROM = "2026-10-01"      # 到職日 ≥ 此日期 → 新增醫師預設新制
+SALES_TIER_1_MAX = 100_000           # 銷售累進：≤ 10 萬
+SALES_TIER_2_MAX = 150_000           #           10 萬 ~ 15 萬；> 15 萬第三段
+PERF_LAB_RATE = 0.10                 # 三伏(九)貼 = 檢驗費 × 10%（固定）
+PERF_OTHER_RATE = 0.50               # 診斷書 = 其它 × 50%（固定）
+SALES_FIELDS = ("internal_drug", "external_drug", "wellness", "herb_decoction")
+OPERATION_FIELDS = ("acupuncture", "trauma", "dislocation")
+TRACK_LABEL = {"guaranteed": "保障薪", "performance": "業績薪"}
+
+
 # ─── 抽成欄位對應 ────────────────────────────────────────
 # DB 欄位名 → doctor_cash_monthly view 欄位名
 COMMISSION_FIELDS = [
@@ -60,6 +83,13 @@ COMMISSION_FIELDS = [
     "acupuncture", "trauma", "dislocation",
     "wellness", "herb_decoction", "consult", "lab", "other",
 ]
+
+# doctor_salary_monthly v15 新增欄位（migration 未跑時寫入要剔除）
+DUAL_DB_FIELDS = (
+    "salary_scheme", "chosen_track", "license_fee", "opening_pay",
+    "nhi_points_ex_drug", "nhi_perf_bonus", "perf_commission_total",
+    "perf_commission_breakdown", "guaranteed_total", "performance_total",
+)
 
 
 @dataclass
@@ -100,12 +130,62 @@ class SalaryComponent:
     role_to: str | None = None
     notes: list[str] = field(default_factory=list)
 
+    # ── v15 雙軌制（salary_scheme='dual'）──
+    salary_scheme: str = "legacy"
+    chosen_track: str | None = None            # 'guaranteed' / 'performance'
+    salary_params: dict = field(default_factory=dict)   # 該月適用參數（顯示用）
+    license_fee: int = 0                       # 執照費（只記在主聘列）
+    opening_pay: int = 0                       # 開診費 × 診數
+    nhi_points_ex_drug: int = 0                # 健保總額 − 藥費
+    nhi_perf_bonus: int = 0                    # 健保業績獎金
+    perf_sales_revenue: int = 0                # 銷售額（內服+外用+保養+飲片）
+    perf_sales_bonus: int = 0                  # 銷售獎金（累進；跨院合計後分攤）
+    perf_sales_tiers: list[dict] = field(default_factory=list)  # 累進各段（醫師合計）
+    perf_operation_revenue: int = 0            # 針灸+傷科+脫臼
+    perf_operation_bonus: int = 0
+    perf_lab_bonus: int = 0                    # 三伏(九)貼
+    perf_other_bonus: int = 0                  # 診斷書
+
     @property
     def is_main_clinic(self) -> bool:
         return self.role != "support"
 
     @property
+    def is_dual(self) -> bool:
+        return self.salary_scheme == "dual"
+
+    @property
+    def perf_commission_total(self) -> int:
+        return (self.perf_sales_bonus + self.perf_operation_bonus
+                + self.perf_lab_bonus + self.perf_other_bonus)
+
+    @property
+    def perf_commission_breakdown(self) -> dict[str, int]:
+        return {
+            "sales": self.perf_sales_bonus,
+            "operation": self.perf_operation_bonus,
+            "lab": self.perf_lab_bonus,
+            "other": self.perf_other_bonus,
+        }
+
+    @property
+    def guaranteed_total(self) -> int:
+        """新制保障薪（此診所列）= 診薪×診數 + 自費獎金(固定%) + 複針 + A91"""
+        return (self.session_pay + self.commission_total
+                + self.acu_complex_bonus + self.a91_bonus)
+
+    @property
+    def performance_total(self) -> int:
+        """新制業績薪（此診所列）= 執照費 + 開診費×診數 + 健保業績獎金 + 自費獎金(業績版)"""
+        return (self.license_fee + self.opening_pay
+                + self.nhi_perf_bonus + self.perf_commission_total)
+
+    @property
     def gross(self) -> int:
+        if self.is_dual:
+            if self.chosen_track == "performance":
+                return self.performance_total
+            return self.guaranteed_total
         return (
             self.director_allowance
             + self.session_pay
@@ -121,7 +201,7 @@ class SalaryComponent:
             "clinic_id": self.clinic_id,
             "doctor_id": self.doctor_id,
             "service_month": self.service_month,
-            "director_allowance": self.director_allowance,
+            "director_allowance": 0 if self.is_dual else self.director_allowance,
             "session_count": self.sessions_total,
             "session_pay": self.session_pay,
             "commission_total": self.commission_total,
@@ -138,6 +218,17 @@ class SalaryComponent:
             "a91_bonus": self.a91_bonus,
             "labor_deduction": 0,    # 主聘列才填，非主聘 0
             "nhi_deduction": 0,
+            # v15
+            "salary_scheme": self.salary_scheme,
+            "chosen_track": self.chosen_track if self.is_dual else None,
+            "license_fee": self.license_fee,
+            "opening_pay": self.opening_pay,
+            "nhi_points_ex_drug": self.nhi_points_ex_drug,
+            "nhi_perf_bonus": self.nhi_perf_bonus,
+            "perf_commission_total": self.perf_commission_total,
+            "perf_commission_breakdown": self.perf_commission_breakdown,
+            "guaranteed_total": self.guaranteed_total if self.is_dual else 0,
+            "performance_total": self.performance_total if self.is_dual else 0,
         }
 
 
@@ -157,6 +248,11 @@ class Payslip:
     nhi_deduction: int = 0
     insurance_base: int = 0
     insurance_note: str | None = None
+    # v15 雙軌（兩院合計）
+    salary_scheme: str = "legacy"
+    chosen_track: str | None = None
+    guaranteed_total: int = 0
+    performance_total: int = 0
 
     @property
     def gross_total(self) -> int:
@@ -165,6 +261,10 @@ class Payslip:
     @property
     def take_home(self) -> int:
         return self.gross_total - self.labor_deduction - self.nhi_deduction
+
+    @property
+    def is_dual(self) -> bool:
+        return self.salary_scheme == "dual"
 
 
 # ============================================================================
@@ -182,15 +282,20 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
 
     Returns:
         dict 含：
-          doctors, clinics, doctor_clinic, visit_stats, cash_monthly,
-          commission_rules, commission_overrides, insurance_deductions,
+          doctors, clinics, doctor_clinic, session_fees, visit_stats, cash_monthly,
+          outpatient, commission_rules, commission_overrides, insurance_deductions,
           bonus_threshold
     """
-    doctors = sb.table("doctors").select("id, name, session_fee, is_active").execute().data
+    try:
+        doctors = sb.table("doctors").select(
+            "id, name, session_fee, is_active, salary_scheme"
+        ).execute().data
+    except Exception:  # v15 migration 未跑 → 全部視為舊制
+        doctors = sb.table("doctors").select("id, name, session_fee, is_active").execute().data
     clinics = sb.table("clinics").select("id, short_name").execute().data
 
     doctor_clinic = fetch_doctor_clinic(sb)      # 含生效日期（migration 前自動 fallback）
-    session_fees = fetch_session_fees(sb)        # 診薪歷史（表不存在回 []）
+    session_fees = fetch_session_fees(sb)        # 薪資參數歷史（表不存在回 []）
 
     visit_stats = (
         sb.table("doctor_visit_stats")
@@ -207,7 +312,8 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
     outpatient = (
         sb.table("doctor_outpatient_summary")
         .select("clinic_id, doctor_id, service_month, "
-                "acu_complex_mid_count, acu_complex_high_count, a91_count")
+                "acu_complex_mid_count, acu_complex_high_count, a91_count, "
+                "nhi_total_points, nhi_drug_fee")
         .eq("service_month", service_month)
         .execute().data
     )
@@ -292,7 +398,7 @@ def _calc_commission(
 def _calc_perf_bonus(
     visit_row: dict | None, sessions: int, threshold: float
 ) -> tuple[bool, float, int, int, int]:
-    """業績獎金（健保每診平均 ≥ threshold 觸發）"""
+    """業績獎金（健保每診平均 ≥ threshold 觸發）— 舊制"""
     if not visit_row or sessions <= 0:
         return False, 0.0, 0, 0, 0
     nhi_total = visit_row.get("nhi_visits_total") or 0
@@ -311,12 +417,125 @@ def _calc_perf_bonus(
     return True, round(avg, 2), b_internal, b_pure, b_combo
 
 
+# ─── 新制：業績薪自費獎金（銷售累進）──────────────────────
+
+
+def progressive_sales_bonus(
+    total_sales: int, rate_1: float, rate_2: float, rate_3: float,
+) -> tuple[int, list[dict]]:
+    """
+    銷售獎金累進：≤100,000 × rate_1、100,001~150,000 × rate_2、150,001+ × rate_3
+    （rate 為百分比數字，如 20 / 23 / 25）。例：160,000 → 100,000×20% + 50,000×23% + 10,000×25%。
+
+    Returns (獎金合計(四捨五入), [{"label","base","rate","bonus"}...])
+    """
+    total_sales = max(int(total_sales or 0), 0)
+    t1 = min(total_sales, SALES_TIER_1_MAX)
+    t2 = min(max(total_sales - SALES_TIER_1_MAX, 0), SALES_TIER_2_MAX - SALES_TIER_1_MAX)
+    t3 = max(total_sales - SALES_TIER_2_MAX, 0)
+    tiers = [
+        {"label": f"≤{SALES_TIER_1_MAX:,}", "base": t1, "rate": float(rate_1)},
+        {"label": f"{SALES_TIER_1_MAX + 1:,}~{SALES_TIER_2_MAX:,}", "base": t2, "rate": float(rate_2)},
+        {"label": f">{SALES_TIER_2_MAX:,}", "base": t3, "rate": float(rate_3)},
+    ]
+    raw_total = 0.0
+    for t in tiers:
+        raw = t["base"] * t["rate"] / 100
+        t["bonus"] = round(raw)
+        raw_total += raw
+    return round(raw_total), tiers
+
+
+def _allocate(total: int, weights: list[int]) -> list[int]:
+    """依權重把整數 total 分攤（最大餘數法，總和恰等於 total）。權重全 0 → 全給第一個。"""
+    if not weights:
+        return []
+    wsum = sum(weights)
+    if total == 0:
+        return [0] * len(weights)
+    if wsum <= 0:
+        out = [0] * len(weights)
+        out[0] = total
+        return out
+    raw = [total * w / wsum for w in weights]
+    floors = [int(x) for x in raw]
+    rem = total - sum(floors)
+    order = sorted(range(len(weights)), key=lambda i: raw[i] - floors[i], reverse=True)
+    for i in order[:rem]:
+        floors[i] += 1
+    return floors
+
+
+def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
+    """
+    新制醫師：計算業績薪各項、決定採用軌道（兩院合計比較，哪個高領哪個）。
+    保障薪各項（診薪×診數/自費固定%/複針/A91）已在 calculate_components 算好。
+    """
+    by_doc: dict[int, list[SalaryComponent]] = {}
+    for c in components:
+        if c.is_dual:
+            by_doc.setdefault(c.doctor_id, []).append(c)
+
+    for _did, comps in by_doc.items():
+        params = comps[0].salary_params or dict(DEFAULT_SALARY_PARAMS)
+        opening_fee = float(params.get("opening_fee") or 0)
+        nhi_rate = float(params.get("nhi_rate") or 0)
+        op_rate = float(params.get("operation_rate") or 0)
+
+        # 各院可直接歸屬的項目
+        for c in comps:
+            cash = inputs["cash_monthly"].get((c.clinic_id, c.doctor_id)) or {}
+            op = inputs["outpatient"].get((c.clinic_id, c.doctor_id)) or {}
+            c.opening_pay = round(c.sessions_total * opening_fee)
+            pts = int(op.get("nhi_total_points") or 0) - int(op.get("nhi_drug_fee") or 0)
+            c.nhi_points_ex_drug = max(pts, 0)
+            c.nhi_perf_bonus = round(c.nhi_points_ex_drug * nhi_rate / 100)
+            c.perf_sales_revenue = sum(int(cash.get(f) or 0) for f in SALES_FIELDS)
+            c.perf_operation_revenue = sum(int(cash.get(f) or 0) for f in OPERATION_FIELDS)
+            c.perf_operation_bonus = round(c.perf_operation_revenue * op_rate / 100)
+            c.perf_lab_bonus = round(int(cash.get("lab") or 0) * PERF_LAB_RATE)
+            c.perf_other_bonus = round(int(cash.get("other") or 0) * PERF_OTHER_RATE)
+            # 舊制業績獎金 / 院長津貼不在新制公式內
+            c.bonus_internal = c.bonus_pure_acu_trauma = c.bonus_internal_combo = 0
+            c.bonus_total = 0
+            c.perf_triggered = False
+            if c.director_allowance:
+                c.notes.append(
+                    f"院長津貼 {c.director_allowance:,} 不在新制公式內，未計入"
+                )
+            if not op:
+                c.notes.append("無門診申報主表（健保業績獎金計 0）")
+
+        # 執照費記在主聘列（月中轉院取生效較新的主聘）
+        mains = [c for c in comps if c.role != "support"]
+        main = (max(mains, key=lambda c: parse_date(c.role_from) or date.min)
+                if mains else comps[0])
+        main.license_fee = int(params.get("license_fee") or 0)
+
+        # 銷售累進：兩院合計後按各院銷售額分攤
+        total_sales = sum(c.perf_sales_revenue for c in comps)
+        sales_bonus, tiers = progressive_sales_bonus(
+            total_sales, params.get("sales_rate_1", 20),
+            params.get("sales_rate_2", 23), params.get("sales_rate_3", 25),
+        )
+        for c, b in zip(comps, _allocate(sales_bonus, [c.perf_sales_revenue for c in comps])):
+            c.perf_sales_bonus = b
+            c.perf_sales_tiers = tiers
+
+        guaranteed = sum(c.guaranteed_total for c in comps)
+        performance = sum(c.performance_total for c in comps)
+        chosen = "performance" if performance > guaranteed else "guaranteed"
+        for c in comps:
+            c.chosen_track = chosen
+
+
 def calculate_components(inputs: dict, service_month: str) -> list[SalaryComponent]:
     """
     為該月份所有 (診所×醫師) 組合計算 SalaryComponent。
     依 doctor_clinic 表「該月有效」的角色列為計算基礎（v12 起帶生效區間：
     到職前/離職後的月份不再列入），不限於有 visit_stats 的。
     （沒看診診數=0、抽成=0、業績不觸發；但記錄一筆便於審計）
+    新制醫師（doctors.salary_scheme='dual'）另跑 _apply_dual_scheme。
     """
     components: list[SalaryComponent] = []
     threshold = inputs["bonus_threshold"]
@@ -338,13 +557,13 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
         outpatient_row = inputs["outpatient"].get((clinic_id, doctor_id))
 
         sessions = (visit_row or {}).get("sessions_total", 0) or 0
-        # session_fee 為 NUMERIC(7,1)（如 3230.8），先乘診數最後再 round
-        # v12：診薪取「該月月底有效」的版本（doctor_session_fees），
-        # 無歷史列時 fallback doctors.session_fee
-        session_fee = resolve_session_fee(
+        # v12/v15：薪資參數取「該月月底有效」的版本（doctor_session_fees），
+        # 無歷史列時 fallback doctors.session_fee + 預設新制參數
+        params = resolve_salary_params(
             inputs.get("session_fees") or [], inputs["doctors"],
             doctor_id, service_month,
         )
+        session_fee = float(params["session_fee"])
         session_pay = round(sessions * session_fee)
         commission_total, breakdown = _calc_commission(inputs, doctor_id, cash_row)
         triggered, avg, b_int, b_pure, b_combo = _calc_perf_bonus(
@@ -393,6 +612,8 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
             a91_bonus=a91_b,
             role_from=dc.get("effective_from"),
             role_to=dc.get("effective_to"),
+            salary_scheme=(doctor.get("salary_scheme") or "legacy"),
+            salary_params=params,
         )
 
         if not visit_row:
@@ -402,6 +623,7 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
 
         components.append(sc)
 
+    _apply_dual_scheme(components, inputs)
     return components
 
 
@@ -439,6 +661,10 @@ def build_payslips(
             gross_support=support.gross if support else 0,
             support_clinic_id=support.clinic_id if support else None,
             support_clinic_name=support.clinic_name if support else None,
+            salary_scheme=main.salary_scheme,
+            chosen_track=main.chosen_track if main.is_dual else None,
+            guaranteed_total=sum(c.guaranteed_total for c in comps) if main.is_dual else 0,
+            performance_total=sum(c.performance_total for c in comps) if main.is_dual else 0,
         )
 
         # 勞健保扣除（主聘診所）：
@@ -471,6 +697,8 @@ def upsert_salary_monthly(
     """
     寫入 doctor_salary_monthly。每個 (clinic_id, doctor_id, service_month) 一列。
     扣除額只填在主聘診所那列，支援診所那列扣除為 0。
+    v15 欄位不存在（migration 未跑）：無新制醫師 → 剔除新欄位重試；
+    有新制醫師 → 直接報錯（否則 total_salary 會算錯）。
     """
     # 索引：哪些 (clinic, doctor) 是主聘
     main_set = {(p.main_clinic_id, p.doctor_id): p for p in payslips}
@@ -486,11 +714,26 @@ def upsert_salary_monthly(
 
     if not rows:
         return 0
-    resp = (
-        sb.table("doctor_salary_monthly")
-        .upsert(rows, on_conflict="clinic_id,doctor_id,service_month")
-        .execute()
-    )
+    try:
+        resp = (
+            sb.table("doctor_salary_monthly")
+            .upsert(rows, on_conflict="clinic_id,doctor_id,service_month")
+            .execute()
+        )
+    except Exception as e:
+        if not any(f in str(e) for f in DUAL_DB_FIELDS):
+            raise
+        if any(c.is_dual for c in components):
+            raise ValueError(
+                "資料庫尚未執行 migration_v14_to_v15.sql（雙軌制欄位不存在），"
+                "本月有新制醫師，無法寫入。請先到 Supabase SQL Editor 執行 migration。"
+            ) from e
+        legacy_rows = [{k: v for k, v in r.items() if k not in DUAL_DB_FIELDS} for r in rows]
+        resp = (
+            sb.table("doctor_salary_monthly")
+            .upsert(legacy_rows, on_conflict="clinic_id,doctor_id,service_month")
+            .execute()
+        )
     return len(resp.data) if resp.data else len(rows)
 
 

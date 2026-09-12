@@ -4571,6 +4571,7 @@ def page_salary():
         run_salary_calculation,
         upsert_salary_monthly,
         fetch_salary_inputs,
+        TRACK_LABEL,
     )
 
     sb = get_authed_client()
@@ -4618,6 +4619,8 @@ def page_salary():
         pay_rows.append({
             "主聘": p.main_clinic_name,
             "醫師": p.doctor_name,
+            "制度": (f"新制・{TRACK_LABEL.get(p.chosen_track, '?')}"
+                    if p.is_dual else "舊制"),
             "主聘應付": p.gross_main,
             "支援應付": p.gross_support,
             "支援來自": p.support_clinic_name or "—",
@@ -4643,6 +4646,8 @@ def page_salary():
                 "診所": c.clinic_name,
                 "醫師": c.doctor_name,
                 "角色": c.role,
+                "制度": (f"新制・{TRACK_LABEL.get(c.chosen_track, '?')}"
+                        if c.is_dual else "舊制"),
                 "院長津貼": c.director_allowance,
                 "診數": c.sessions_total,
                 "診薪×診數": c.session_pay,
@@ -4658,6 +4663,59 @@ def page_salary():
         st.dataframe(
             pd.DataFrame(comp_rows), use_container_width=True, hide_index=True
         )
+
+    # ─── v15 新制雙軌：保障薪 vs 業績薪 ───
+    dual_comps = [c for c in components if c.is_dual]
+    if dual_comps:
+        with st.expander("🆕 新制雙軌（保障薪 vs 業績薪，取高者）", expanded=True):
+            st.caption(
+                "**保障薪**＝診薪×診數＋自費獎金（固定 20%/40%/10%/50%）＋複針＋A91；"
+                "**業績薪**＝執照費＋開診費×診數＋（健保總額−藥費）×健保%＋自費獎金"
+                "（銷售累進 ≤10萬/10~15萬/>15萬、操作%、三伏貼 10%、診斷書 50%）。"
+                "跨院以兩院合計比較；銷售累進以合計銷售額計算後按各院銷售額分攤；執照費記在主聘。"
+            )
+            sum_rows = [{
+                "醫師": p.doctor_name,
+                "保障薪合計": p.guaranteed_total,
+                "業績薪合計": p.performance_total,
+                "採用": TRACK_LABEL.get(p.chosen_track, "?"),
+                "差額": abs(p.performance_total - p.guaranteed_total),
+            } for p in sorted(payslips, key=lambda x: x.doctor_name) if p.is_dual]
+            st.dataframe(pd.DataFrame(sum_rows), use_container_width=True, hide_index=True)
+
+            det = []
+            for c in sorted(dual_comps, key=lambda x: (x.doctor_name, x.clinic_name)):
+                p = c.salary_params or {}
+                det.append({
+                    "診所": c.clinic_name, "醫師": c.doctor_name, "診數": c.sessions_total,
+                    "診薪×診數": c.session_pay, "自費獎金(固定)": c.commission_total,
+                    "複針": c.acu_complex_bonus, "A91": c.a91_bonus,
+                    "保障薪小計": c.guaranteed_total,
+                    "執照費": c.license_fee, "開診費×診數": c.opening_pay,
+                    "健保點數(−藥費)": c.nhi_points_ex_drug,
+                    f"健保獎金({p.get('nhi_rate', 0):g}%)": c.nhi_perf_bonus,
+                    "銷售額": c.perf_sales_revenue, "銷售獎金(累進)": c.perf_sales_bonus,
+                    "操作額": c.perf_operation_revenue,
+                    f"操作獎金({p.get('operation_rate', 0):g}%)": c.perf_operation_bonus,
+                    "三伏貼(10%)": c.perf_lab_bonus, "診斷書(50%)": c.perf_other_bonus,
+                    "業績薪小計": c.performance_total,
+                })
+            st.dataframe(pd.DataFrame(det), use_container_width=True, hide_index=True)
+
+            tier_rows = []
+            seen = set()
+            for c in dual_comps:
+                if c.doctor_id in seen or not c.perf_sales_tiers:
+                    continue
+                seen.add(c.doctor_id)
+                for t in c.perf_sales_tiers:
+                    tier_rows.append({
+                        "醫師": c.doctor_name, "級距": t["label"],
+                        "銷售基底": t["base"], "比例%": t["rate"], "獎金": t["bonus"],
+                    })
+            if tier_rows:
+                st.markdown("**銷售獎金累進明細（醫師兩院合計銷售額）**")
+                st.dataframe(pd.DataFrame(tier_rows), use_container_width=True, hide_index=True)
 
     cross = [p for p in payslips if p.support_clinic_id and p.gross_support > 0]
     if cross:
@@ -4899,6 +4957,77 @@ def page_salary():
             st.error(f"寫入失敗：{e}")
 
 
+def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0) -> list[str]:
+    """新制雙軌薪資單段落：保障薪／業績薪逐項 + 採用軌道 + 應付/實領（v15）"""
+    from data_processor.salary import (
+        TRACK_LABEL, SALES_FIELDS, OPERATION_FIELDS, PERF_LAB_RATE, PERF_OTHER_RATE,
+    )
+    p = c.salary_params or {}
+    bd = c.commission_breakdown or {}
+    L: list[str] = []
+
+    def _rev(keys) -> int:
+        return sum(int(cash_row.get(k, 0) or 0) for k in keys)
+
+    # ── 保障薪 ──
+    tag = "　✅ 採用" if c.chosen_track == "guaranteed" else ""
+    L.append(f"**【保障薪】{tag}**（小計 **NT {c.guaranteed_total:,} 元**）")
+    L.append(f"- 診薪：[{c.sessions_total} 診 × {float(p.get('session_fee') or 0):,.1f} = "
+             f"**{c.session_pay:,}**] 元")
+    sales_rev, sales_com = _rev(SALES_FIELDS), sum(bd.get(k, 0) for k in SALES_FIELDS)
+    op_rev, op_com = _rev(OPERATION_FIELDS), sum(bd.get(k, 0) for k in OPERATION_FIELDS)
+    lab_rev, other_rev = _rev(("lab",)), _rev(("other",))
+    if sales_rev:
+        L.append(f"- 銷售獎金（固定 20%）：[{sales_rev:,} × 20% = **{sales_com:,}**] 元")
+    if op_rev:
+        L.append(f"- 操作獎金（固定 40%）：[{op_rev:,} × 40% = **{op_com:,}**] 元")
+    if lab_rev:
+        L.append(f"- 三伏(九)貼：[{lab_rev:,} × 10% = **{bd.get('lab', 0):,}**] 元")
+    if other_rev:
+        L.append(f"- 診斷書（其它）：[{other_rev:,} × 50% = **{bd.get('other', 0):,}**] 元")
+    if c.acu_complex_mid_count or c.acu_complex_high_count:
+        L.append(f"- 複針：[中 {c.acu_complex_mid_count} ×20 + 高 {c.acu_complex_high_count} ×40 = "
+                 f"**{c.acu_complex_bonus:,}**] 元")
+    if c.a91_count:
+        L.append(f"- A91 整合醫療：[{c.a91_count} 人 ×14 = **{c.a91_bonus:,}**] 元")
+
+    # ── 業績薪 ──
+    tag = "　✅ 採用" if c.chosen_track == "performance" else ""
+    L.append(f"**【業績薪】{tag}**（小計 **NT {c.performance_total:,} 元**）")
+    if c.license_fee:
+        L.append(f"- 執照費：**{c.license_fee:,}** 元")
+    L.append(f"- 開診費：[{c.sessions_total} 診 × {float(p.get('opening_fee') or 0):,.0f} = "
+             f"**{c.opening_pay:,}**] 元")
+    L.append(f"- 健保業績獎金：[健保點數(藥費除外) {c.nhi_points_ex_drug:,} × "
+             f"{float(p.get('nhi_rate') or 0):g}% = **{c.nhi_perf_bonus:,}**] 元")
+    if c.perf_sales_revenue or c.perf_sales_bonus:
+        L.append(f"- 銷售獎金（累進 {float(p.get('sales_rate_1') or 0):g}/"
+                 f"{float(p.get('sales_rate_2') or 0):g}/{float(p.get('sales_rate_3') or 0):g}%）："
+                 f"銷售額 {c.perf_sales_revenue:,} → **{c.perf_sales_bonus:,}** 元")
+        for t in c.perf_sales_tiers:
+            if t["base"]:
+                L.append(f"- 　級距 {t['label']}：[{t['base']:,} × {t['rate']:g}% = {t['bonus']:,}] 元")
+        if len(c.perf_sales_tiers) and sum(t["bonus"] for t in c.perf_sales_tiers) != c.perf_sales_bonus:
+            L.append("- 　（累進以兩院合計銷售額計算，此為本院分攤額）")
+    if c.perf_operation_revenue:
+        L.append(f"- 操作獎金：[{c.perf_operation_revenue:,} × {float(p.get('operation_rate') or 0):g}% = "
+                 f"**{c.perf_operation_bonus:,}**] 元")
+    if lab_rev:
+        L.append(f"- 三伏(九)貼：[{lab_rev:,} × {PERF_LAB_RATE:.0%} = **{c.perf_lab_bonus:,}**] 元")
+    if other_rev:
+        L.append(f"- 診斷書（其它）：[{other_rev:,} × {PERF_OTHER_RATE:.0%} = **{c.perf_other_bonus:,}**] 元")
+
+    L.append("---")
+    L.append(f"**▶ 採用{TRACK_LABEL.get(c.chosen_track, '?')}（較高者），此診所應付：NT {c.gross:,} 元**")
+    if labor_ded or nhi_ded:
+        take = c.gross - labor_ded - nhi_ded
+        L.append(f"勞保扣 NT {labor_ded:,}　|　健保扣 NT {nhi_ded:,}")
+        L.append(f"**▶ 此診所實領：NT {take:,} 元**")
+    if c.notes:
+        L.append(f"⚠️ {'；'.join(c.notes)}")
+    return L
+
+
 def _payslip_lines(c, cash_lookup: dict, role_label: dict,
                    labor_ded: int = 0, nhi_ded: int = 0) -> list[str]:
     """
@@ -4920,6 +5049,10 @@ def _payslip_lines(c, cash_lookup: dict, role_label: dict,
             f"健保人次 {c.visit_count_nhi:,}　|　"
             f"平均 {c.avg_visits_per_session}/診"
         )
+
+    if getattr(c, "is_dual", False):
+        L.extend(_payslip_lines_dual(c, cash_row, labor_ded, nhi_ded))
+        return L
 
     if c.session_pay:
         L.append(f"**診薪**：總額 **NT {c.session_pay:,} 元**")
@@ -5500,7 +5633,9 @@ def _settings_doctor_roster(sb):
     from data_processor.doctor_config import (
         fetch_doctor_clinic, fetch_session_fees,
         doctor_employment_status, parse_date, previous_day,
+        DEFAULT_SALARY_PARAMS, SALARY_PARAM_FIELDS,
     )
+    from data_processor.salary import DUAL_SCHEME_FROM
 
     st.subheader("醫師-診所角色配置")
     st.caption(
@@ -5514,7 +5649,14 @@ def _settings_doctor_roster(sb):
     role_label = {"director": "負責醫", "regular": "執業醫", "support": "支援醫"}
 
     try:
-        doctors = sb.table("doctors").select("id, name, session_fee, is_active").execute().data
+        try:
+            doctors = sb.table("doctors").select(
+                "id, name, session_fee, is_active, salary_scheme"
+            ).execute().data
+            scheme_migrated = True
+        except Exception:  # v15 migration 未跑
+            doctors = sb.table("doctors").select("id, name, session_fee, is_active").execute().data
+            scheme_migrated = False
         clinics = sb.table("clinics").select("id, short_name").execute().data
         dc_rows = fetch_doctor_clinic(sb)
         fee_rows = fetch_session_fees(sb)
@@ -5523,6 +5665,11 @@ def _settings_doctor_roster(sb):
         return
 
     migrated = (not dc_rows) or ("effective_from" in dc_rows[0])
+    if not scheme_migrated:
+        st.warning(
+            "⚠️ 資料庫尚未執行 **migration_v14_to_v15.sql**（薪資雙軌制欄位不存在）："
+            "新增醫師只能用舊制，新制參數無法儲存。"
+        )
     if not migrated:
         st.warning(
             "⚠️ 資料庫尚未執行 **migration_v11_to_v12.sql**（doctor_clinic 生效日期欄位不存在），"
@@ -5532,21 +5679,84 @@ def _settings_doctor_roster(sb):
     did_name = {d["id"]: d["name"] for d in doctors}
     cid_name = {c["id"]: c["short_name"] for c in clinics}
 
+    def _current_fee_row(did: int) -> dict | None:
+        """今日有效的薪資參數列（≤今日最新一筆）；尚未生效（如未來到職）則取最早的未來列"""
+        mine = [r for r in fee_rows if r["doctor_id"] == did]
+        past = [r for r in mine if (parse_date(r.get("effective_from")) or date.min) <= today]
+        if past:
+            return max(past, key=lambda r: parse_date(r.get("effective_from")) or date.min)
+        future = [r for r in mine if (parse_date(r.get("effective_from")) or date.min) > today]
+        if future:
+            return min(future, key=lambda r: parse_date(r.get("effective_from")) or date.max)
+        return None
+
     def _current_fee(did: int):
-        """今日有效診薪（歷史列優先，無則 doctors.session_fee）"""
-        best, best_from = None, None
-        for r in fee_rows:
-            if r["doctor_id"] != did:
-                continue
-            f = parse_date(r.get("effective_from")) or date.min
-            if f > today:
-                continue
-            if best_from is None or f > best_from:
-                best_from, best = f, r
+        """現行診薪（歷史列優先，無則 doctors.session_fee）"""
+        best = _current_fee_row(did)
         if best is not None:
             return float(best["session_fee"])
         d = next((x for x in doctors if x["id"] == did), None)
         return float(d["session_fee"] or 0) if d else 0.0
+
+    def _row_params(r: dict | None) -> dict:
+        """薪資參數列 → 新制參數 dict（缺欄用預設）"""
+        out = dict(DEFAULT_SALARY_PARAMS)
+        if r:
+            for k in SALARY_PARAM_FIELDS:
+                if r.get(k) is not None:
+                    out[k] = float(r[k])
+        return out
+
+    def _current_params(did: int) -> dict:
+        """現行（或即將生效）的新制參數（無列 / 未 migration → 預設）"""
+        return _row_params(_current_fee_row(did))
+
+    def _fmt_params(p: dict) -> str:
+        return (f"執照 {int(p['license_fee']):,}／開診 {int(p['opening_fee']):,}"
+                f"／健保 {p['nhi_rate']:g}%"
+                f"／銷售 {p['sales_rate_1']:g}/{p['sales_rate_2']:g}/{p['sales_rate_3']:g}%"
+                f"／操作 {p['operation_rate']:g}%")
+
+    scheme_label = {"legacy": "舊制", "dual": "新制雙軌"}
+    did_scheme = {d["id"]: (d.get("salary_scheme") or "legacy") for d in doctors}
+
+    def _salary_params_inputs(key_prefix: str, cur: dict) -> dict:
+        """新制參數輸入區（執照費／開診費／健保%／銷售三段%／操作%）；key 帶前綴避免互相干擾"""
+        st.markdown("**新制參數（業績薪用）**")
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            lic = st.number_input("執照費（元／月）", min_value=0, step=1000,
+                                  value=int(cur.get("license_fee") or 0),
+                                  key=f"{key_prefix}_license_fee")
+        with a2:
+            opn = st.number_input("開診費（元／診）", min_value=0, step=100,
+                                  value=int(cur.get("opening_fee") or 0),
+                                  key=f"{key_prefix}_opening_fee")
+        with a3:
+            nhi = st.number_input("健保抽成 %", min_value=0.0, max_value=100.0, step=0.5,
+                                  value=float(cur.get("nhi_rate") or 0), format="%.2f",
+                                  key=f"{key_prefix}_nhi_rate")
+        with a4:
+            opr = st.number_input("操作抽成 %（針傷脫）", min_value=0.0, max_value=100.0, step=0.5,
+                                  value=float(cur.get("operation_rate") or 0), format="%.2f",
+                                  key=f"{key_prefix}_operation_rate")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            s1 = st.number_input("銷售 ≤10 萬 %", min_value=0.0, max_value=100.0, step=0.5,
+                                 value=float(cur.get("sales_rate_1") or 0), format="%.2f",
+                                 key=f"{key_prefix}_sales_rate_1")
+        with b2:
+            s2 = st.number_input("銷售 10 萬~15 萬 %", min_value=0.0, max_value=100.0, step=0.5,
+                                 value=float(cur.get("sales_rate_2") or 0), format="%.2f",
+                                 key=f"{key_prefix}_sales_rate_2")
+        with b3:
+            s3 = st.number_input("銷售 >15 萬 %", min_value=0.0, max_value=100.0, step=0.5,
+                                 value=float(cur.get("sales_rate_3") or 0), format="%.2f",
+                                 key=f"{key_prefix}_sales_rate_3")
+        st.caption("三伏(九)貼＝檢驗費×10%、診斷書＝其它×50% 為固定比例；掛號費、診察費不計。")
+        return {"license_fee": int(lic), "opening_fee": int(opn), "nhi_rate": float(nhi),
+                "sales_rate_1": float(s1), "sales_rate_2": float(s2), "sales_rate_3": float(s3),
+                "operation_rate": float(opr)}
 
     status = doctor_employment_status(dc_rows, today)
 
@@ -5567,6 +5777,9 @@ def _settings_doctor_roster(sb):
             "角色": role_label.get(r["role"], r["role"]),
             "院長津貼": r.get("director_allowance") or 0,
             "現行診薪": _current_fee(r["doctor_id"]),
+            "制度": scheme_label.get(did_scheme.get(r["doctor_id"], "legacy"), "舊制"),
+            "新制參數": (_fmt_params(_current_params(r["doctor_id"]))
+                       if did_scheme.get(r["doctor_id"]) == "dual" else "—"),
             "生效起": f_str or "（初始）",
             "結束": t_str or "—",
             "備註": r.get("note") or "",
@@ -5650,12 +5863,13 @@ def _settings_doctor_roster(sb):
                 fee_hist.append({
                     "醫師": did_name.get(r["doctor_id"], "?"),
                     "診薪": float(r["session_fee"]),
+                    "新制參數": _fmt_params(_row_params(r)),
                     "生效起": str(r.get("effective_from") or "")[:10],
                     "結束": str(r.get("effective_to") or "")[:10] or "—",
                     "備註": r.get("note") or "",
                 })
             if fee_hist:
-                st.markdown("**診薪調整歷史**")
+                st.markdown("**薪資參數調整歷史**")
                 st.dataframe(pd.DataFrame(fee_hist),
                              use_container_width=True, hide_index=True)
             if not hist_rows and not fee_hist:
@@ -5677,7 +5891,7 @@ def _settings_doctor_roster(sb):
             "🔚 結束單一角色（如：結束某院支援）",
             "🔁 轉換診所（換主聘）",
             "📅 醫師離職",
-            "💲 調整診薪",
+            "💲 調整薪資（診薪／新制參數）",
             "💰 調整院長津貼",
             "✏️ 進階：直接編修單列",
         ],
@@ -5711,6 +5925,23 @@ def _settings_doctor_roster(sb):
                                       value=0.0, format="%.1f", key="ro_new_fee")
             new_allow = st.number_input("院長津貼（負責醫才有）", min_value=0,
                                         step=1000, value=0, key="ro_new_allow")
+        # v15：薪資制度（115/10 起到職預設新制雙軌）
+        scheme_opts = ["dual", "legacy"] if scheme_migrated else ["legacy"]
+        new_scheme = st.selectbox(
+            "薪資制度", scheme_opts,
+            index=(0 if (scheme_migrated and str(new_start) >= DUAL_SCHEME_FROM)
+                   else len(scheme_opts) - 1),
+            format_func=lambda s: {
+                "dual": "新制雙軌（保障薪 vs 業績薪取高；115/10 起入職）",
+                "legacy": "舊制（診薪＋自費抽成＋業績獎金）",
+            }[s],
+            key=f"ro_new_scheme_{new_start}",  # 帶到職日：改日期即依 115/10 門檻重算預設
+            help="制度為醫師層級設定（不分月份）。保障薪＝診薪×診數＋自費獎金＋複針＋A91；"
+                 "業績薪＝執照費＋開診費×診數＋(健保總額−藥費)×健保%＋自費獎金(銷售累進/操作%)。",
+        )
+        new_params = dict(DEFAULT_SALARY_PARAMS)
+        if new_scheme == "dual":
+            new_params = _salary_params_inputs("ro_new", DEFAULT_SALARY_PARAMS)
         st.caption("到職後如有投保，請到「勞健保扣除額」分頁新增該醫師的扣除配置（生效日=投保日）。")
         if st.button("💾 建立醫師", type="primary", key="ro_new_save"):
             name = (new_name or "").strip()
@@ -5719,14 +5950,15 @@ def _settings_doctor_roster(sb):
             else:
                 try:
                     exist = next((d for d in doctors if d["name"] == name), None)
+                    doc_payload = {"session_fee": new_fee, "is_active": True}
+                    if scheme_migrated:
+                        doc_payload["salary_scheme"] = new_scheme
                     if exist:
                         did = exist["id"]
-                        sb.table("doctors").update(
-                            {"session_fee": new_fee, "is_active": True}
-                        ).eq("id", did).execute()
+                        sb.table("doctors").update(doc_payload).eq("id", did).execute()
                     else:
                         did = sb.table("doctors").insert(
-                            {"name": name, "session_fee": new_fee, "is_active": True}
+                            {"name": name, **doc_payload}
                         ).execute().data[0]["id"]
                     dup = [r for r in active_dc
                            if r["doctor_id"] == did and r["clinic_id"] == new_clinic]
@@ -5740,12 +5972,20 @@ def _settings_doctor_roster(sb):
                             "effective_from": str(new_start),
                             "note": f"到職（{new_start}）",
                         }).execute()
-                        sb.table("doctor_session_fees").upsert({
+                        fee_payload = {
                             "doctor_id": did, "session_fee": new_fee,
                             "effective_from": str(new_start),
                             "note": f"到職（{new_start}）",
-                        }, on_conflict="doctor_id,effective_from").execute()
-                        st.success(f"✅ 已建立 {name}（{cid_name[new_clinic]} {role_label[new_role]}，{new_start} 起）")
+                        }
+                        if scheme_migrated:
+                            fee_payload.update(new_params)
+                        sb.table("doctor_session_fees").upsert(
+                            fee_payload, on_conflict="doctor_id,effective_from"
+                        ).execute()
+                        st.success(
+                            f"✅ 已建立 {name}（{cid_name[new_clinic]} {role_label[new_role]}，"
+                            f"{new_start} 起，{scheme_label.get(new_scheme)}）"
+                        )
                         st.rerun()
                 except Exception as e:
                     st.error(f"建立失敗：{e}")
@@ -5944,22 +6184,39 @@ def _settings_doctor_roster(sb):
                 except Exception as e:
                     st.error(f"登記失敗：{e}")
 
-    # 5) 調整診薪 ------------------------------------------------------------
+    # 5) 調整薪資（診薪／新制參數）------------------------------------------
     elif action.startswith("💲"):
         col1, col2 = st.columns(2)
         with col1:
             fee_doc = st.selectbox("醫師", list(did_name),
                                    format_func=did_name.get, key="ro_fee_doc")
+            cur_scheme = did_scheme.get(fee_doc, "legacy")
             st.metric("現行診薪", f"{_current_fee(fee_doc):,.1f}")
+            st.caption(f"制度：{scheme_label.get(cur_scheme, cur_scheme)}")
         with col2:
             next_month_first = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
             fee_date = st.date_input("生效日（建議月初）", value=next_month_first, key="ro_fee_date")
-            fee_new = st.number_input("新診薪", min_value=0.0, step=0.1,
+            fee_new = st.number_input("新診薪（每診；新制為保障薪基礎）", min_value=0.0, step=0.1,
                                       value=float(_current_fee(fee_doc)),
-                                      format="%.1f", key="ro_fee_new")
+                                      format="%.1f", key=f"ro_fee_new_{fee_doc}")
+        new_p = dict(DEFAULT_SALARY_PARAMS)
+        new_scheme_sel = cur_scheme
+        if scheme_migrated:
+            if cur_scheme != "dual":
+                st.caption("ℹ️ 此醫師為舊制：新制參數會一併存檔但不影響其薪資（改制度請用下方進階）。")
+            new_p = _salary_params_inputs(f"ro_fee_{fee_doc}", _current_params(fee_doc))
+            with st.expander("進階：變更薪資制度（醫師層級，不分月份）"):
+                st.warning("制度不是日期版本化：變更後該醫師**所有月份**重算都會採用新制度，"
+                           "已寫入 doctor_salary_monthly 的舊結果不受影響（重新寫入才會覆蓋）。")
+                new_scheme_sel = st.selectbox(
+                    "薪資制度", ["legacy", "dual"],
+                    index=["legacy", "dual"].index(cur_scheme),
+                    format_func=lambda s: scheme_label.get(s, s),
+                    key=f"ro_fee_scheme_{fee_doc}",
+                )
         if fee_date.day != 1:
-            st.warning("生效日不是月初：薪資按「月底有效值」計整月，該月整月都會用新診薪。")
-        if st.button("💾 調整診薪", type="primary", key="ro_fee_save"):
+            st.warning("生效日不是月初：薪資按「月底有效值」計整月，該月整月都會用新參數。")
+        if st.button("💾 調整薪資", type="primary", key="ro_fee_save"):
             try:
                 open_rows = [
                     r for r in fee_rows
@@ -5970,15 +6227,26 @@ def _settings_doctor_roster(sb):
                     sb.table("doctor_session_fees").update(
                         {"effective_to": str(previous_day(fee_date))}
                     ).eq("id", r["id"]).execute()
-                sb.table("doctor_session_fees").upsert({
+                fee_payload = {
                     "doctor_id": fee_doc, "session_fee": fee_new,
                     "effective_from": str(fee_date),
                     "note": f"調薪（{fee_date} 起）",
-                }, on_conflict="doctor_id,effective_from").execute()
-                sb.table("doctors").update(
-                    {"session_fee": fee_new}
-                ).eq("id", fee_doc).execute()
-                st.success(f"✅ {did_name[fee_doc]} 自 {fee_date} 起診薪 {fee_new:,.1f}")
+                }
+                if scheme_migrated:
+                    fee_payload.update(new_p)
+                sb.table("doctor_session_fees").upsert(
+                    fee_payload, on_conflict="doctor_id,effective_from"
+                ).execute()
+                doc_payload = {"session_fee": fee_new}
+                if scheme_migrated and new_scheme_sel != cur_scheme:
+                    doc_payload["salary_scheme"] = new_scheme_sel
+                sb.table("doctors").update(doc_payload).eq("id", fee_doc).execute()
+                msg = f"✅ {did_name[fee_doc]} 自 {fee_date} 起診薪 {fee_new:,.1f}"
+                if scheme_migrated:
+                    msg += f"；新制參數：{_fmt_params(new_p)}"
+                if scheme_migrated and new_scheme_sel != cur_scheme:
+                    msg += f"；制度改為 {scheme_label.get(new_scheme_sel)}"
+                st.success(msg)
                 st.rerun()
             except Exception as e:
                 st.error(f"調整失敗：{e}")

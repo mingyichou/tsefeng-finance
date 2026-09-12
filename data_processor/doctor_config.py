@@ -25,6 +25,19 @@ import calendar
 from datetime import date, timedelta
 
 
+# ─── v15 新制薪資參數（doctor_session_fees 新欄位；migration 未跑時的預設）───
+DEFAULT_SALARY_PARAMS: dict[str, float] = {
+    "license_fee": 0,        # 執照費（元／月，業績薪）
+    "opening_fee": 0,        # 開診費（元／診，業績薪）
+    "nhi_rate": 34.0,        # 健保抽成 %
+    "sales_rate_1": 20.0,    # 銷售 ≤100,000 %
+    "sales_rate_2": 23.0,    # 銷售 100,001~150,000 %
+    "sales_rate_3": 25.0,    # 銷售 150,001+ %
+    "operation_rate": 40.0,  # 操作（針灸+傷科+脫臼）%
+}
+SALARY_PARAM_FIELDS = tuple(DEFAULT_SALARY_PARAMS)
+
+
 # ─── 日期工具 ────────────────────────────────────────────────
 
 
@@ -97,25 +110,21 @@ def fetch_doctor_clinic(sb) -> list[dict]:
 
 
 def fetch_session_fees(sb) -> list[dict]:
-    """讀 doctor_session_fees；表不存在（migration 未跑）回 []。"""
+    """讀 doctor_session_fees（v15 含新制參數欄；舊庫 fallback）；表不存在回 []。"""
+    base = "id, doctor_id, session_fee, effective_from, effective_to, note"
     try:
         return sb.table("doctor_session_fees").select(
-            "id, doctor_id, session_fee, effective_from, effective_to, note"
+            base + ", " + ", ".join(SALARY_PARAM_FIELDS)
         ).execute().data
     except Exception:
-        return []
+        try:
+            return sb.table("doctor_session_fees").select(base).execute().data
+        except Exception:
+            return []
 
 
-def resolve_session_fee(
-    fee_rows: list[dict],
-    doctors: dict[int, dict],
-    doctor_id: int,
-    service_month: str,
-) -> float:
-    """
-    該醫師該月適用診薪 = 歷史列中 effective_from ≤ 月底、取最新的一筆。
-    無任何歷史列（migration 未跑 / 未搬資料）→ fallback doctors.session_fee。
-    """
+def _best_fee_row(fee_rows: list[dict], doctor_id: int, service_month: str) -> dict | None:
+    """該醫師該月適用的薪資參數列 = effective_from ≤ 月底、取最新的一筆。"""
     _, m_end = month_bounds(service_month)
     best_row = None
     best_from = None
@@ -127,10 +136,42 @@ def resolve_session_fee(
             continue
         if best_from is None or ef_from > best_from:
             best_from, best_row = ef_from, r
-    if best_row is not None:
-        return float(best_row.get("session_fee") or 0)
-    doc = doctors.get(doctor_id) or {}
-    return float(doc.get("session_fee") or 0)
+    return best_row
+
+
+def resolve_salary_params(
+    fee_rows: list[dict],
+    doctors: dict[int, dict],
+    doctor_id: int,
+    service_month: str,
+) -> dict:
+    """
+    該醫師該月適用薪資參數（v15）：{session_fee, license_fee, opening_fee, nhi_rate,
+    sales_rate_1/2/3, operation_rate}。
+    取歷史列中 effective_from ≤ 月底、最新的一筆；無任何歷史列 → 診薪 fallback
+    doctors.session_fee、新制參數用 DEFAULT_SALARY_PARAMS；列上缺欄（migration 未跑）同預設。
+    """
+    params: dict = dict(DEFAULT_SALARY_PARAMS)
+    row = _best_fee_row(fee_rows, doctor_id, service_month)
+    if row is not None:
+        params["session_fee"] = float(row.get("session_fee") or 0)
+        for k in SALARY_PARAM_FIELDS:
+            if row.get(k) is not None:
+                params[k] = float(row[k])
+    else:
+        doc = doctors.get(doctor_id) or {}
+        params["session_fee"] = float(doc.get("session_fee") or 0)
+    return params
+
+
+def resolve_session_fee(
+    fee_rows: list[dict],
+    doctors: dict[int, dict],
+    doctor_id: int,
+    service_month: str,
+) -> float:
+    """該醫師該月適用診薪（= resolve_salary_params()['session_fee']）。"""
+    return resolve_salary_params(fee_rows, doctors, doctor_id, service_month)["session_fee"]
 
 
 # ─── 勞健保扣除（按日比例）──────────────────────────────────
