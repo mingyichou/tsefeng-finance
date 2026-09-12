@@ -4672,7 +4672,7 @@ def page_salary():
                 "**業績薪**＝執照費＋開診費×診數＋（健保總額−藥費）×健保%＋自費獎金"
                 "（銷售累進 ≤10萬/10~15萬/>15萬、操作%、三伏貼 10%、診斷書 50%）。"
                 "**兩間診所獨立計算**：每院各自比較取高（可一院保障薪、另一院業績薪）；"
-                "銷售累進以該院銷售額計算；執照費只記主聘診所。"
+                "銷售累進以該院銷售額計算；執照費＝執照費基數 × 該院週診數。"
             )
             sum_rows = [{
                 "醫師": p.doctor_name,
@@ -5027,7 +5027,9 @@ def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0,
         tag = "　✅ 採用" if (full and c.chosen_track == "performance") else ""
         L.append(f"**【業績薪】{tag}**（小計 **NT {c.performance_total:,} 元**）")
         if c.license_fee:
-            L.append(f"- 執照費：**{c.license_fee:,}** 元")
+            wk = {"澤豐": "weekly_sessions_fz", "澤沛": "weekly_sessions_fp"}.get(c.clinic_name)
+            L.append(f"- 執照費：[基數 {int(p.get('license_fee_base') or 0):,} × 週診 "
+                     f"{int(p.get(wk) or 0) if wk else 0} = **{c.license_fee:,}**] 元")
         L.append(f"- 開診費：[{c.sessions_total} 診 × {float(p.get('opening_fee') or 0):,.0f} = "
                  f"**{c.opening_pay:,}**] 元")
         L.append(f"- 健保業績獎金：[健保點數(藥費除外) {c.nhi_points_ex_drug:,} × "
@@ -5755,7 +5757,11 @@ def _settings_doctor_roster(sb):
         return _row_params(_current_fee_row(did))
 
     def _fmt_params(p: dict) -> str:
-        return (f"執照 {int(p['license_fee']):,}／開診 {int(p['opening_fee']):,}"
+        base = int(p.get("license_fee_base") or 0)
+        wfz = int(p.get("weekly_sessions_fz") or 0)
+        wfp = int(p.get("weekly_sessions_fp") or 0)
+        return (f"執照 {base:,}×(豐{wfz}診/沛{wfp}診)={base * wfz:,}/{base * wfp:,}"
+                f"／開診 {int(p['opening_fee']):,}"
                 f"／健保 {p['nhi_rate']:g}%"
                 f"／銷售 {p['sales_rate_1']:g}/{p['sales_rate_2']:g}/{p['sales_rate_3']:g}%"
                 f"／操作 {p['operation_rate']:g}%")
@@ -5764,40 +5770,54 @@ def _settings_doctor_roster(sb):
     did_scheme = {d["id"]: (d.get("salary_scheme") or "legacy") for d in doctors}
 
     def _salary_params_inputs(key_prefix: str, cur: dict) -> dict:
-        """新制參數輸入區（執照費／開診費／健保%／銷售三段%／操作%）；key 帶前綴避免互相干擾"""
+        """新制參數輸入區（執照費基數＋兩院週診數／開診費／健保%／操作%／銷售三段%）；
+        key 帶前綴避免互相干擾。該院當月執照費 = 基數 × 該院週診數。"""
         st.markdown("**新制參數（業績薪用）**")
         a1, a2, a3, a4 = st.columns(4)
         with a1:
-            lic = st.number_input("執照費（元／月）", min_value=0, step=1000,
-                                  value=int(cur.get("license_fee") or 0),
-                                  key=f"{key_prefix}_license_fee")
+            base = st.number_input("執照費基數（元／週診）", min_value=0, step=50,
+                                   value=int(cur.get("license_fee_base") or 0),
+                                   key=f"{key_prefix}_license_fee_base")
         with a2:
+            wfz = st.number_input("澤豐中醫週診數（診）", min_value=0, step=1,
+                                  value=int(cur.get("weekly_sessions_fz") or 0),
+                                  key=f"{key_prefix}_weekly_sessions_fz")
+        with a3:
+            wfp = st.number_input("澤沛中醫週診數（診）", min_value=0, step=1,
+                                  value=int(cur.get("weekly_sessions_fp") or 0),
+                                  key=f"{key_prefix}_weekly_sessions_fp")
+        with a4:
             opn = st.number_input("開診費（元／診）", min_value=0, step=100,
                                   value=int(cur.get("opening_fee") or 0),
                                   key=f"{key_prefix}_opening_fee")
-        with a3:
+        st.caption(
+            f"該院當月執照費＝基數 × 該院週診數：澤豐 {int(base) * int(wfz):,} 元／"
+            f"澤沛 {int(base) * int(wfp):,} 元（例：基數 1,250、澤豐 6 診、澤沛 2 診 → 7,500／2,500）"
+        )
+        b1, b2, b3, b4, b5 = st.columns(5)
+        with b1:
             nhi = st.number_input("健保抽成 %", min_value=0.0, max_value=100.0, step=0.5,
                                   value=float(cur.get("nhi_rate") or 0), format="%.2f",
                                   key=f"{key_prefix}_nhi_rate")
-        with a4:
+        with b2:
             opr = st.number_input("操作抽成 %（針傷脫）", min_value=0.0, max_value=100.0, step=0.5,
                                   value=float(cur.get("operation_rate") or 0), format="%.2f",
                                   key=f"{key_prefix}_operation_rate")
-        b1, b2, b3 = st.columns(3)
-        with b1:
+        with b3:
             s1 = st.number_input("銷售 ≤10 萬 %", min_value=0.0, max_value=100.0, step=0.5,
                                  value=float(cur.get("sales_rate_1") or 0), format="%.2f",
                                  key=f"{key_prefix}_sales_rate_1")
-        with b2:
+        with b4:
             s2 = st.number_input("銷售 10 萬~15 萬 %", min_value=0.0, max_value=100.0, step=0.5,
                                  value=float(cur.get("sales_rate_2") or 0), format="%.2f",
                                  key=f"{key_prefix}_sales_rate_2")
-        with b3:
+        with b5:
             s3 = st.number_input("銷售 >15 萬 %", min_value=0.0, max_value=100.0, step=0.5,
                                  value=float(cur.get("sales_rate_3") or 0), format="%.2f",
                                  key=f"{key_prefix}_sales_rate_3")
         st.caption("三伏(九)貼＝檢驗費×10%、診斷書＝其它×50% 為固定比例；掛號費、診察費不計。")
-        return {"license_fee": int(lic), "opening_fee": int(opn), "nhi_rate": float(nhi),
+        return {"license_fee_base": int(base), "weekly_sessions_fz": int(wfz),
+                "weekly_sessions_fp": int(wfp), "opening_fee": int(opn), "nhi_rate": float(nhi),
                 "sales_rate_1": float(s1), "sales_rate_2": float(s2), "sales_rate_3": float(s3),
                 "operation_rate": float(opr)}
 
@@ -5980,7 +6000,7 @@ def _settings_doctor_roster(sb):
             }[s],
             key=f"ro_new_scheme_{new_start}",  # 帶到職日：改日期即依 115/10 門檻重算預設
             help="制度為醫師層級設定（不分月份）。保障薪＝診薪×診數＋自費獎金＋複針＋A91；"
-                 "業績薪＝執照費＋開診費×診數＋(健保總額−藥費)×健保%＋自費獎金(銷售累進/操作%)。",
+                 "業績薪＝執照費(基數×該院週診數)＋開診費×診數＋(健保總額−藥費)×健保%＋自費獎金(銷售累進/操作%)。",
         )
         new_params = dict(DEFAULT_SALARY_PARAMS)
         if new_scheme == "dual":

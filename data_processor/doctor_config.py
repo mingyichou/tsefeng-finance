@@ -27,7 +27,9 @@ from datetime import date, timedelta
 
 # ─── v15 新制薪資參數（doctor_session_fees 新欄位；migration 未跑時的預設）───
 DEFAULT_SALARY_PARAMS: dict[str, float] = {
-    "license_fee": 0,        # 執照費（元／月，業績薪）
+    "license_fee_base": 0,   # 執照費基數（元／週診；該院執照費 = 基數 × 該院週診數）
+    "weekly_sessions_fz": 0, # 澤豐週診數（診／週）
+    "weekly_sessions_fp": 0, # 澤沛週診數（診／週）
     "opening_fee": 0,        # 開診費（元／診，業績薪）
     "nhi_rate": 34.0,        # 健保抽成 %
     "sales_rate_1": 20.0,    # 銷售 ≤100,000 %
@@ -36,6 +38,16 @@ DEFAULT_SALARY_PARAMS: dict[str, float] = {
     "operation_rate": 40.0,  # 操作（針灸+傷科+脫臼）%
 }
 SALARY_PARAM_FIELDS = tuple(DEFAULT_SALARY_PARAMS)
+WEEKLY_SESSIONS_FIELD = {"澤豐": "weekly_sessions_fz", "澤沛": "weekly_sessions_fp"}
+
+
+def license_fee_for_clinic(params: dict, clinic_short: str) -> int:
+    """該院當月執照費 = 執照費基數 × 該院週診數（院長 2026-09-13：基數 1250、澤豐 6 診／澤沛 2 診
+    → 澤豐 7,500、澤沛 2,500）。未知診所 → 0。"""
+    key = WEEKLY_SESSIONS_FIELD.get(clinic_short)
+    if not key:
+        return 0
+    return round(float(params.get("license_fee_base") or 0) * float(params.get(key) or 0))
 
 
 # ─── 日期工具 ────────────────────────────────────────────────

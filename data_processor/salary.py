@@ -21,13 +21,14 @@
 
 新制雙軌（dual；115/10 起入職，院長 2026-09-13 裁定）：哪個高領哪個
   保障薪 = 診薪×診數 + 自費獎金(固定 20%/40%/10%/50%) + A91 獎金 + 複針獎金
-  業績薪 = 執照費 + 開診費×診數 + 健保業績獎金 + 自費獎金(業績版)
+  業績薪 = 執照費(基數×該院週診數) + 開診費×診數 + 健保業績獎金 + 自費獎金(業績版)
     健保業績獎金 = (健保總額 − 藥費) × 健保抽成比例（預設 34%）
     自費獎金(業績版) = 銷售獎金(累進：≤10萬 20%、10~15萬 23%、>15萬 25%)
                      + 操作獎金(針灸+傷科+脫臼 × 40%) + 三伏貼(檢驗費×10%) + 診斷書(其它×50%)
   A91/複針已含在健保點數內 → 業績薪不另計；舊制的「每診平均≥15.1 業績獎金」與院長津貼
   皆不在新制公式內。**兩間診所獨立計算**（院長 2026-09-13）：每院各自比較保障薪 vs 業績薪，
-  可一院領保障薪、另一院領業績薪；銷售累進以該院銷售額計算；執照費只記主聘列（執照掛主聘）。
+  可一院領保障薪、另一院領業績薪；銷售累進以該院銷售額計算；執照費各院 = 執照費基數 × 該院週診數
+  （如基數 1250、澤豐 6 診／澤沛 2 診 → 澤豐 7,500、澤沛 2,500）。
 
   實領 = 應付 − 勞保扣 − 健保扣（兩制相同）
 """
@@ -39,10 +40,12 @@ from datetime import date
 
 from .doctor_config import (
     DEFAULT_SALARY_PARAMS,
+    WEEKLY_SESSIONS_FIELD,
     active_dc_rows,
     fetch_doctor_clinic,
     fetch_session_fees,
     insurance_for_month,
+    license_fee_for_clinic,
     parse_date,
     resolve_salary_params,
 )
@@ -134,7 +137,7 @@ class SalaryComponent:
     salary_scheme: str = "legacy"
     chosen_track: str | None = None            # 'guaranteed' / 'performance'
     salary_params: dict = field(default_factory=dict)   # 該月適用參數（顯示用）
-    license_fee: int = 0                       # 執照費（只記在主聘列）
+    license_fee: int = 0                       # 執照費 = 基數 × 該院週診數
     opening_pay: int = 0                       # 開診費 × 診數
     nhi_points_ex_drug: int = 0                # 健保總額 − 藥費
     nhi_perf_bonus: int = 0                    # 健保業績獎金
@@ -176,7 +179,7 @@ class SalaryComponent:
 
     @property
     def performance_total(self) -> int:
-        """新制業績薪（此診所列）= 執照費 + 開診費×診數 + 健保業績獎金 + 自費獎金(業績版)"""
+        """新制業績薪（此診所列）= 執照費(基數×該院週診數) + 開診費×診數 + 健保業績獎金 + 自費獎金(業績版)"""
         return (self.license_fee + self.opening_pay
                 + self.nhi_perf_bonus + self.perf_commission_total)
 
@@ -463,7 +466,7 @@ def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
     新制醫師：每個（診所×醫師）列**獨立**計算業績薪各項，並各自比較保障薪 vs 業績薪
     （院長 2026-09-13 裁定：兩間診所獨立計算，可一院領保障薪、另一院領業績薪）。
     保障薪各項（診薪×診數/自費固定%/複針/A91）已在 calculate_components 算好。
-    執照費只記主聘列（執照掛在主聘診所；月中轉院取生效較新的主聘）。
+    執照費各院 = 執照費基數 × 該院週診數（license_fee_for_clinic）。
     """
     by_doc: dict[int, list[SalaryComponent]] = {}
     for c in components:
@@ -476,14 +479,10 @@ def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
         nhi_rate = float(params.get("nhi_rate") or 0)
         op_rate = float(params.get("operation_rate") or 0)
 
-        mains = [c for c in comps if c.role != "support"]
-        main = (max(mains, key=lambda c: parse_date(c.role_from) or date.min)
-                if mains else comps[0])
-
         for c in comps:
             cash = inputs["cash_monthly"].get((c.clinic_id, c.doctor_id)) or {}
             op = inputs["outpatient"].get((c.clinic_id, c.doctor_id)) or {}
-            c.license_fee = int(params.get("license_fee") or 0) if c is main else 0
+            c.license_fee = license_fee_for_clinic(params, c.clinic_name)
             c.opening_pay = round(c.sessions_total * opening_fee)
             pts = int(op.get("nhi_total_points") or 0) - int(op.get("nhi_drug_fee") or 0)
             c.nhi_points_ex_drug = max(pts, 0)
