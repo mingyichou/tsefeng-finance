@@ -4619,8 +4619,7 @@ def page_salary():
         pay_rows.append({
             "主聘": p.main_clinic_name,
             "醫師": p.doctor_name,
-            "制度": (f"新制・{TRACK_LABEL.get(p.chosen_track, '?')}"
-                    if p.is_dual else "舊制"),
+            "制度": (f"新制・{p.chosen_label}" if p.is_dual else "舊制"),
             "主聘應付": p.gross_main,
             "支援應付": p.gross_support,
             "支援來自": p.support_clinic_name or "—",
@@ -4672,13 +4671,14 @@ def page_salary():
                 "**保障薪**＝診薪×診數＋自費獎金（固定 20%/40%/10%/50%）＋複針＋A91；"
                 "**業績薪**＝執照費＋開診費×診數＋（健保總額−藥費）×健保%＋自費獎金"
                 "（銷售累進 ≤10萬/10~15萬/>15萬、操作%、三伏貼 10%、診斷書 50%）。"
-                "跨院以兩院合計比較；銷售累進以合計銷售額計算後按各院銷售額分攤；執照費記在主聘。"
+                "**兩間診所獨立計算**：每院各自比較取高（可一院保障薪、另一院業績薪）；"
+                "銷售累進以該院銷售額計算；執照費只記主聘診所。"
             )
             sum_rows = [{
                 "醫師": p.doctor_name,
                 "保障薪合計": p.guaranteed_total,
                 "業績薪合計": p.performance_total,
-                "採用": TRACK_LABEL.get(p.chosen_track, "?"),
+                "採用": p.chosen_label,
                 "差額": abs(p.performance_total - p.guaranteed_total),
             } for p in sorted(payslips, key=lambda x: x.doctor_name) if p.is_dual]
             st.dataframe(pd.DataFrame(sum_rows), use_container_width=True, hide_index=True)
@@ -4703,18 +4703,16 @@ def page_salary():
             st.dataframe(pd.DataFrame(det), use_container_width=True, hide_index=True)
 
             tier_rows = []
-            seen = set()
-            for c in dual_comps:
-                if c.doctor_id in seen or not c.perf_sales_tiers:
-                    continue
-                seen.add(c.doctor_id)
+            for c in sorted(dual_comps, key=lambda x: (x.doctor_name, x.clinic_name)):
                 for t in c.perf_sales_tiers:
+                    if not t["base"]:
+                        continue
                     tier_rows.append({
-                        "醫師": c.doctor_name, "級距": t["label"],
+                        "診所": c.clinic_name, "醫師": c.doctor_name, "級距": t["label"],
                         "銷售基底": t["base"], "比例%": t["rate"], "獎金": t["bonus"],
                     })
             if tier_rows:
-                st.markdown("**銷售獎金累進明細（醫師兩院合計銷售額）**")
+                st.markdown("**銷售獎金累進明細（各院銷售額各自累進）**")
                 st.dataframe(pd.DataFrame(tier_rows), use_container_width=True, hide_index=True)
 
     cross = [p for p in payslips if p.support_clinic_id and p.gross_support > 0]
@@ -4862,29 +4860,47 @@ def page_salary():
             )
             st.markdown(f"## **實領總額：NT {ps.take_home:,} 元**")
 
-        # ─── 此醫師專屬 列印 HTML 下載 ───
-        html_str = generate_doctor_payslip_html(
-            comps, ps, cash_lookup, role_label, service_month
-        )
-        st.download_button(
-            f"📄 下載 {doctor_name} 薪資單 HTML（開啟後 Ctrl+P 列印乾淨版面）",
-            data=html_str.encode("utf-8"),
-            file_name=f"薪資單_{doctor_name}_{service_month[:7]}.html",
-            mime="text/html",
-            key=f"dl_html_{doctor_id}",
-        )
-        # 現金支付版：末尾多 匯款金額(=投保額)/現金給付(=實領−匯款)/簽收欄
-        if ps:
-            html_cash = generate_doctor_payslip_html(
+        # ─── 此醫師專屬 列印 HTML 下載（依制度分版，院長 2026-09-13）───
+        #   舊制（周明毅/呂敏盛/胡舒婷）：一般版（全額匯款，不印現金欄、不算雙軌）
+        #   新制：純保障薪版（只列採用薪別）＋ 雙軌完整版；兩版都附匯款/扣除/現金簽收
+        if ps and ps.is_dual:
+            all_guaranteed = all(
+                t == "guaranteed" for t in ps.track_by_clinic.values()
+            )
+            single_name = "純保障薪版" if all_guaranteed else "單軌版（只列採用薪別）"
+            html_single = generate_doctor_payslip_html(
                 comps, ps, cash_lookup, role_label, service_month,
-                cash_payment=True,
+                cash_payment=True, track_view="single",
             )
             st.download_button(
-                f"📄 下載 {doctor_name} 薪資單 HTML-現金支付（開啟後 Ctrl+P 列印乾淨版面）",
-                data=html_cash.encode("utf-8"),
-                file_name=f"薪資單_現金支付_{doctor_name}_{service_month[:7]}.html",
+                f"📄 下載 {doctor_name} 薪資單-{single_name}（含匯款／扣除／現金簽收）",
+                data=html_single.encode("utf-8"),
+                file_name=f"薪資單_{single_name}_{doctor_name}_{service_month[:7]}.html",
                 mime="text/html",
-                key=f"dl_html_cash_{doctor_id}",
+                key=f"dl_html_single_{doctor_id}",
+                help="不列出業績薪；當業績薪遠低於保障薪時用這版。",
+            )
+            html_full = generate_doctor_payslip_html(
+                comps, ps, cash_lookup, role_label, service_month,
+                cash_payment=True, track_view="full",
+            )
+            st.download_button(
+                f"📄 下載 {doctor_name} 薪資單-雙軌完整版（保障薪＋業績薪＋匯款／扣除／現金簽收）",
+                data=html_full.encode("utf-8"),
+                file_name=f"薪資單_雙軌完整版_{doctor_name}_{service_month[:7]}.html",
+                mime="text/html",
+                key=f"dl_html_full_{doctor_id}",
+            )
+        else:
+            html_str = generate_doctor_payslip_html(
+                comps, ps, cash_lookup, role_label, service_month
+            )
+            st.download_button(
+                f"📄 下載 {doctor_name} 薪資單 HTML（舊制・全額匯款；開啟後 Ctrl+P 列印）",
+                data=html_str.encode("utf-8"),
+                file_name=f"薪資單_{doctor_name}_{service_month[:7]}.html",
+                mime="text/html",
+                key=f"dl_html_{doctor_id}",
             )
 
     if selected_doctor == SHOW_ALL:
@@ -4957,8 +4973,12 @@ def page_salary():
             st.error(f"寫入失敗：{e}")
 
 
-def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0) -> list[str]:
-    """新制雙軌薪資單段落：保障薪／業績薪逐項 + 採用軌道 + 應付/實領（v15）"""
+def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0,
+                        track_view: str = "full") -> list[str]:
+    """新制薪資單段落（v15；各院獨立比較）。
+    track_view='full'：註明雙軌制、保障薪與業績薪完整計算式、採用哪一軌給薪；
+    track_view='single'：只列該院採用的薪別（保障薪被採用時即「純保障薪版」，不出現業績薪）。
+    """
     from data_processor.salary import (
         TRACK_LABEL, SALES_FIELDS, OPERATION_FIELDS, PERF_LAB_RATE, PERF_OTHER_RATE,
     )
@@ -4969,56 +4989,70 @@ def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0)
     def _rev(keys) -> int:
         return sum(int(cash_row.get(k, 0) or 0) for k in keys)
 
+    full = track_view != "single"
+    show_g = full or c.chosen_track == "guaranteed"
+    show_p = full or c.chosen_track == "performance"
+    if full:
+        L.append("**薪資制度：雙軌制** — 保障薪與業績薪各自計算，依較高者給薪")
+
     # ── 保障薪 ──
-    tag = "　✅ 採用" if c.chosen_track == "guaranteed" else ""
-    L.append(f"**【保障薪】{tag}**（小計 **NT {c.guaranteed_total:,} 元**）")
-    L.append(f"- 診薪：[{c.sessions_total} 診 × {float(p.get('session_fee') or 0):,.1f} = "
+    tag = "　✅ 採用" if (full and c.chosen_track == "guaranteed") else ""
+    if show_g:
+        L.append(f"**【保障薪】{tag}**（小計 **NT {c.guaranteed_total:,} 元**）")
+    G: list[str] = []
+    G.append(f"- 診薪：[{c.sessions_total} 診 × {float(p.get('session_fee') or 0):,.1f} = "
              f"**{c.session_pay:,}**] 元")
     sales_rev, sales_com = _rev(SALES_FIELDS), sum(bd.get(k, 0) for k in SALES_FIELDS)
     op_rev, op_com = _rev(OPERATION_FIELDS), sum(bd.get(k, 0) for k in OPERATION_FIELDS)
     lab_rev, other_rev = _rev(("lab",)), _rev(("other",))
     if sales_rev:
-        L.append(f"- 銷售獎金（固定 20%）：[{sales_rev:,} × 20% = **{sales_com:,}**] 元")
+        G.append(f"- 銷售獎金（固定 20%）：[{sales_rev:,} × 20% = **{sales_com:,}**] 元")
     if op_rev:
-        L.append(f"- 操作獎金（固定 40%）：[{op_rev:,} × 40% = **{op_com:,}**] 元")
+        G.append(f"- 操作獎金（固定 40%）：[{op_rev:,} × 40% = **{op_com:,}**] 元")
     if lab_rev:
-        L.append(f"- 三伏(九)貼：[{lab_rev:,} × 10% = **{bd.get('lab', 0):,}**] 元")
+        G.append(f"- 三伏(九)貼：[{lab_rev:,} × 10% = **{bd.get('lab', 0):,}**] 元")
     if other_rev:
-        L.append(f"- 診斷書（其它）：[{other_rev:,} × 50% = **{bd.get('other', 0):,}**] 元")
+        G.append(f"- 診斷書（其它）：[{other_rev:,} × 50% = **{bd.get('other', 0):,}**] 元")
     if c.acu_complex_mid_count or c.acu_complex_high_count:
-        L.append(f"- 複針：[中 {c.acu_complex_mid_count} ×20 + 高 {c.acu_complex_high_count} ×40 = "
+        G.append(f"- 複針：[中 {c.acu_complex_mid_count} ×20 + 高 {c.acu_complex_high_count} ×40 = "
                  f"**{c.acu_complex_bonus:,}**] 元")
     if c.a91_count:
-        L.append(f"- A91 整合醫療：[{c.a91_count} 人 ×14 = **{c.a91_bonus:,}**] 元")
+        G.append(f"- A91 整合醫療：[{c.a91_count} 人 ×14 = **{c.a91_bonus:,}**] 元")
+
+    if show_g:
+        L.extend(G)
 
     # ── 業績薪 ──
-    tag = "　✅ 採用" if c.chosen_track == "performance" else ""
-    L.append(f"**【業績薪】{tag}**（小計 **NT {c.performance_total:,} 元**）")
-    if c.license_fee:
-        L.append(f"- 執照費：**{c.license_fee:,}** 元")
-    L.append(f"- 開診費：[{c.sessions_total} 診 × {float(p.get('opening_fee') or 0):,.0f} = "
-             f"**{c.opening_pay:,}**] 元")
-    L.append(f"- 健保業績獎金：[健保點數(藥費除外) {c.nhi_points_ex_drug:,} × "
-             f"{float(p.get('nhi_rate') or 0):g}% = **{c.nhi_perf_bonus:,}**] 元")
-    if c.perf_sales_revenue or c.perf_sales_bonus:
-        L.append(f"- 銷售獎金（累進 {float(p.get('sales_rate_1') or 0):g}/"
-                 f"{float(p.get('sales_rate_2') or 0):g}/{float(p.get('sales_rate_3') or 0):g}%）："
-                 f"銷售額 {c.perf_sales_revenue:,} → **{c.perf_sales_bonus:,}** 元")
-        for t in c.perf_sales_tiers:
-            if t["base"]:
-                L.append(f"- 　級距 {t['label']}：[{t['base']:,} × {t['rate']:g}% = {t['bonus']:,}] 元")
-        if len(c.perf_sales_tiers) and sum(t["bonus"] for t in c.perf_sales_tiers) != c.perf_sales_bonus:
-            L.append("- 　（累進以兩院合計銷售額計算，此為本院分攤額）")
-    if c.perf_operation_revenue:
-        L.append(f"- 操作獎金：[{c.perf_operation_revenue:,} × {float(p.get('operation_rate') or 0):g}% = "
-                 f"**{c.perf_operation_bonus:,}**] 元")
-    if lab_rev:
-        L.append(f"- 三伏(九)貼：[{lab_rev:,} × {PERF_LAB_RATE:.0%} = **{c.perf_lab_bonus:,}**] 元")
-    if other_rev:
-        L.append(f"- 診斷書（其它）：[{other_rev:,} × {PERF_OTHER_RATE:.0%} = **{c.perf_other_bonus:,}**] 元")
+    if show_p:
+        tag = "　✅ 採用" if (full and c.chosen_track == "performance") else ""
+        L.append(f"**【業績薪】{tag}**（小計 **NT {c.performance_total:,} 元**）")
+        if c.license_fee:
+            L.append(f"- 執照費：**{c.license_fee:,}** 元")
+        L.append(f"- 開診費：[{c.sessions_total} 診 × {float(p.get('opening_fee') or 0):,.0f} = "
+                 f"**{c.opening_pay:,}**] 元")
+        L.append(f"- 健保業績獎金：[健保點數(藥費除外) {c.nhi_points_ex_drug:,} × "
+                 f"{float(p.get('nhi_rate') or 0):g}% = **{c.nhi_perf_bonus:,}**] 元")
+        if c.perf_sales_revenue or c.perf_sales_bonus:
+            L.append(f"- 銷售獎金（累進 {float(p.get('sales_rate_1') or 0):g}/"
+                     f"{float(p.get('sales_rate_2') or 0):g}/{float(p.get('sales_rate_3') or 0):g}%）："
+                     f"銷售額 {c.perf_sales_revenue:,} → **{c.perf_sales_bonus:,}** 元")
+            for t in c.perf_sales_tiers:
+                if t["base"]:
+                    L.append(f"- 　級距 {t['label']}：[{t['base']:,} × {t['rate']:g}% = {t['bonus']:,}] 元")
+        if c.perf_operation_revenue:
+            L.append(f"- 操作獎金：[{c.perf_operation_revenue:,} × {float(p.get('operation_rate') or 0):g}% = "
+                     f"**{c.perf_operation_bonus:,}**] 元")
+        if lab_rev:
+            L.append(f"- 三伏(九)貼：[{lab_rev:,} × {PERF_LAB_RATE:.0%} = **{c.perf_lab_bonus:,}**] 元")
+        if other_rev:
+            L.append(f"- 診斷書（其它）：[{other_rev:,} × {PERF_OTHER_RATE:.0%} = **{c.perf_other_bonus:,}**] 元")
 
     L.append("---")
-    L.append(f"**▶ 採用{TRACK_LABEL.get(c.chosen_track, '?')}（較高者），此診所應付：NT {c.gross:,} 元**")
+    if full:
+        L.append(f"**▶ 依雙軌制採用{TRACK_LABEL.get(c.chosen_track, '?')}（較高者）給薪，"
+                 f"此診所應付：NT {c.gross:,} 元**")
+    else:
+        L.append(f"**▶ 此診所應付：NT {c.gross:,} 元**")
     if labor_ded or nhi_ded:
         take = c.gross - labor_ded - nhi_ded
         L.append(f"勞保扣 NT {labor_ded:,}　|　健保扣 NT {nhi_ded:,}")
@@ -5029,7 +5063,8 @@ def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0)
 
 
 def _payslip_lines(c, cash_lookup: dict, role_label: dict,
-                   labor_ded: int = 0, nhi_ded: int = 0) -> list[str]:
+                   labor_ded: int = 0, nhi_ded: int = 0,
+                   track_view: str = "full") -> list[str]:
     """
     產生(診所×醫師)薪資單 markdown 行 list。
     避開 $ 符號（streamlit markdown 會啟動 LaTeX 公式渲染導致顯示亂掉）—
@@ -5051,7 +5086,7 @@ def _payslip_lines(c, cash_lookup: dict, role_label: dict,
         )
 
     if getattr(c, "is_dual", False):
-        L.extend(_payslip_lines_dual(c, cash_row, labor_ded, nhi_ded))
+        L.extend(_payslip_lines_dual(c, cash_row, labor_ded, nhi_ded, track_view))
         return L
 
     if c.session_pay:
@@ -5196,16 +5231,24 @@ def _md_line_to_html(line: str) -> str:
 
 def generate_doctor_payslip_html(
     comps, ps, cash_lookup: dict, role_label: dict, service_month: str,
-    cash_payment: bool = False,
+    cash_payment: bool = False, track_view: str = "full",
 ) -> str:
     """產生單一醫師薪資單的完整 HTML（給下載+瀏覽器列印用）。
 
-    cash_payment=True：現金支付版 — 內容同一般版，末尾多
-    「匯款金額（=當月投保額）／現金給付（=實領−匯款）／簽收欄」。
+    cash_payment=True：末尾多「匯款金額（=投保額−勞健扣）／現金給付（=實領−匯款）／簽收欄」。
+    track_view（新制醫師）：'full' 雙軌完整版（保障薪＋業績薪＋採用）；
+    'single' 只列採用薪別（保障薪被採用時即純保障薪版）。舊制醫師不受影響。
     """
     doctor_name = comps[0].doctor_name
     title = f"{doctor_name} 薪資單 {service_month[:7]}"
-    if cash_payment:
+    is_dual = bool(ps and getattr(ps, "is_dual", False))
+    if is_dual:
+        if track_view == "single":
+            all_g = all(t == "guaranteed" for t in ps.track_by_clinic.values())
+            title += "（保障薪）" if all_g else "（採用薪別）"
+        else:
+            title += "（雙軌制）"
+    elif cash_payment:
         title += "（現金支付）"
 
     css = """
@@ -5278,7 +5321,7 @@ def generate_doctor_payslip_html(
                 if c.role != "support" and ps
                 else (0, 0)
             )
-            for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
+            for line in _payslip_lines(c, cash_lookup, role_label, ld, nd, track_view):
                 html.append(_md_line_to_html(line))
             if c.role != "support" and cash_formula_lines:
                 for line in cash_formula_lines:
@@ -5306,7 +5349,7 @@ def generate_doctor_payslip_html(
             if c.role != "support" and ps
             else (0, 0)
         )
-        for line in _payslip_lines(c, cash_lookup, role_label, ld, nd):
+        for line in _payslip_lines(c, cash_lookup, role_label, ld, nd, track_view):
             html.append(_md_line_to_html(line))
         if c.role != "support" and cash_formula_lines:
             for line in cash_formula_lines:

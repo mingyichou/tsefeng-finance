@@ -26,8 +26,8 @@
     自費獎金(業績版) = 銷售獎金(累進：≤10萬 20%、10~15萬 23%、>15萬 25%)
                      + 操作獎金(針灸+傷科+脫臼 × 40%) + 三伏貼(檢驗費×10%) + 診斷書(其它×50%)
   A91/複針已含在健保點數內 → 業績薪不另計；舊制的「每診平均≥15.1 業績獎金」與院長津貼
-  皆不在新制公式內。跨院時保障/業績都以**兩院合計**比較；銷售累進以兩院合計銷售額計算後
-  按各院銷售額分攤；執照費記在主聘列。
+  皆不在新制公式內。**兩間診所獨立計算**（院長 2026-09-13）：每院各自比較保障薪 vs 業績薪，
+  可一院領保障薪、另一院領業績薪；銷售累進以該院銷售額計算；執照費只記主聘列（執照掛主聘）。
 
   實領 = 應付 − 勞保扣 − 健保扣（兩制相同）
 """
@@ -139,8 +139,8 @@ class SalaryComponent:
     nhi_points_ex_drug: int = 0                # 健保總額 − 藥費
     nhi_perf_bonus: int = 0                    # 健保業績獎金
     perf_sales_revenue: int = 0                # 銷售額（內服+外用+保養+飲片）
-    perf_sales_bonus: int = 0                  # 銷售獎金（累進；跨院合計後分攤）
-    perf_sales_tiers: list[dict] = field(default_factory=list)  # 累進各段（醫師合計）
+    perf_sales_bonus: int = 0                  # 銷售獎金（累進；該院銷售額）
+    perf_sales_tiers: list[dict] = field(default_factory=list)  # 累進各段（該院）
     perf_operation_revenue: int = 0            # 針灸+傷科+脫臼
     perf_operation_bonus: int = 0
     perf_lab_bonus: int = 0                    # 三伏(九)貼
@@ -248,11 +248,23 @@ class Payslip:
     nhi_deduction: int = 0
     insurance_base: int = 0
     insurance_note: str | None = None
-    # v15 雙軌（兩院合計）
+    # v15 雙軌（各院獨立比較；chosen_track = 主聘列採用軌道，track_by_clinic 逐院）
     salary_scheme: str = "legacy"
     chosen_track: str | None = None
-    guaranteed_total: int = 0
-    performance_total: int = 0
+    guaranteed_total: int = 0          # 兩院保障薪加總（顯示用）
+    performance_total: int = 0         # 兩院業績薪加總（顯示用）
+    track_by_clinic: dict = field(default_factory=dict)   # {clinic_name: track}
+
+    @property
+    def chosen_label(self) -> str:
+        """採用薪別標籤：各院相同 → '保障薪'；不同 → '澤沛 保障薪／澤豐 業績薪'"""
+        if not self.is_dual or not self.track_by_clinic:
+            return "—"
+        tracks = set(self.track_by_clinic.values())
+        if len(tracks) == 1:
+            return TRACK_LABEL.get(next(iter(tracks)), "?")
+        return "／".join(f"{cn} {TRACK_LABEL.get(t, '?')}"
+                         for cn, t in self.track_by_clinic.items())
 
     @property
     def gross_total(self) -> int:
@@ -446,30 +458,12 @@ def progressive_sales_bonus(
     return round(raw_total), tiers
 
 
-def _allocate(total: int, weights: list[int]) -> list[int]:
-    """依權重把整數 total 分攤（最大餘數法，總和恰等於 total）。權重全 0 → 全給第一個。"""
-    if not weights:
-        return []
-    wsum = sum(weights)
-    if total == 0:
-        return [0] * len(weights)
-    if wsum <= 0:
-        out = [0] * len(weights)
-        out[0] = total
-        return out
-    raw = [total * w / wsum for w in weights]
-    floors = [int(x) for x in raw]
-    rem = total - sum(floors)
-    order = sorted(range(len(weights)), key=lambda i: raw[i] - floors[i], reverse=True)
-    for i in order[:rem]:
-        floors[i] += 1
-    return floors
-
-
 def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
     """
-    新制醫師：計算業績薪各項、決定採用軌道（兩院合計比較，哪個高領哪個）。
+    新制醫師：每個（診所×醫師）列**獨立**計算業績薪各項，並各自比較保障薪 vs 業績薪
+    （院長 2026-09-13 裁定：兩間診所獨立計算，可一院領保障薪、另一院領業績薪）。
     保障薪各項（診薪×診數/自費固定%/複針/A91）已在 calculate_components 算好。
+    執照費只記主聘列（執照掛在主聘診所；月中轉院取生效較新的主聘）。
     """
     by_doc: dict[int, list[SalaryComponent]] = {}
     for c in components:
@@ -482,15 +476,23 @@ def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
         nhi_rate = float(params.get("nhi_rate") or 0)
         op_rate = float(params.get("operation_rate") or 0)
 
-        # 各院可直接歸屬的項目
+        mains = [c for c in comps if c.role != "support"]
+        main = (max(mains, key=lambda c: parse_date(c.role_from) or date.min)
+                if mains else comps[0])
+
         for c in comps:
             cash = inputs["cash_monthly"].get((c.clinic_id, c.doctor_id)) or {}
             op = inputs["outpatient"].get((c.clinic_id, c.doctor_id)) or {}
+            c.license_fee = int(params.get("license_fee") or 0) if c is main else 0
             c.opening_pay = round(c.sessions_total * opening_fee)
             pts = int(op.get("nhi_total_points") or 0) - int(op.get("nhi_drug_fee") or 0)
             c.nhi_points_ex_drug = max(pts, 0)
             c.nhi_perf_bonus = round(c.nhi_points_ex_drug * nhi_rate / 100)
             c.perf_sales_revenue = sum(int(cash.get(f) or 0) for f in SALES_FIELDS)
+            c.perf_sales_bonus, c.perf_sales_tiers = progressive_sales_bonus(
+                c.perf_sales_revenue, params.get("sales_rate_1", 20),
+                params.get("sales_rate_2", 23), params.get("sales_rate_3", 25),
+            )
             c.perf_operation_revenue = sum(int(cash.get(f) or 0) for f in OPERATION_FIELDS)
             c.perf_operation_bonus = round(c.perf_operation_revenue * op_rate / 100)
             c.perf_lab_bonus = round(int(cash.get("lab") or 0) * PERF_LAB_RATE)
@@ -505,28 +507,10 @@ def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
                 )
             if not op:
                 c.notes.append("無門診申報主表（健保業績獎金計 0）")
-
-        # 執照費記在主聘列（月中轉院取生效較新的主聘）
-        mains = [c for c in comps if c.role != "support"]
-        main = (max(mains, key=lambda c: parse_date(c.role_from) or date.min)
-                if mains else comps[0])
-        main.license_fee = int(params.get("license_fee") or 0)
-
-        # 銷售累進：兩院合計後按各院銷售額分攤
-        total_sales = sum(c.perf_sales_revenue for c in comps)
-        sales_bonus, tiers = progressive_sales_bonus(
-            total_sales, params.get("sales_rate_1", 20),
-            params.get("sales_rate_2", 23), params.get("sales_rate_3", 25),
-        )
-        for c, b in zip(comps, _allocate(sales_bonus, [c.perf_sales_revenue for c in comps])):
-            c.perf_sales_bonus = b
-            c.perf_sales_tiers = tiers
-
-        guaranteed = sum(c.guaranteed_total for c in comps)
-        performance = sum(c.performance_total for c in comps)
-        chosen = "performance" if performance > guaranteed else "guaranteed"
-        for c in comps:
-            c.chosen_track = chosen
+            # 該院獨立比較：哪個高領哪個（相等取保障薪）
+            c.chosen_track = (
+                "performance" if c.performance_total > c.guaranteed_total else "guaranteed"
+            )
 
 
 def calculate_components(inputs: dict, service_month: str) -> list[SalaryComponent]:
@@ -665,6 +649,9 @@ def build_payslips(
             chosen_track=main.chosen_track if main.is_dual else None,
             guaranteed_total=sum(c.guaranteed_total for c in comps) if main.is_dual else 0,
             performance_total=sum(c.performance_total for c in comps) if main.is_dual else 0,
+            track_by_clinic=(
+                {c.clinic_name: c.chosen_track for c in comps} if main.is_dual else {}
+            ),
         )
 
         # 勞健保扣除（主聘診所）：
