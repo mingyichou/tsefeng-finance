@@ -33,12 +33,16 @@
   C18=地址（澤豐） → ⛔ 不寫入（隱私）
   C19=電話（澤豐） → ⛔ 不寫入（隱私）
 
-檔名規則（多種格式並存）：
+檔名規則（多種格式並存；醫師姓名 2~4 個中文字，任何醫師主檔內的醫師都可，
+2026-11-06 起不再寫死三位醫師——新進醫師如蔣慈芳建檔後即可辨識）：
   澤豐：澤豐{醫師}醫師自費統計{YYYYMM}.xlsx
         {醫師}醫師自費統計{YYYYMM}.xlsx     (呂敏盛無「澤豐」前綴)
-  澤沛：{YYYYMM}月自費-{周/胡}.xlsx          (11501)
-        {YYYYMM}自費-{周/胡}.xlsx            (11502+)
+  澤沛：{YYYYMM}月自費-{姓}.xlsx             (11501；單字簡稱→以醫師主檔姓氏唯一對應)
+        {YYYYMM}自費-{姓}.xlsx               (11502+)
+        {YYYYMM}{姓}醫師自費統計.xlsx        (11410 短名)
+        {YYYYMM}{醫師}醫師自費統計.xlsx      (11412)
         澤沛{醫師}醫師自費統計{YYYYMM}.xlsx (相容)
+  副檔名 .xls／.xlsx 皆可（醫資系統匯出的 .xls 實為 xlsx 內容，pandas 依內容自動判斷）。
 
 ⚠️ 隱私：姓名/地址/電話一律不寫入 DB
 """
@@ -68,7 +72,27 @@ COMMISSION_FIELDS = [
 ]
 
 
+# 單字簡稱 → 全名（歷史檔名慣例；有傳入 known_doctors 時以醫師主檔姓氏唯一對應為優先）
 _DOCTOR_SHORTHAND = {"周": "周明毅", "胡": "胡舒婷", "呂": "呂敏盛"}
+_CJK = r"[一-鿿]"
+_NAME = rf"({_CJK}{{2,4}})"          # 醫師全名 2~4 字
+_SURNAME = rf"({_CJK})"              # 單字簡稱
+
+
+def _resolve_shorthand(ch: str, known_doctors=None) -> str:
+    """單字簡稱 → 醫師全名：醫師主檔中同姓氏恰一位 → 採用；多位 → 要求改用全名；
+    無法對應時退回歷史慣例表。"""
+    if known_doctors:
+        hits = sorted({n for n in known_doctors if n and str(n)[0] == ch})
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ValueError(
+                f"檔名簡稱「{ch}」對應多位醫師（{'、'.join(hits)}），請改用完整姓名命名檔案"
+            )
+    if ch in _DOCTOR_SHORTHAND:
+        return _DOCTOR_SHORTHAND[ch]
+    raise ValueError(f"檔名簡稱「{ch}」無法對應醫師主檔內任何醫師，請改用完整姓名命名檔案")
 
 
 def _to_int(v) -> int:
@@ -111,55 +135,58 @@ def clinic_hint_from_filename(filename: str) -> str | None:
     if name.startswith("澤沛"):
         return "澤沛"
     # 澤沛短名格式（11501月自費-周 / 11503自費-胡）
-    if re.match(r"^\d{5}(?:月)?自費-[周胡呂]$", name):
+    if re.match(rf"^\d{{5}}(?:月)?自費-{_CJK}$", name):
         return "澤沛"
     # 11410短名（11410周醫師自費統計）
-    if re.match(r"^\d{5}[周胡呂]醫師自費統計$", name):
+    if re.match(rf"^\d{{5}}{_CJK}醫師自費統計$", name):
         return "澤沛"
     # YYYYMM 在前 + 醫師全名（11412周明毅醫師自費統計）→ 澤沛慣例
-    if re.match(r"^\d{5}(周明毅|呂敏盛|胡舒婷)醫師自費統計$", name):
+    if re.match(rf"^\d{{5}}{_CJK}{{2,4}}醫師自費統計$", name):
         return "澤沛"
     # 醫師完整名無前綴 + YYYYMM 在後（如「呂敏盛醫師自費統計11503」）→ 慣例為澤豐
-    if re.match(r"^(周明毅|呂敏盛|胡舒婷)醫師自費統計\d{5}$", name):
+    if re.match(rf"^{_CJK}{{2,4}}醫師自費統計\d{{5}}$", name):
         return "澤豐"
     return None
 
 
-def parse_filename(filename: str) -> dict:
+def parse_filename(filename: str, known_doctors=None) -> dict:
     """
-    從檔名解析醫師、服務月份。
+    從檔名解析醫師、服務月份。醫師姓名不寫死（任何 2~4 字中文名皆可，
+    呼叫端再以醫師主檔核對）；單字簡稱以 known_doctors（醫師主檔姓名清單）姓氏唯一對應。
 
     Returns:
         {'doctor': '周明毅', 'yyyymm': '11503', 'service_month': '2026-03-01'}
 
     Raises:
-        ValueError: 檔名格式無法識別
+        ValueError: 檔名格式無法識別 / 簡稱無法對應
     """
-    name = Path(filename).stem  # 去 .xlsx
+    name = Path(filename).stem.strip()  # 去 .xlsx／.xls
 
     # 模式 1: 澤沛短名 — 11501月自費-周 / 11503自費-胡
-    m = re.match(r"^(\d{5})(?:月)?自費-(周|胡|呂)$", name)
+    m = re.match(rf"^(\d{{5}})(?:月)?自費-{_SURNAME}$", name)
     if m:
-        yyyymm = m.group(1)
-        doctor = _DOCTOR_SHORTHAND[m.group(2)]
-        return _build_meta(doctor, yyyymm)
+        return _build_meta(_resolve_shorthand(m.group(2), known_doctors), m.group(1))
 
-    # 模式 2: 完整名 — 澤豐周明毅醫師自費統計11503 / 周明毅醫師自費統計11503 / 澤沛胡舒婷醫師自費統計11503
-    m = re.match(r"^(?:澤豐|澤沛)?(周明毅|呂敏盛|胡舒婷)醫師自費統計(\d{5})$", name)
+    # 模式 2: 完整名 — 澤豐周明毅醫師自費統計11503 / 周明毅醫師自費統計11503 /
+    #         澤沛胡舒婷醫師自費統計11503 / 澤豐蔣慈芳醫師自費統計11510
+    m = re.match(rf"^(?:澤豐|澤沛)?{_NAME}醫師自費統計(\d{{5}})$", name)
     if m:
         return _build_meta(m.group(1), m.group(2))
 
     # 模式 3: 11410短名 — 11410周醫師自費統計
-    m = re.match(r"^(\d{5})(周|胡|呂)醫師自費統計$", name)
+    m = re.match(rf"^(\d{{5}}){_SURNAME}醫師自費統計$", name)
     if m:
-        return _build_meta(_DOCTOR_SHORTHAND[m.group(2)], m.group(1))
+        return _build_meta(_resolve_shorthand(m.group(2), known_doctors), m.group(1))
 
     # 模式 4: YYYYMM 在前 + 醫師全名 — 11412周明毅醫師自費統計
-    m = re.match(r"^(\d{5})(周明毅|呂敏盛|胡舒婷)醫師自費統計$", name)
+    m = re.match(rf"^(\d{{5}}){_NAME}醫師自費統計$", name)
     if m:
         return _build_meta(m.group(2), m.group(1))
 
-    raise ValueError(f"檔名格式不符自費統計規則：{name}")
+    raise ValueError(
+        f"檔名格式不符自費統計規則：{name}（可用格式：澤豐{{醫師}}醫師自費統計{{民國年月}}、"
+        f"{{民國年月}}自費-{{姓}}、{{民國年月}}{{醫師}}醫師自費統計）"
+    )
 
 
 def _build_meta(doctor: str, yyyymm: str) -> dict:

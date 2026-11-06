@@ -26,7 +26,10 @@ from datetime import date, timedelta
 
 
 # ─── v15 新制薪資參數（doctor_session_fees 新欄位；migration 未跑時的預設）───
-DEFAULT_SALARY_PARAMS: dict[str, float] = {
+# v16：加 sales_tier_mode（銷售獎金算法，院長 2026-11-06）
+#   progressive＝累進級距：≤10 萬部分×r1 ＋ 10~15 萬部分×r2 ＋ >15 萬部分×r3
+#   whole      ＝全額級距：銷售額 <10 萬 → 全額×r1；10 萬~<15 萬 → 全額×r2；≥15 萬 → 全額×r3
+DEFAULT_SALARY_PARAMS: dict[str, float | str] = {
     "license_fee_base": 0,   # 執照費基數（元／週診；該院執照費 = 基數 × 該院週診數）
     "weekly_sessions_fz": 0, # 澤豐週診數（診／週）
     "weekly_sessions_fp": 0, # 澤沛週診數（診／週）
@@ -36,9 +39,24 @@ DEFAULT_SALARY_PARAMS: dict[str, float] = {
     "sales_rate_2": 23.0,    # 銷售 100,001~150,000 %
     "sales_rate_3": 25.0,    # 銷售 150,001+ %
     "operation_rate": 40.0,  # 操作（針灸+傷科+脫臼）%
+    "sales_tier_mode": "progressive",  # 銷售獎金算法（v16）
 }
-SALARY_PARAM_FIELDS = tuple(DEFAULT_SALARY_PARAMS)
+SALARY_TEXT_FIELDS = ("sales_tier_mode",)
+SALARY_NUMERIC_FIELDS = tuple(k for k in DEFAULT_SALARY_PARAMS if k not in SALARY_TEXT_FIELDS)
+SALARY_PARAM_FIELDS = tuple(DEFAULT_SALARY_PARAMS)      # 全部（含 v16 文字欄）
+SALARY_PARAM_FIELDS_V15 = SALARY_NUMERIC_FIELDS           # v15 既有欄（v16 migration 未跑時的 select）
+SALES_TIER_MODES = ("progressive", "whole")
+SALES_TIER_MODE_LABEL = {
+    "progressive": "累進級距（各級距部分各自比例）",
+    "whole": "全額級距（達到級距後全銷售額同一比例）",
+}
 WEEKLY_SESSIONS_FIELD = {"澤豐": "weekly_sessions_fz", "澤沛": "weekly_sessions_fp"}
+
+
+def normalize_sales_tier_mode(v) -> str:
+    """DB／UI 來的值 → 'progressive' | 'whole'（空值或未知一律累進）。"""
+    s = str(v or "").strip().lower()
+    return s if s in SALES_TIER_MODES else "progressive"
 
 
 def license_fee_for_clinic(params: dict, clinic_short: str) -> int:
@@ -122,17 +140,16 @@ def fetch_doctor_clinic(sb) -> list[dict]:
 
 
 def fetch_session_fees(sb) -> list[dict]:
-    """讀 doctor_session_fees（v15 含新制參數欄；舊庫 fallback）；表不存在回 []。"""
+    """讀 doctor_session_fees；欄位逐級 fallback：
+    v16 全欄（含 sales_tier_mode）→ v15 欄（無 v16 migration）→ 基本欄（無 v15）→ 表不存在回 []。"""
     base = "id, doctor_id, session_fee, effective_from, effective_to, note"
-    try:
-        return sb.table("doctor_session_fees").select(
-            base + ", " + ", ".join(SALARY_PARAM_FIELDS)
-        ).execute().data
-    except Exception:
+    for extra in (SALARY_PARAM_FIELDS, SALARY_PARAM_FIELDS_V15, ()):
+        cols = base + (", " + ", ".join(extra) if extra else "")
         try:
-            return sb.table("doctor_session_fees").select(base).execute().data
+            return sb.table("doctor_session_fees").select(cols).execute().data
         except Exception:
-            return []
+            continue
+    return []
 
 
 def _best_fee_row(fee_rows: list[dict], doctor_id: int, service_month: str) -> dict | None:
@@ -167,9 +184,10 @@ def resolve_salary_params(
     row = _best_fee_row(fee_rows, doctor_id, service_month)
     if row is not None:
         params["session_fee"] = float(row.get("session_fee") or 0)
-        for k in SALARY_PARAM_FIELDS:
+        for k in SALARY_NUMERIC_FIELDS:
             if row.get(k) is not None:
                 params[k] = float(row[k])
+        params["sales_tier_mode"] = normalize_sales_tier_mode(row.get("sales_tier_mode"))
     else:
         doc = doctors.get(doctor_id) or {}
         params["session_fee"] = float(doc.get("session_fee") or 0)

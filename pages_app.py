@@ -503,6 +503,7 @@ def _salary_gross(sal_row: dict | None) -> int:
         + (sal_row.get("bonus_total") or 0)
         + (sal_row.get("acu_complex_bonus") or 0)
         + (sal_row.get("a91_bonus") or 0)
+        + (sal_row.get("holiday_pay") or 0)   # v16 國定假日薪資
     )
 
 
@@ -2468,11 +2469,14 @@ def _section_cash_visits():
 
     for f in uploaded_files:
         try:
-            meta = parse_cash_filename(f.name)
+            # 檔名內醫師姓名不寫死；單字簡稱以醫師主檔姓氏唯一對應（2026-11-06 蔣慈芳案）
+            meta = parse_cash_filename(f.name, known_doctors=list(name_to_did))
             doctor = meta["doctor"]
             doctor_id = name_to_did.get(doctor)
             if doctor_id is None:
-                raise ValueError(f"醫師 {doctor} 不在 doctors 表")
+                raise ValueError(
+                    f"醫師「{doctor}」不在醫師主檔，請先到「系統設定 → 醫師主檔 → 新增醫師（到職）」建檔"
+                )
             recs, totals = parse_cash_visits(
                 f, f.name, clinic_id, doctor_id,
                 expected_doctor_name=doctor,
@@ -3005,12 +3009,18 @@ def _section_tcm_concentrate_pricing():
 
 def _section_staff_salary():
     """員工薪資批次匯入（Sprint 2.8c）— 支援單月、選定月、全部月份"""
-    from data_processor.staff_salary import parse_staff_salary, list_sheets
+    from data_processor.staff_salary import (
+        parse_staff_salary, parse_staff_salary_ex, list_sheets,
+    )
 
     st.subheader("👤 員工薪資（多月 sheet）")
     st.caption(
         "一個檔多個月 sheet。可選擇：自動最新 / 指定月份 / 全部月份一次匯入。"
-        "同月份「-更正」優先採用。抓員工總額 + 跨診所代付（影響豐沛金流）。"
+        "同月份「-更正」優先採用。抓員工總額 + 跨診所代付（影響豐沛金流）。\n\n"
+        "**跨院員工的 Excel 標示慣例**（薪資一律由歸屬診所正式發放；到服務診所支援產生的薪資由服務診所負擔）："
+        "左欄全月薪資計算用「N年M月薪資計算」當標題（只當邊界、不入帳）；"
+        "右欄用「N年M月{服務診所}薪資明細({歸屬診所}代付)」＋「應付總額」列。"
+        "區塊標題的年月要與 sheet 月份相同，sheet 名稱尾端不要留空格。"
     )
 
     col1, col2 = st.columns([1, 4])
@@ -3061,7 +3071,7 @@ def _section_staff_salary():
         target_sheet = chosen.split("（")[0]
 
     try:
-        sheet_name, records = parse_staff_salary(
+        sheet_name, records, diag = parse_staff_salary_ex(
             uploaded, uploaded.name, default_cid, short_to_cid,
             target_sheet=target_sheet,
         )
@@ -3073,13 +3083,38 @@ def _section_staff_salary():
         f"📋 已解析 sheet：**{sheet_name}**　|　**{len(records)}** 位員工"
     )
 
+    # 沒辨識到的區塊：說明原因（2026-11-06：10 月 sheet 內張郡紋區塊標題仍寫 09 月 → 被當跨月資料略過）
+    if diag.get("month_mismatch"):
+        st.warning(
+            "⚠️ 以下區塊的**標題年月與 sheet 月份不符**，已當成跨月舊資料略過；"
+            "若是本月薪資，請到 Excel 把區塊標題的年月改成與 sheet 相同後重傳：\n\n"
+            + "\n".join(
+                f"- **{d['name']}**：標題「{d['title']}」（sheet 月份 {d['sheet_month'][:7]}）"
+                for d in diag["month_mismatch"]
+            )
+        )
+    if diag.get("no_amount"):
+        st.info(
+            "ℹ️ 以下區塊找不到「總額／實領總額／薪資A／應付總額／總計」金額列，未產生紀錄"
+            "（跨院員工左欄的全月薪資計算若用「薪資明細」當標題會出現在這裡，屬正常；"
+            "建議標題改成「N年M月薪資計算」就不會列出）：\n\n"
+            + "\n".join(f"- {d['name']}：標題「{d['title']}」" for d in diag["no_amount"])
+        )
+
     if records:
         df = pd.DataFrame(records)
-        df["主聘診所"] = df["clinic_id"].map(cid_to_short)
-        df["實付方"] = df["paid_by_clinic_id"].map(cid_to_short).fillna("（自付）")
+        # 欄位語意（院長 2026-11-06 用語）：歸屬診所＝主聘、正式發放全月薪資（代付列的 paid_by）；
+        # 服務診所＝支援地、應負擔該部分薪資（clinic_id）。自付列兩者相同。
+        df["歸屬診所（正式發薪）"] = [
+            cid_to_short.get(r["paid_by_clinic_id"]) if r["paid_by_clinic_id"]
+            else cid_to_short.get(r["clinic_id"])
+            for r in records
+        ]
+        df["服務診所（應負擔）"] = df["clinic_id"].map(cid_to_short)
+        df["代付"] = ["歸屬診所代付" if r["paid_by_clinic_id"] else "（自付）" for r in records]
         cols = [
-            "service_month", "主聘診所", "employee_label",
-            "gross_salary", "實付方", "note",
+            "service_month", "employee_label", "歸屬診所（正式發薪）",
+            "服務診所（應負擔）", "gross_salary", "代付", "note",
         ]
         st.dataframe(df[cols], use_container_width=True, hide_index=True)
 
@@ -3088,13 +3123,16 @@ def _section_staff_salary():
         st.markdown("**🔁 跨診所代付摘要（影響豐沛金流）：**")
         from collections import defaultdict
         agg = defaultdict(int)
+        names = defaultdict(list)
         for r in cross:
             owner = cid_to_short.get(r["clinic_id"], "?")
             payer = cid_to_short.get(r["paid_by_clinic_id"], "?")
             agg[(owner, payer)] += r["gross_salary"]
+            names[(owner, payer)].append(r["employee_label"])
         for (owner, payer), total in agg.items():
             st.markdown(
-                f"- **{owner}** 應付薪資但 **{payer}** 代付 → "
+                f"- {'、'.join(names[(owner, payer)])}：歸屬 **{payer}**（已正式發放全月薪資），"
+                f"到 **{owner}** 服務產生的薪資應由 {owner} 負擔 → "
                 f"{owner} 應給 {payer} **NT {total:,} 元**"
             )
 
@@ -4572,6 +4610,7 @@ def page_salary():
         upsert_salary_monthly,
         fetch_salary_inputs,
         TRACK_LABEL,
+        sales_mode_label,
     )
 
     sb = get_authed_client()
@@ -4654,6 +4693,7 @@ def page_salary():
                 "業績獎金": c.bonus_total,
                 "複針獎金": c.acu_complex_bonus,
                 "A91獎金": c.a91_bonus,
+                "國定假日": c.holiday_pay,
                 "平均人次": c.avg_visits_per_session,
                 "業績觸發": "✅" if c.perf_triggered else "—",
                 "應付小計": c.gross,
@@ -4670,9 +4710,11 @@ def page_salary():
             st.caption(
                 "**保障薪**＝診薪×診數＋自費獎金（固定 20%/40%/10%/50%）＋複針＋A91；"
                 "**業績薪**＝執照費＋開診費×診數＋（健保總額−藥費）×健保%＋自費獎金"
-                "（銷售累進 ≤10萬/10~15萬/>15萬、操作%、三伏貼 10%、診斷書 50%）。"
+                "（銷售級距 ≤10萬/10~15萬/>15萬、操作%、三伏貼 10%、診斷書 50%）。"
                 "**兩間診所獨立計算**：每院各自比較取高（可一院保障薪、另一院業績薪）；"
-                "銷售累進以該院銷售額計算；執照費＝執照費基數 × 該院週診數。"
+                "銷售級距以該院銷售額計算；執照費＝執照費基數 × 該院週診數。"
+                "銷售獎金算法每位醫師二選一（醫師主檔）：**累進級距**＝各段部分各自比例；"
+                "**全額級距**＝達到級距後全銷售額同一比例。國定假日薪資另加在採用軌道之上，不影響比較。"
             )
             sum_rows = [{
                 "醫師": p.doctor_name,
@@ -4694,7 +4736,8 @@ def page_salary():
                     "執照費": c.license_fee, "開診費×診數": c.opening_pay,
                     "健保點數(−藥費)": c.nhi_points_ex_drug,
                     f"健保獎金({p.get('nhi_rate', 0):g}%)": c.nhi_perf_bonus,
-                    "銷售額": c.perf_sales_revenue, "銷售獎金(累進)": c.perf_sales_bonus,
+                    "銷售額": c.perf_sales_revenue, "銷售獎金": c.perf_sales_bonus,
+                    "銷售算法": sales_mode_label(p),
                     "操作額": c.perf_operation_revenue,
                     f"操作獎金({p.get('operation_rate', 0):g}%)": c.perf_operation_bonus,
                     "三伏貼(10%)": c.perf_lab_bonus, "診斷書(50%)": c.perf_other_bonus,
@@ -4712,8 +4755,29 @@ def page_salary():
                         "銷售基底": t["base"], "比例%": t["rate"], "獎金": t["bonus"],
                     })
             if tier_rows:
-                st.markdown("**銷售獎金累進明細（各院銷售額各自累進）**")
+                st.markdown("**銷售獎金級距明細（各院銷售額各自計算；累進＝多段、全額＝單一級距）**")
                 st.dataframe(pd.DataFrame(tier_rows), use_container_width=True, hide_index=True)
+
+    # ─── v16 國定假日薪資（只在有給薪時顯示）───
+    hol_comps = [c for c in components if c.holiday_pay]
+    if hol_comps:
+        with st.expander("🎌 國定假日薪資明細（只列有給薪的節日）"):
+            st.caption(
+                "每位醫師於「系統設定 → 國定假日給薪」設定各節日每日薪資；"
+                "落在本月且金額 > 0 的節日才列出，合計加在**主聘診所**應付上。"
+            )
+            hol_rows = []
+            for c in sorted(hol_comps, key=lambda x: x.doctor_name):
+                for it in c.holiday_items:
+                    hol_rows.append({
+                        "診所": c.clinic_name, "醫師": c.doctor_name,
+                        "節日": it["label"], "日期": it["date"], "薪資": it["amount"],
+                    })
+                hol_rows.append({
+                    "診所": c.clinic_name, "醫師": c.doctor_name,
+                    "節日": "合計", "日期": "", "薪資": c.holiday_pay,
+                })
+            st.dataframe(pd.DataFrame(hol_rows), use_container_width=True, hide_index=True)
 
     cross = [p for p in payslips if p.support_clinic_id and p.gross_support > 0]
     if cross:
@@ -4973,6 +5037,20 @@ def page_salary():
             st.error(f"寫入失敗：{e}")
 
 
+def _holiday_lines(c) -> list[str]:
+    """國定假日薪資段落（v16）。沒有給薪（未約定／全 0／該月無節日）→ 回空 list，薪資單不出現。"""
+    items = getattr(c, "holiday_items", None) or []
+    total = int(getattr(c, "holiday_pay", 0) or 0)
+    if total <= 0 or not items:
+        return []
+    L = [f"**國定假日薪資**（合計 **NT {total:,} 元**）"]
+    for it in items:
+        d = str(it.get("date") or "")
+        md = f"{int(d[5:7])}/{int(d[8:10])}" if len(d) >= 10 else d
+        L.append(f"- {it.get('label')}（{md}）：**NT {int(it.get('amount') or 0):,}** 元")
+    return L
+
+
 def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0,
                         track_view: str = "full") -> list[str]:
     """新制薪資單段落（v15；各院獨立比較）。
@@ -4981,6 +5059,7 @@ def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0,
     """
     from data_processor.salary import (
         TRACK_LABEL, SALES_FIELDS, OPERATION_FIELDS, PERF_LAB_RATE, PERF_OTHER_RATE,
+        sales_mode_label,
     )
     p = c.salary_params or {}
     bd = c.commission_breakdown or {}
@@ -5035,7 +5114,7 @@ def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0,
         L.append(f"- 健保業績獎金：[健保點數(藥費除外) {c.nhi_points_ex_drug:,} × "
                  f"{float(p.get('nhi_rate') or 0):g}% = **{c.nhi_perf_bonus:,}**] 元")
         if c.perf_sales_revenue or c.perf_sales_bonus:
-            L.append(f"- 銷售獎金（累進 {float(p.get('sales_rate_1') or 0):g}/"
+            L.append(f"- 銷售獎金（{sales_mode_label(p)} {float(p.get('sales_rate_1') or 0):g}/"
                      f"{float(p.get('sales_rate_2') or 0):g}/{float(p.get('sales_rate_3') or 0):g}%）："
                      f"銷售額 {c.perf_sales_revenue:,} → **{c.perf_sales_bonus:,}** 元")
             for t in c.perf_sales_tiers:
@@ -5049,10 +5128,13 @@ def _payslip_lines_dual(c, cash_row: dict, labor_ded: int = 0, nhi_ded: int = 0,
         if other_rev:
             L.append(f"- 診斷書（其它）：[{other_rev:,} × {PERF_OTHER_RATE:.0%} = **{c.perf_other_bonus:,}**] 元")
 
+    L.extend(_holiday_lines(c))   # v16 國定假日薪資（有才出現）
     L.append("---")
+    hol = (f" NT {c.gross_before_holiday:,} ＋ 國定假日薪資 NT {c.holiday_pay:,}，"
+           if c.holiday_pay else "")
     if full:
-        L.append(f"**▶ 依雙軌制採用{TRACK_LABEL.get(c.chosen_track, '?')}（較高者）給薪，"
-                 f"此診所應付：NT {c.gross:,} 元**")
+        L.append(f"**▶ 依雙軌制採用{TRACK_LABEL.get(c.chosen_track, '?')}（較高者）給薪{hol}"
+                 f"{'' if hol else '，'}此診所應付：NT {c.gross:,} 元**")
     else:
         L.append(f"**▶ 此診所應付：NT {c.gross:,} 元**")
     if labor_ded or nhi_ded:
@@ -5192,6 +5274,8 @@ def _payslip_lines(c, cash_lookup: dict, role_label: dict,
                 f"**{c.a91_bonus:,}**] 元"
             )
 
+    L.extend(_holiday_lines(c))   # v16 國定假日薪資（有才出現）
+
     L.append("---")
     L.append(f"**▶ 此診所應付：NT {c.gross:,} 元**")
     if labor_ded or nhi_ded:
@@ -5200,7 +5284,7 @@ def _payslip_lines(c, cash_lookup: dict, role_label: dict,
         L.append(f"**▶ 此診所實領：NT {take:,} 元**")
 
     if c.notes:
-        L.append(f"⚠️ {chr(65307).join(c.notes) if False else '；'.join(c.notes)}")
+        L.append(f"⚠️ {'；'.join(c.notes)}")
 
     return L
 
@@ -5636,8 +5720,8 @@ def page_settings():
 
     sb = get_authed_client()
 
-    tab1, tab2, tab_ins, tab_cost, tab_pl, tab3 = st.tabs(
-        ["白名單使用者", "醫師主檔", "勞健保扣除額", "成本參數",
+    tab1, tab2, tab_ins, tab_hol, tab_cost, tab_pl, tab3 = st.tabs(
+        ["白名單使用者", "醫師主檔", "勞健保扣除額", "國定假日給薪", "成本參數",
          "損益分析名單", "系統資訊"]
     )
 
@@ -5657,6 +5741,9 @@ def page_settings():
 
     with tab_ins:
         _settings_insurance_deductions(sb)
+
+    with tab_hol:
+        _settings_holiday_pay(sb)
 
     with tab_cost:
         _settings_cost_params(sb)
@@ -5678,7 +5765,8 @@ def _settings_doctor_roster(sb):
     from data_processor.doctor_config import (
         fetch_doctor_clinic, fetch_session_fees,
         doctor_employment_status, parse_date, previous_day,
-        DEFAULT_SALARY_PARAMS, SALARY_PARAM_FIELDS,
+        DEFAULT_SALARY_PARAMS, SALARY_NUMERIC_FIELDS,
+        SALES_TIER_MODES, SALES_TIER_MODE_LABEL, normalize_sales_tier_mode,
     )
     from data_processor.salary import DUAL_SCHEME_FROM
 
@@ -5744,13 +5832,34 @@ def _settings_doctor_roster(sb):
         return float(d["session_fee"] or 0) if d else 0.0
 
     def _row_params(r: dict | None) -> dict:
-        """薪資參數列 → 新制參數 dict（缺欄用預設）"""
+        """薪資參數列 → 新制參數 dict（缺欄用預設；sales_tier_mode 為文字欄）"""
         out = dict(DEFAULT_SALARY_PARAMS)
         if r:
-            for k in SALARY_PARAM_FIELDS:
+            for k in SALARY_NUMERIC_FIELDS:
                 if r.get(k) is not None:
                     out[k] = float(r[k])
+            out["sales_tier_mode"] = normalize_sales_tier_mode(r.get("sales_tier_mode"))
         return out
+
+    def _upsert_fee_payload(payload: dict) -> bool:
+        """寫 doctor_session_fees。v16 欄 sales_tier_mode 不存在（migration_v15_to_v16 未跑）
+        → 剔除該欄重試並回 False（呼叫端提示算法未儲存、目前以累進計）。"""
+        try:
+            sb.table("doctor_session_fees").upsert(
+                payload, on_conflict="doctor_id,effective_from"
+            ).execute()
+            return True
+        except Exception as e:
+            if "sales_tier_mode" not in str(e) or "sales_tier_mode" not in payload:
+                raise
+            p2 = {k: v for k, v in payload.items() if k != "sales_tier_mode"}
+            sb.table("doctor_session_fees").upsert(
+                p2, on_conflict="doctor_id,effective_from"
+            ).execute()
+            return False
+
+    _TIER_MODE_WARN = ("⚠️ 銷售獎金算法未儲存：資料庫尚未執行 migration_v15_to_v16.sql"
+                       "（sales_tier_mode 欄位不存在），目前一律以累進級距計算。其餘參數已儲存。")
 
     def _current_params(did: int) -> dict:
         """現行（或即將生效）的新制參數（無列 / 未 migration → 預設）"""
@@ -5760,10 +5869,11 @@ def _settings_doctor_roster(sb):
         base = int(p.get("license_fee_base") or 0)
         wfz = int(p.get("weekly_sessions_fz") or 0)
         wfp = int(p.get("weekly_sessions_fp") or 0)
+        mode = "全額" if normalize_sales_tier_mode(p.get("sales_tier_mode")) == "whole" else "累進"
         return (f"執照 {base:,}×(豐{wfz}診/沛{wfp}診)={base * wfz:,}/{base * wfp:,}"
                 f"／開診 {int(p['opening_fee']):,}"
                 f"／健保 {p['nhi_rate']:g}%"
-                f"／銷售 {p['sales_rate_1']:g}/{p['sales_rate_2']:g}/{p['sales_rate_3']:g}%"
+                f"／銷售 {p['sales_rate_1']:g}/{p['sales_rate_2']:g}/{p['sales_rate_3']:g}%（{mode}）"
                 f"／操作 {p['operation_rate']:g}%")
 
     scheme_label = {"legacy": "舊制", "dual": "新制雙軌"}
@@ -5794,7 +5904,7 @@ def _settings_doctor_roster(sb):
             f"該院當月執照費＝基數 × 該院週診數：澤豐 {int(base) * int(wfz):,} 元／"
             f"澤沛 {int(base) * int(wfp):,} 元（例：基數 1,250、澤豐 6 診、澤沛 2 診 → 7,500／2,500）"
         )
-        b1, b2, b3, b4, b5 = st.columns(5)
+        b1, b2 = st.columns(2)
         with b1:
             nhi = st.number_input("健保抽成 %", min_value=0.0, max_value=100.0, step=0.5,
                                   value=float(cur.get("nhi_rate") or 0), format="%.2f",
@@ -5803,23 +5913,51 @@ def _settings_doctor_roster(sb):
             opr = st.number_input("操作抽成 %（針傷脫）", min_value=0.0, max_value=100.0, step=0.5,
                                   value=float(cur.get("operation_rate") or 0), format="%.2f",
                                   key=f"{key_prefix}_operation_rate")
+        # v16：銷售獎金算法二選一（院長 2026-11-06）
+        cur_mode = normalize_sales_tier_mode(cur.get("sales_tier_mode"))
+        mode = st.radio(
+            "銷售獎金算法（銷售額＝內服＋外用＋保養＋飲片）",
+            list(SALES_TIER_MODES),
+            index=list(SALES_TIER_MODES).index(cur_mode),
+            format_func=lambda m: SALES_TIER_MODE_LABEL[m],
+            horizontal=True,
+            key=f"{key_prefix}_sales_tier_mode",
+            help="累進級距：≤10 萬部分×比例①＋10~15 萬部分×比例②＋>15 萬部分×比例③。"
+                 "全額級距：銷售額 <10 萬 → 全額×比例①；10 萬~<15 萬 → 全額×比例②（含 10 萬以內）；"
+                 "≥15 萬 → 全額×比例③（含 15 萬以內）。",
+        )
+        if mode == "whole":
+            lbl1, lbl2, lbl3 = ("銷售 <10 萬：全額 %", "銷售 10 萬~<15 萬：全額 %", "銷售 ≥15 萬：全額 %")
+        else:
+            lbl1, lbl2, lbl3 = ("銷售 ≤10 萬部分 %", "銷售 10 萬~15 萬部分 %", "銷售 >15 萬部分 %")
+        b3, b4, b5 = st.columns(3)
         with b3:
-            s1 = st.number_input("銷售 ≤10 萬 %", min_value=0.0, max_value=100.0, step=0.5,
+            s1 = st.number_input(lbl1, min_value=0.0, max_value=100.0, step=0.5,
                                  value=float(cur.get("sales_rate_1") or 0), format="%.2f",
                                  key=f"{key_prefix}_sales_rate_1")
         with b4:
-            s2 = st.number_input("銷售 10 萬~15 萬 %", min_value=0.0, max_value=100.0, step=0.5,
+            s2 = st.number_input(lbl2, min_value=0.0, max_value=100.0, step=0.5,
                                  value=float(cur.get("sales_rate_2") or 0), format="%.2f",
                                  key=f"{key_prefix}_sales_rate_2")
         with b5:
-            s3 = st.number_input("銷售 >15 萬 %", min_value=0.0, max_value=100.0, step=0.5,
+            s3 = st.number_input(lbl3, min_value=0.0, max_value=100.0, step=0.5,
                                  value=float(cur.get("sales_rate_3") or 0), format="%.2f",
                                  key=f"{key_prefix}_sales_rate_3")
-        st.caption("三伏(九)貼＝檢驗費×10%、診斷書＝其它×50% 為固定比例；掛號費、診察費不計。")
+        ex = 160_000
+        if mode == "whole":
+            ex_txt = f"{ex:,} × {float(s3):g}% = {round(ex * float(s3) / 100):,}"
+        else:
+            ex_val = round(100_000 * float(s1) / 100 + 50_000 * float(s2) / 100 + 10_000 * float(s3) / 100)
+            ex_txt = (f"100,000×{float(s1):g}% + 50,000×{float(s2):g}% + 10,000×{float(s3):g}% "
+                      f"= {ex_val:,}")
+        st.caption(
+            f"試算：銷售額 {ex:,} → {ex_txt} 元。"
+            "三伏(九)貼＝檢驗費×10%、診斷書＝其它×50% 為固定比例；掛號費、診察費不計。"
+        )
         return {"license_fee_base": int(base), "weekly_sessions_fz": int(wfz),
                 "weekly_sessions_fp": int(wfp), "opening_fee": int(opn), "nhi_rate": float(nhi),
                 "sales_rate_1": float(s1), "sales_rate_2": float(s2), "sales_rate_3": float(s3),
-                "operation_rate": float(opr)}
+                "operation_rate": float(opr), "sales_tier_mode": mode}
 
     status = doctor_employment_status(dc_rows, today)
 
@@ -6042,14 +6180,15 @@ def _settings_doctor_roster(sb):
                         }
                         if scheme_migrated:
                             fee_payload.update(new_params)
-                        sb.table("doctor_session_fees").upsert(
-                            fee_payload, on_conflict="doctor_id,effective_from"
-                        ).execute()
+                        mode_saved = _upsert_fee_payload(fee_payload)
                         st.success(
                             f"✅ 已建立 {name}（{cid_name[new_clinic]} {role_label[new_role]}，"
                             f"{new_start} 起，{scheme_label.get(new_scheme)}）"
                         )
-                        st.rerun()
+                        if mode_saved:
+                            st.rerun()
+                        else:
+                            st.warning(_TIER_MODE_WARN)
                 except Exception as e:
                     st.error(f"建立失敗：{e}")
 
@@ -6297,9 +6436,7 @@ def _settings_doctor_roster(sb):
                 }
                 if scheme_migrated:
                     fee_payload.update(new_p)
-                sb.table("doctor_session_fees").upsert(
-                    fee_payload, on_conflict="doctor_id,effective_from"
-                ).execute()
+                mode_saved = _upsert_fee_payload(fee_payload)
                 doc_payload = {"session_fee": fee_new}
                 if scheme_migrated and new_scheme_sel != cur_scheme:
                     doc_payload["salary_scheme"] = new_scheme_sel
@@ -6310,7 +6447,10 @@ def _settings_doctor_roster(sb):
                 if scheme_migrated and new_scheme_sel != cur_scheme:
                     msg += f"；制度改為 {scheme_label.get(new_scheme_sel)}"
                 st.success(msg)
-                st.rerun()
+                if mode_saved:
+                    st.rerun()
+                else:
+                    st.warning(_TIER_MODE_WARN)
             except Exception as e:
                 st.error(f"調整失敗：{e}")
 
@@ -6638,6 +6778,242 @@ def _settings_insurance_deductions(sb):
                 st.rerun()
             except Exception as e:
                 st.error(f"刪除失敗：{e}")
+
+
+def _settings_holiday_pay(sb):
+    """國定假日給薪（v16，院長 2026-11-06）：每位醫師獨立設定 16 個節日的每日薪資，
+    加上年度行事曆（規則計算；可逐年覆寫）與單月試算。"""
+    import json
+    from datetime import date as _date
+    from data_processor.holidays import (
+        HOLIDAY_DEFS, HOLIDAY_KEYS, HOLIDAY_LABEL, HOLIDAY_GROUP, GROUP_LABEL,
+        LUNAR_AVAILABLE, OVERRIDES_SETTING_KEY,
+        holiday_dates, holidays_in_month, fetch_holiday_overrides, fmt_holiday_date,
+    )
+
+    st.subheader("國定假日給薪")
+    st.caption(
+        "與醫師約定「特定國定假日額外薪資」時在此設定：**每位醫師獨立**、16 個節日分列、"
+        "填**每日薪資**（預設 0＝不給薪）。春節三天分開填，跨月時（如初一 1/31、初二 2/1）"
+        "各自計入所屬月份。算薪時只列出「落在該月且金額 > 0」的節日並加總，"
+        "計入**主聘診所**應付；完全沒有給薪的醫師，薪資單不會出現此區塊。\n\n"
+        "**日期認定**：不上網抓取，全部依規則計算——固定公曆 7 天直接取日期；"
+        "小年夜／除夕／春節三天／端午／中秋以農曆換算；清明依節氣公式（4/4 或 4/5）；"
+        "兒童節與清明同日時提前至 4/3（4/4 逢週四則延至 4/5）。"
+        "若政府公告與計算不同，可在下方「進階」覆寫該年度單一節日的日期。"
+    )
+
+    today = _date.today()
+    try:
+        doctors = sb.table("doctors").select("id, name, is_active").execute().data or []
+    except Exception as e:
+        st.error(f"讀取醫師失敗：{e}")
+        return
+    did_name = {d["id"]: d["name"] for d in doctors}
+
+    table_ok = True
+    try:
+        pay_rows = sb.table("doctor_holiday_pay").select(
+            "doctor_id, holiday_key, amount"
+        ).execute().data or []
+    except Exception:
+        pay_rows, table_ok = [], False
+    if not table_ok:
+        st.warning(
+            "⚠️ 資料庫尚未執行 **migration_v15_to_v16.sql**（doctor_holiday_pay 表不存在）："
+            "以下只能檢視行事曆，無法儲存給薪設定。請先到 Supabase SQL Editor 執行 migration。"
+        )
+    if not LUNAR_AVAILABLE:
+        st.error(
+            "⚠️ 農曆換算套件 lunardate 未安裝（requirements.txt 已列，請重新部署）。"
+            "農曆節日日期暫時無法計算，可先在下方「進階」手動覆寫日期。"
+        )
+    overrides = fetch_holiday_overrides(sb)
+
+    cfg: dict[int, dict[str, int]] = {}
+    for r in pay_rows:
+        cfg.setdefault(int(r["doctor_id"]), {})[str(r["holiday_key"])] = int(r.get("amount") or 0)
+
+    # ── 1. 現行給薪設定 ──
+    st.markdown("**📋 現行國定假日給薪設定**（未列出的醫師＝全部 0，未約定）")
+    cfg_rows = []
+    for did in sorted(cfg, key=lambda d: did_name.get(d, "")):
+        for k in HOLIDAY_KEYS:
+            amt = cfg[did].get(k, 0)
+            if amt > 0:
+                cfg_rows.append({
+                    "醫師": did_name.get(did, f"id={did}"),
+                    "類型": GROUP_LABEL[HOLIDAY_GROUP[k]],
+                    "節日": HOLIDAY_LABEL[k],
+                    "每日薪資": amt,
+                })
+    if cfg_rows:
+        st.dataframe(pd.DataFrame(cfg_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("尚無任何醫師設定國定假日給薪。")
+
+    # ── 2. 年度行事曆 ──
+    years = {today.year - 1, today.year, today.year + 1, today.year + 2}
+    for y in overrides:
+        try:
+            years.add(int(y))
+        except (TypeError, ValueError):
+            pass
+    sel_year = st.selectbox(
+        "📅 年度行事曆（16 個節日的日期；政府公告後可在此核對，不同再到下方「進階」覆寫）",
+        sorted(years),
+        index=sorted(years).index(today.year), key="hol_cal_year",
+        format_func=lambda y: f"{y}（民國 {y - 1911} 年）",
+    )
+    cal = holiday_dates(sel_year, overrides)
+    st.dataframe(pd.DataFrame([{
+        "類型": GROUP_LABEL[h["group"]],
+        "節日": h["label"],
+        "日期": fmt_holiday_date(h["date"]),
+        "來源": ("手動覆寫" if h["overridden"]
+                 else ("規則計算" if h["date"] else "無法計算（請覆寫）")),
+    } for h in cal]), use_container_width=True, hide_index=True)
+
+    # ── 3. 單月試算 ──
+    if cfg:
+        with st.expander("🧮 單月試算（看某月哪些醫師會算到哪些節日）"):
+            calc_month = st.date_input(
+                "薪資月份（取該月 1 日）",
+                value=today.replace(day=1), key="hol_calc_month",
+            )
+            sm = calc_month.replace(day=1).isoformat()
+            in_month = holidays_in_month(sm, overrides)
+            trial = []
+            for did in sorted(cfg, key=lambda d: did_name.get(d, "")):
+                total = 0
+                for h in in_month:
+                    amt = cfg[did].get(h["key"], 0)
+                    if amt > 0:
+                        total += amt
+                        trial.append({
+                            "醫師": did_name.get(did, f"id={did}"),
+                            "節日": h["label"], "日期": fmt_holiday_date(h["date"]),
+                            "薪資": amt,
+                        })
+                if total:
+                    trial.append({"醫師": did_name.get(did, f"id={did}"),
+                                  "節日": "合計", "日期": "", "薪資": total})
+            if trial:
+                st.dataframe(pd.DataFrame(trial), use_container_width=True, hide_index=True)
+            else:
+                st.info(
+                    f"{sm[:7]} 沒有任何醫師有國定假日薪資"
+                    + ("（該月無節日）" if not in_month
+                       else "（該月節日：" + "、".join(h["label"] for h in in_month) + "，但都未設定給薪）")
+                )
+
+    # ── 編輯區 ──
+    if not st.session_state.get("edit_mode"):
+        st.info("⚠️ 唯讀模式。如需設定給薪或覆寫日期，請啟用左下「編輯模式」。")
+        return
+
+    st.divider()
+    st.markdown("**📝 設定醫師國定假日每日薪資**")
+    if not table_ok:
+        st.caption("（需先執行 migration_v15_to_v16.sql 才能儲存）")
+    active_ids = [d["id"] for d in doctors if d.get("is_active", True)]
+    other_ids = [d["id"] for d in doctors if d["id"] not in active_ids]
+    sel_doc = st.selectbox(
+        "醫師", active_ids + other_ids, format_func=did_name.get, key="hol_doc",
+    )
+    cur = cfg.get(sel_doc, {})
+    kb = f"hol_amt_{sel_doc}"   # key 帶醫師 → 切換醫師即帶入該醫師現行值
+    new_amounts: dict[str, int] = {}
+    for group in ("fixed", "lunar"):
+        st.markdown(f"**{GROUP_LABEL[group]}**")
+        defs = [(k, label) for k, label, g in HOLIDAY_DEFS if g == group]
+        cols = st.columns(4)
+        for i, (k, label) in enumerate(defs):
+            with cols[i % 4]:
+                new_amounts[k] = int(st.number_input(
+                    label, min_value=0, step=100, value=int(cur.get(k, 0)),
+                    key=f"{kb}_{k}",
+                ))
+    total_cfg = sum(new_amounts.values())
+    st.caption(
+        f"此醫師 16 個節日每日薪資合計 {total_cfg:,} 元（全年若全部落在在職月份的上限）。"
+        "填 0＝該節日不給薪。"
+    )
+    if st.button("💾 儲存此醫師的國定假日給薪", type="primary",
+                 key="hol_save", disabled=not table_ok):
+        payload = [
+            {"doctor_id": sel_doc, "holiday_key": k, "amount": v}
+            for k, v in new_amounts.items()
+        ]
+        try:
+            sb.table("doctor_holiday_pay").upsert(
+                payload, on_conflict="doctor_id,holiday_key"
+            ).execute()
+            st.success(
+                f"✅ 已儲存 {did_name.get(sel_doc)} 的國定假日給薪"
+                f"（{sum(1 for v in new_amounts.values() if v > 0)} 個節日有給薪）"
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"儲存失敗：{e}")
+
+    # ── 進階：覆寫年度日期 ──
+    with st.expander("✏️ 進階：覆寫某年節日日期（政府公告與規則計算不同時才用）"):
+        st.caption(
+            "只會儲存「與計算值不同」的節日；改回計算值即視為取消覆寫。"
+            "覆寫影響該年所有醫師的薪資計算（已寫入的月份要重新寫入才會更新）。"
+        )
+        ov_year = int(st.number_input(
+            "年度（西元）", min_value=2020, max_value=2099, value=int(sel_year), step=1,
+            key="hol_ov_year",
+        ))
+        st.caption(f"西元 {ov_year} ＝ 民國 {ov_year - 1911} 年；下方帶入的是目前採用的日期（🖊️＝已覆寫）。")
+        cal2 = holiday_dates(ov_year, overrides)
+        new_dates: dict[str, _date | None] = {}
+        cols = st.columns(4)
+        for i, h in enumerate(cal2):
+            with cols[i % 4]:
+                new_dates[h["key"]] = st.date_input(
+                    h["label"] + ("　🖊️" if h["overridden"] else ""),
+                    value=h["date"] or h["computed"] or _date(ov_year, 1, 1),
+                    min_value=_date(ov_year, 1, 1), max_value=_date(ov_year, 12, 31),
+                    key=f"hol_ov_{ov_year}_{h['key']}",
+                )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 儲存此年度日期覆寫", key="hol_ov_save"):
+                yr_over = {
+                    h["key"]: new_dates[h["key"]].isoformat()
+                    for h in cal2
+                    if new_dates[h["key"]] and new_dates[h["key"]] != h["computed"]
+                }
+                new_over = {str(y): v for y, v in overrides.items() if str(y) != str(ov_year)}
+                if yr_over:
+                    new_over[str(ov_year)] = yr_over
+                try:
+                    sb.table("system_settings").upsert([{
+                        "key": OVERRIDES_SETTING_KEY,
+                        "value": json.dumps(new_over, ensure_ascii=False),
+                        "description": "國定假日日期覆寫（年度 → 節日 key → 日期）",
+                    }]).execute()
+                    st.success(f"✅ {ov_year} 年覆寫 {len(yr_over)} 個節日" if yr_over
+                               else f"✅ {ov_year} 年已清除覆寫，全部採規則計算")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"儲存失敗：{e}")
+        with c2:
+            if st.button("🗑️ 清除此年度全部覆寫", key="hol_ov_clear"):
+                new_over = {str(y): v for y, v in overrides.items() if str(y) != str(ov_year)}
+                try:
+                    sb.table("system_settings").upsert([{
+                        "key": OVERRIDES_SETTING_KEY,
+                        "value": json.dumps(new_over, ensure_ascii=False),
+                        "description": "國定假日日期覆寫（年度 → 節日 key → 日期）",
+                    }]).execute()
+                    st.success(f"✅ 已清除 {ov_year} 年覆寫")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"清除失敗：{e}")
 
 
 def _read_settings_json(sb, key: str, default):

@@ -31,6 +31,14 @@
   （如基數 1250、澤豐 6 診／澤沛 2 診 → 澤豐 7,500、澤沛 2,500）。
 
   實領 = 應付 − 勞保扣 − 健保扣（兩制相同）
+
+v16（院長 2026-11-06）：
+  - 國定假日薪資：每醫師獨立設定 16 個節日的每日薪資（doctor_holiday_pay），
+    算薪時把落在該月、金額 > 0 的節日列出加總，計入**主聘診所列**的應付
+    （舊制：應付 ＋ 國定假日薪資；新制：採用軌道小計 ＋ 國定假日薪資，不影響保障/業績比較）。
+    全部為 0（未約定／該月無節日）→ 薪資單不出現此區塊。日期規則見 holidays.py。
+  - 銷售獎金算法二選一（doctor_session_fees.sales_tier_mode）：
+    progressive 累進級距（原設計）／ whole 全額級距（達到級距後全銷售額同一比例）。
 """
 
 from __future__ import annotations
@@ -40,14 +48,21 @@ from datetime import date
 
 from .doctor_config import (
     DEFAULT_SALARY_PARAMS,
+    SALES_TIER_MODE_LABEL,
     WEEKLY_SESSIONS_FIELD,
     active_dc_rows,
     fetch_doctor_clinic,
     fetch_session_fees,
     insurance_for_month,
     license_fee_for_clinic,
+    normalize_sales_tier_mode,
     parse_date,
     resolve_salary_params,
+)
+from .holidays import (
+    fetch_holiday_overrides,
+    fetch_holiday_pay,
+    holiday_pay_for_month,
 )
 
 
@@ -92,6 +107,15 @@ DUAL_DB_FIELDS = (
     "salary_scheme", "chosen_track", "license_fee", "opening_pay",
     "nhi_points_ex_drug", "nhi_perf_bonus", "perf_commission_total",
     "perf_commission_breakdown", "guaranteed_total", "performance_total",
+)
+# doctor_salary_monthly v16 新增欄位（國定假日薪資）
+HOLIDAY_DB_FIELDS = ("holiday_pay", "holiday_breakdown")
+# 寫入時的可選欄位群：(欄位, 缺欄時的 migration 提示, 「本批資料需要此群」判斷)
+_OPTIONAL_DB_FIELD_GROUPS = (
+    (DUAL_DB_FIELDS, "migration_v14_to_v15.sql（雙軌制欄位）",
+     lambda comps: any(c.is_dual for c in comps)),
+    (HOLIDAY_DB_FIELDS, "migration_v15_to_v16.sql（國定假日薪資欄位）",
+     lambda comps: any(c.holiday_pay for c in comps)),
 )
 
 
@@ -149,6 +173,10 @@ class SalaryComponent:
     perf_lab_bonus: int = 0                    # 三伏(九)貼
     perf_other_bonus: int = 0                  # 診斷書
 
+    # ── v16 國定假日薪資（只填在主聘診所列；兩制皆加在應付上）──
+    holiday_pay: int = 0
+    holiday_items: list[dict] = field(default_factory=list)   # [{key,label,date,amount}]
+
     @property
     def is_main_clinic(self) -> bool:
         return self.role != "support"
@@ -184,7 +212,8 @@ class SalaryComponent:
                 + self.nhi_perf_bonus + self.perf_commission_total)
 
     @property
-    def gross(self) -> int:
+    def gross_before_holiday(self) -> int:
+        """不含國定假日薪資的應付（新制＝採用軌道小計；舊制＝原公式）"""
         if self.is_dual:
             if self.chosen_track == "performance":
                 return self.performance_total
@@ -197,6 +226,11 @@ class SalaryComponent:
             + self.acu_complex_bonus
             + self.a91_bonus
         )
+
+    @property
+    def gross(self) -> int:
+        """此診所列應付 ＝ 制度應付 ＋ 國定假日薪資（v16；非主聘列 holiday_pay 恆為 0）"""
+        return self.gross_before_holiday + self.holiday_pay
 
     def to_db_row(self) -> dict:
         """回傳可寫入 doctor_salary_monthly 的 dict（單列）"""
@@ -232,6 +266,9 @@ class SalaryComponent:
             "perf_commission_breakdown": self.perf_commission_breakdown,
             "guaranteed_total": self.guaranteed_total if self.is_dual else 0,
             "performance_total": self.performance_total if self.is_dual else 0,
+            # v16
+            "holiday_pay": self.holiday_pay,
+            "holiday_breakdown": list(self.holiday_items) if self.holiday_items else None,
         }
 
 
@@ -257,6 +294,9 @@ class Payslip:
     guaranteed_total: int = 0          # 兩院保障薪加總（顯示用）
     performance_total: int = 0         # 兩院業績薪加總（顯示用）
     track_by_clinic: dict = field(default_factory=dict)   # {clinic_name: track}
+    # v16 國定假日薪資（已含在 gross_main 內；此處供顯示）
+    holiday_pay: int = 0
+    holiday_items: list[dict] = field(default_factory=list)
 
     @property
     def chosen_label(self) -> str:
@@ -354,6 +394,10 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
         PERF_TRIGGER_AVG_FALLBACK,
     )
 
+    # v16 國定假日給薪設定（表不存在 → {}）＋ 年度日期覆寫
+    holiday_pay = fetch_holiday_pay(sb)
+    holiday_overrides = fetch_holiday_overrides(sb)
+
     return {
         "doctors": {d["id"]: d for d in doctors},
         "clinics": {c["id"]: c for c in clinics},
@@ -375,6 +419,8 @@ def fetch_salary_inputs(sb, service_month: str) -> dict:
         },
         "insurance_deductions": insurance_deductions,
         "bonus_threshold": bonus_threshold,
+        "holiday_pay": holiday_pay,              # {doctor_id: {holiday_key: amount}}
+        "holiday_overrides": holiday_overrides,  # {"2027": {key: "YYYY-MM-DD"}}
     }
 
 
@@ -461,6 +507,45 @@ def progressive_sales_bonus(
     return round(raw_total), tiers
 
 
+def whole_sales_bonus(
+    total_sales: int, rate_1: float, rate_2: float, rate_3: float,
+) -> tuple[int, list[dict]]:
+    """
+    銷售獎金「全額級距」（v16 第二種算法，院長 2026-11-06）：
+      銷售額 < 100,000           → 全額 × rate_1
+      100,000 ≤ 銷售額 < 150,000 → 全額 × rate_2（含 10 萬以內部分）
+      銷售額 ≥ 150,000           → 全額 × rate_3（含 15 萬以內部分）
+    例：160,000 → 160,000 × 25% = 40,000（累進則為 20,000＋11,500＋2,500 = 34,000）。
+    Returns (獎金, [單一級距 {"label","base","rate","bonus"}])，與 progressive_sales_bonus 同形。
+    """
+    total_sales = max(int(total_sales or 0), 0)
+    if total_sales < SALES_TIER_1_MAX:
+        label, rate = f"全額（<{SALES_TIER_1_MAX:,}）", float(rate_1)
+    elif total_sales < SALES_TIER_2_MAX:
+        label, rate = f"全額（{SALES_TIER_1_MAX:,}~<{SALES_TIER_2_MAX:,}）", float(rate_2)
+    else:
+        label, rate = f"全額（≥{SALES_TIER_2_MAX:,}）", float(rate_3)
+    bonus = round(total_sales * rate / 100)
+    return bonus, [{"label": label, "base": total_sales, "rate": rate, "bonus": bonus}]
+
+
+def sales_bonus(total_sales: int, params: dict) -> tuple[int, list[dict]]:
+    """依 params['sales_tier_mode'] 分派：progressive（預設）／whole。"""
+    mode = normalize_sales_tier_mode((params or {}).get("sales_tier_mode"))
+    r1 = (params or {}).get("sales_rate_1", 20)
+    r2 = (params or {}).get("sales_rate_2", 23)
+    r3 = (params or {}).get("sales_rate_3", 25)
+    if mode == "whole":
+        return whole_sales_bonus(total_sales, r1, r2, r3)
+    return progressive_sales_bonus(total_sales, r1, r2, r3)
+
+
+def sales_mode_label(params: dict | None) -> str:
+    """薪資單／畫面用的短標籤：累進級距／全額級距"""
+    mode = normalize_sales_tier_mode((params or {}).get("sales_tier_mode"))
+    return SALES_TIER_MODE_LABEL.get(mode, mode).split("（")[0]
+
+
 def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
     """
     新制醫師：每個（診所×醫師）列**獨立**計算業績薪各項，並各自比較保障薪 vs 業績薪
@@ -488,9 +573,8 @@ def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
             c.nhi_points_ex_drug = max(pts, 0)
             c.nhi_perf_bonus = round(c.nhi_points_ex_drug * nhi_rate / 100)
             c.perf_sales_revenue = sum(int(cash.get(f) or 0) for f in SALES_FIELDS)
-            c.perf_sales_bonus, c.perf_sales_tiers = progressive_sales_bonus(
-                c.perf_sales_revenue, params.get("sales_rate_1", 20),
-                params.get("sales_rate_2", 23), params.get("sales_rate_3", 25),
+            c.perf_sales_bonus, c.perf_sales_tiers = sales_bonus(
+                c.perf_sales_revenue, params,
             )
             c.perf_operation_revenue = sum(int(cash.get(f) or 0) for f in OPERATION_FIELDS)
             c.perf_operation_bonus = round(c.perf_operation_revenue * op_rate / 100)
@@ -510,6 +594,35 @@ def _apply_dual_scheme(components: list[SalaryComponent], inputs: dict) -> None:
             c.chosen_track = (
                 "performance" if c.performance_total > c.guaranteed_total else "guaranteed"
             )
+
+
+def _main_component(comps: list[SalaryComponent]) -> SalaryComponent:
+    """該醫師該月的主聘列：role != 'support' 中生效最新的一列（月中轉診所取新診所）；
+    全是支援列則取第一列。build_payslips 與國定假日薪資歸屬共用，確保落在同一列。"""
+    mains = [c for c in comps if c.role != "support"]
+    if mains:
+        return max(mains, key=lambda c: parse_date(c.role_from) or date.min)
+    return comps[0]
+
+
+def _apply_holiday_pay(components: list[SalaryComponent], inputs: dict, service_month: str) -> None:
+    """v16：每位醫師該月國定假日薪資（只列落在該月且每日薪資 > 0 的節日）放到主聘列。
+    未設定／全 0／該月無節日 → holiday_pay=0、items=[]（薪資單不顯示區塊）。"""
+    pay_cfg = inputs.get("holiday_pay") or {}
+    overrides = inputs.get("holiday_overrides") or {}
+    by_doc: dict[int, list[SalaryComponent]] = {}
+    for c in components:
+        c.holiday_pay, c.holiday_items = 0, []
+        by_doc.setdefault(c.doctor_id, []).append(c)
+    for did, comps in by_doc.items():
+        amounts = pay_cfg.get(did)
+        if not amounts:
+            continue
+        total, items = holiday_pay_for_month(amounts, service_month, overrides)
+        if total <= 0:
+            continue
+        main = _main_component(comps)
+        main.holiday_pay, main.holiday_items = total, items
 
 
 def calculate_components(inputs: dict, service_month: str) -> list[SalaryComponent]:
@@ -607,6 +720,7 @@ def calculate_components(inputs: dict, service_month: str) -> list[SalaryCompone
         components.append(sc)
 
     _apply_dual_scheme(components, inputs)
+    _apply_holiday_pay(components, inputs, service_month)
     return components
 
 
@@ -625,13 +739,7 @@ def build_payslips(
     # 月中轉診所（同月兩個主聘列）取生效較新的那家當主聘（扣除只扣一次）。
     payslips: list[Payslip] = []
     for doctor_id, comps in by_doctor.items():
-        mains = [c for c in comps if c.role != "support"]
-        if mains:
-            main = max(
-                mains, key=lambda c: parse_date(c.role_from) or date.min
-            )
-        else:
-            main = comps[0]
+        main = _main_component(comps)
         support = next((c for c in comps if c.role == "support" and c.gross > 0), None)
 
         ps = Payslip(
@@ -651,6 +759,8 @@ def build_payslips(
             track_by_clinic=(
                 {c.clinic_name: c.chosen_track for c in comps} if main.is_dual else {}
             ),
+            holiday_pay=main.holiday_pay,
+            holiday_items=list(main.holiday_items),
         )
 
         # 勞健保扣除（主聘診所）：
@@ -683,8 +793,9 @@ def upsert_salary_monthly(
     """
     寫入 doctor_salary_monthly。每個 (clinic_id, doctor_id, service_month) 一列。
     扣除額只填在主聘診所那列，支援診所那列扣除為 0。
-    v15 欄位不存在（migration 未跑）：無新制醫師 → 剔除新欄位重試；
-    有新制醫師 → 直接報錯（否則 total_salary 會算錯）。
+    可選欄位群（v15 雙軌制／v16 國定假日）在 DB 不存在（migration 未跑）時：
+    本批資料用不到該群（無新制醫師／無國定假日薪資）→ 剔除該群欄位重試；
+    用得到 → 直接報錯並指出要跑哪支 migration（否則 total_salary 會算錯）。
     """
     # 索引：哪些 (clinic, doctor) 是主聘
     main_set = {(p.main_clinic_id, p.doctor_id): p for p in payslips}
@@ -700,27 +811,34 @@ def upsert_salary_monthly(
 
     if not rows:
         return 0
-    try:
-        resp = (
-            sb.table("doctor_salary_monthly")
-            .upsert(rows, on_conflict="clinic_id,doctor_id,service_month")
-            .execute()
-        )
-    except Exception as e:
-        if not any(f in str(e) for f in DUAL_DB_FIELDS):
-            raise
-        if any(c.is_dual for c in components):
-            raise ValueError(
-                "資料庫尚未執行 migration_v14_to_v15.sql（雙軌制欄位不存在），"
-                "本月有新制醫師，無法寫入。請先到 Supabase SQL Editor 執行 migration。"
-            ) from e
-        legacy_rows = [{k: v for k, v in r.items() if k not in DUAL_DB_FIELDS} for r in rows]
-        resp = (
-            sb.table("doctor_salary_monthly")
-            .upsert(legacy_rows, on_conflict="clinic_id,doctor_id,service_month")
-            .execute()
-        )
-    return len(resp.data) if resp.data else len(rows)
+
+    stripped: set[str] = set()
+    for _attempt in range(len(_OPTIONAL_DB_FIELD_GROUPS) + 1):
+        try:
+            resp = (
+                sb.table("doctor_salary_monthly")
+                .upsert(rows, on_conflict="clinic_id,doctor_id,service_month")
+                .execute()
+            )
+            return len(resp.data) if resp.data else len(rows)
+        except Exception as e:
+            msg = str(e)
+            group = next(
+                (g for g in _OPTIONAL_DB_FIELD_GROUPS
+                 if any(f in msg for f in g[0]) and not set(g[0]) <= stripped),
+                None,
+            )
+            if group is None:
+                raise
+            fields, migration_hint, needed = group
+            if needed(components):
+                raise ValueError(
+                    f"資料庫尚未執行 {migration_hint}，本月資料需要這些欄位，無法寫入。"
+                    "請先到 Supabase SQL Editor 執行 migration。"
+                ) from e
+            stripped.update(fields)
+            rows = [{k: v for k, v in r.items() if k not in stripped} for r in rows]
+    raise RuntimeError("doctor_salary_monthly 寫入失敗（欄位相容重試用盡）")
 
 
 # ============================================================================
