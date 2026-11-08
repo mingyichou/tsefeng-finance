@@ -5,6 +5,8 @@
 讀 inventory_transfer + product_pricing + tcm_concentrate_pricing，組出金流明細。
 
 辨識邏輯：
+  *  所有品名（索引側與查詢側）先經 _norm：NFKC + casefold
+     + 字形變體統一（瓜蔞／栝婁／栝簍… → 栝樓，見 CHAR_VARIANT_GROUPS）
   0. 品項名含 (水) 或 (水藥包) 標註
      → 剝除標註後，到 product_pricing 中 vendor='水藥包' 區塊比對
        （第二個 sheet「自費藥粉&自費商品」的水藥包 vendor 區塊）
@@ -14,7 +16,9 @@
   2. 不含廠商 keyword
      → 走 product_pricing.cost_price (vendor 寬鬆比對)：amount = qty × cost_price
   3. 精確比對（含別名）失敗
-     → 前綴模糊比對（前 5 字 → 前 3 字）；唯一候選才帶入，
+     → 剝註記比對：兩側剝掉括號註記後整個品名相等，同表（科中則同廠商）內
+       恰 1 個候選才帶入（砂仁 → 砂仁(不松科)、皂刺 → 皂角刺(不松)）
+     → 再前綴模糊比對（前 5 字 → 前 3 字）；唯一候選才帶入，
        2 個以上候選維持未匹配並在 note 列出候選
   4. 兩處都查不到
      → 標記 unmatched，amount=None
@@ -137,19 +141,56 @@ ALIAS_GROUPS: list[list[str]] = [
     # 水藥（調貨檔品名 vs 自費檔品名 用字不一致）
     ["四物湯", "四物湯(水)", "四物湯(水藥包)"],
     ["山楂纖美茶", "山楂鮮美茶"],   # 調貨「纖」↔ 自費檔「鮮」
-    ["美聲潤喉飲", "美聲潤喉茶"],   # 調貨「飲」↔ 自費檔「茶」
+    # 調貨「飲」↔ 自費檔「茶」；11510 自費檔改名「美聲甘潤茶」（水藥包區唯一美聲品項）
+    ["美聲潤喉飲", "美聲潤喉茶", "美聲甘潤茶"],
 ]
 
 
+# ─── 字形變體統一（院長 2026-11-09）──────────────────────
+# 同一味藥的「習慣用字」不同（瓜蔞／栝樓／栝婁／栝簍…），而且會出現在各種
+# 複合品名裡（栝樓仁、栝樓實、栝樓薤白半夏湯、全栝樓…），逐一列別名群組列不完。
+# 改在 _norm 階段把所有變體寫法統一成價目表採用的寫法（每群組第一個）；
+# 索引建立與查詢兩側都經過 _norm，所以精確／別名／剝註記／模糊比對全部自動受惠。
+# ⚠️ 只放「純粹用字不同、絕對是同一味藥」的變體；品種／炮製等會改變藥材意義的字
+#    （川木通 vs 木通、生甘草 vs 炙甘草）不要放這裡，改用 ALIAS_GROUPS 逐品項處理。
+CHAR_VARIANT_GROUPS: list[list[str]] = [
+    # 價目表寫「栝樓」；調貨檔曾出現「栝簍仁」(竹字頭)，院長另提 瓜蔞／栝婁
+    ["栝樓", "瓜蔞", "栝婁", "栝簍", "栝蔞", "瓜樓", "瓜婁", "瓜簍", "括樓", "括蔞"],
+]
+
+
+def _build_char_variant_map(groups: list[list[str]]) -> dict[str, str]:
+    """{變體(已 NFKC+casefold): 標準寫法}；長變體排前面，避免被短變體先吃掉一部分。"""
+    out: dict[str, str] = {}
+    for group in groups:
+        canon = unicodedata.normalize("NFKC", group[0]).casefold()
+        for v in group[1:]:
+            out[unicodedata.normalize("NFKC", v).casefold()] = canon
+    return dict(sorted(out.items(), key=lambda kv: -len(kv[0])))
+
+
+_CHAR_VARIANT_MAP = _build_char_variant_map(CHAR_VARIANT_GROUPS)
+
+
+def _apply_char_variants(s: str) -> str:
+    for variant, canon in _CHAR_VARIANT_MAP.items():
+        if variant in s:
+            s = s.replace(variant, canon)
+    return s
+
+
 def _norm(s: str | None) -> str:
-    """NFKC 正規化 + 去前後空白 + casefold；用於比對 key。
+    """NFKC 正規化 + 去前後空白 + casefold + 字形變體統一；用於比對 key。
 
     casefold 讓英文大小寫不影響比對（EPA/epa、mini/Mini/MINI），
+    字形變體統一讓 瓜蔞仁／栝婁仁／栝簍仁 都收斂成價目表的「栝樓仁」。
     索引建立與查詢兩側都經過本函式，兩側一致。
     """
     if not s:
         return ""
-    return unicodedata.normalize("NFKC", str(s)).strip().casefold()
+    return _apply_char_variants(
+        unicodedata.normalize("NFKC", str(s)).strip().casefold()
+    )
 
 
 # ─── 水藥包辨識（院長 2026-06-03）────────────────────────
@@ -231,6 +272,52 @@ def _fuzzy_prefix_match(
     return None, None, []
 
 
+# ─── 剝註記比對（院長 2026-11-09）────────────────────────
+# 價目表品名常帶藥局自用的括號註記：砂仁(不松科)、枳實(唯一)、紅花(唯一)、
+# 皂角刺(不松)、木通(川)、甘草（生）…；調貨檔只寫純品名「砂仁」。
+# 兩字品名不做前綴模糊比對（太短易誤配），所以「砂仁(天一)」一直對不到「砂仁(不松科)」。
+# 本層：兩側把括號註記全部剝掉後「整個品名相等」，且同表（科中＝同廠商）內恰 1 個
+# 候選才帶入；2 個以上（如 甘草(生)／甘草(炙)）不自動帶入、候選交給人工。
+# 排在精確／別名之後、前綴模糊之前：比前綴模糊嚴（要整名相等），又不受字數門檻限制。
+_ANNOT_RE = re.compile(r"\([^()]*\)")
+
+
+def _strip_annotations(key: str) -> str:
+    """剝除所有括號註記並去空白（key 須已 _norm，全形括號已轉半形）。"""
+    return re.sub(r"\s+", "", _ANNOT_RE.sub("", key)).strip()
+
+
+def _build_base_index(keys) -> dict[str, list[str]]:
+    """{剝註記後的名稱: [原 normalized key, ...]}。"""
+    out: dict[str, list[str]] = {}
+    for k in keys:
+        base = _strip_annotations(k)
+        if base:
+            out.setdefault(base, []).append(k)
+    return out
+
+
+def _base_lookup(
+    names, base_idx: dict[str, list[str]],
+) -> tuple[str | None, list[str]]:
+    """
+    對 names（品名 + 等價別名）逐一做剝註記比對。
+    回傳 (唯一命中的原 key 或 None, 候選 keys)；
+    任一名稱唯一命中即回傳；全未命中時回傳第一個有候選者的候選清單供提示。
+    """
+    first_cands: list[str] = []
+    for name in names:
+        base = _strip_annotations(_norm(name))
+        if not base:
+            continue
+        cands = base_idx.get(base, [])
+        if len(cands) == 1:
+            return cands[0], cands
+        if cands and not first_cands:
+            first_cands = cands
+    return None, first_cands
+
+
 def _fmt_candidates(cands: list[str], limit: int = 5) -> str:
     shown = "、".join(cands[:limit])
     if len(cands) > limit:
@@ -266,7 +353,13 @@ def _detect_brand(item_name: str) -> tuple[str | None, str]:
     if not m:
         return None, item_name
     vendor = m.group(1)
-    clean = (item_name[:m.start()] + item_name[m.end():]).strip(" -()（）_")
+    clean = (item_name[:m.start()] + item_name[m.end():]).strip(" -_")
+    # 只剝掉因去除廠商註而落單的括號；成對的品名註記「砂仁(去殼)」要保留
+    # （舊版 strip("()") 會把「砂仁(去殼)(天一)」剝成「砂仁(去殼」）。
+    while clean and clean[0] in ")）":
+        clean = clean[1:].lstrip(" -_")
+    while clean and clean[-1] in "(（":
+        clean = clean[:-1].rstrip(" -_")
     return vendor, clean
 
 
@@ -349,6 +442,14 @@ def compute_inventory_amounts(
     for (v_key, n_key) in tcm_idx:
         tcm_names_by_vendor.setdefault(v_key, []).append(n_key)
 
+    # 剝註記比對用索引：{剝掉括號註記後的名稱: [原 key, ...]}
+    water_base_idx = _build_base_index(water_idx.keys())
+    pp_base_idx = _build_base_index(pp_idx.keys())
+    tcm_base_by_vendor: dict[str, dict[str, list[str]]] = {
+        v_key: _build_base_index(names)
+        for v_key, names in tcm_names_by_vendor.items()
+    }
+
     out: list[PricedItem] = []
     for row in inventory_rows:
         item = row["item"]
@@ -387,9 +488,22 @@ def compute_inventory_amounts(
                 source = "自費(水藥包)"
                 note = f"水藥包：{clean}"
             else:
-                # 模糊比對：前 5 字 → 前 3 字，唯一命中才帶入
-                hit, lv, cands = _fuzzy_prefix_match(clean, water_idx.keys())
-                if hit:
+                # 剝註記比對：兩側剝掉括號註記後整名相等且唯一
+                bhit, bcands = _base_lookup(
+                    [_strip_water_marker(c) for c in _equivalents_of(clean)],
+                    water_base_idx,
+                )
+                hit, lv, cands = None, None, []
+                if not bhit:
+                    # 模糊比對：前 5 字 → 前 3 字，唯一命中才帶入
+                    hit, lv, cands = _fuzzy_prefix_match(clean, water_idx.keys())
+                if bhit:
+                    pp = water_idx[bhit]
+                    unit_price = float(pp["cost_price"])
+                    amount = round(qty * unit_price, 2)
+                    source = "自費(水藥包)"
+                    note = f"剝註記命中：{clean} → {pp['product_name']}"
+                elif hit:
                     pp = water_idx[hit]
                     unit_price = float(pp["cost_price"])
                     amount = round(qty * unit_price, 2)
@@ -401,9 +515,15 @@ def compute_inventory_amounts(
                         f"水藥包表前{lv}字有 {len(cands)} 個候選："
                         f"{_fmt_candidates(cands)}｜請人工確認品名"
                     )
+                elif bcands:
+                    source = "未匹配"
+                    note = (
+                        f"水藥包表剝註記後有 {len(bcands)} 個候選："
+                        f"{_fmt_candidates(bcands)}｜請人工確認品名"
+                    )
                 else:
                     source = "未匹配"
-                    note = f"水藥包表查無 {clean}"
+                    note = f"水藥包表查無 {clean}（含別名/剝註記/模糊）"
         elif vendor:
             # 走科中：嘗試 clean 名 + 所有等價別名
             v_key = _norm(vendor)
@@ -423,11 +543,25 @@ def compute_inventory_amounts(
                 if tried_alias:
                     note = f"別名命中：{clean} → {tried_alias}"
             else:
-                # 模糊比對：只在同廠商的品名內找，前 5 字 → 前 3 字
-                hit, lv, cands = _fuzzy_prefix_match(
-                    clean, tcm_names_by_vendor.get(v_key, [])
+                # 剝註記比對：同廠商內兩側剝掉括號註記後整名相等且唯一
+                # （砂仁 → 砂仁(不松科)、皂刺 → 別名 皂角刺 → 皂角刺(不松)）
+                bhit, bcands = _base_lookup(
+                    _equivalents_of(clean), tcm_base_by_vendor.get(v_key, {})
                 )
-                if hit:
+                hit, lv, cands = None, None, []
+                if not bhit:
+                    # 模糊比對：只在同廠商的品名內找，前 5 字 → 前 3 字
+                    hit, lv, cands = _fuzzy_prefix_match(
+                        clean, tcm_names_by_vendor.get(v_key, [])
+                    )
+                if bhit:
+                    tcm = tcm_idx[(v_key, bhit)]
+                    unit_price = float(tcm["price"])
+                    ratio = BRAND_RATIO[vendor]
+                    amount = round(qty * unit_price * ratio, 2)
+                    source = f"科中{tcm['category']}"
+                    note = f"剝註記命中：{clean} → {tcm['product_name']}"
+                elif hit:
                     tcm = tcm_idx[(v_key, hit)]
                     unit_price = float(tcm["price"])
                     ratio = BRAND_RATIO[vendor]
@@ -440,9 +574,15 @@ def compute_inventory_amounts(
                         f"科中表({vendor})前{lv}字有 {len(cands)} 個候選："
                         f"{_fmt_candidates(cands)}｜請人工確認品名"
                     )
+                elif bcands:
+                    source = "未匹配"
+                    note = (
+                        f"科中表({vendor})剝註記後有 {len(bcands)} 個候選："
+                        f"{_fmt_candidates(bcands)}｜請人工確認品名"
+                    )
                 else:
                     source = "未匹配"
-                    note = f"科中表查無 {vendor} × {clean}（含別名/模糊）"
+                    note = f"科中表查無 {vendor} × {clean}（含別名/剝註記/模糊）"
         else:
             # 走自費商品（不分廠商，僅靠 product_name）
             # 嘗試順序：item 原名 + clean 名 + item 等價 + clean 等價
@@ -472,10 +612,24 @@ def compute_inventory_amounts(
                     msg += f"｜別名命中：→ {tried_alias}"
                 note = msg
             else:
-                # 模糊比對：前 5 字 → 前 3 字，唯一命中才帶入
-                # （如 佳衛暢 → 佳衛暢益生菌、攝護通膠囊 → 攝護通）
-                hit, lv, cands = _fuzzy_prefix_match(clean, pp_idx.keys())
-                if hit:
+                # 剝註記比對：兩側剝掉括號註記後整名相等且唯一
+                # （如 瑪卡(上賀) → 瑪卡(200G)）
+                bhit, bcands = _base_lookup(candidates, pp_base_idx)
+                hit, lv, cands = None, None, []
+                if not bhit:
+                    # 模糊比對：前 5 字 → 前 3 字，唯一命中才帶入
+                    # （如 佳衛暢 → 佳衛暢益生菌、攝護通膠囊 → 攝護通）
+                    hit, lv, cands = _fuzzy_prefix_match(clean, pp_idx.keys())
+                if bhit:
+                    pp = pp_idx[bhit]
+                    unit_price = float(pp["cost_price"])
+                    amount = round(qty * unit_price, 2)
+                    source = "自費"
+                    note = (
+                        f"自費商品({pp.get('vendor')})｜"
+                        f"剝註記命中：{clean} → {pp['product_name']}"
+                    )
+                elif hit:
                     pp = pp_idx[hit]
                     unit_price = float(pp["cost_price"])
                     amount = round(qty * unit_price, 2)
@@ -490,9 +644,15 @@ def compute_inventory_amounts(
                         f"自費商品表前{lv}字有 {len(cands)} 個候選："
                         f"{_fmt_candidates(cands)}｜請人工確認品名"
                     )
+                elif bcands:
+                    source = "未匹配"
+                    note = (
+                        f"自費商品表剝註記後有 {len(bcands)} 個候選："
+                        f"{_fmt_candidates(bcands)}｜請人工確認品名"
+                    )
                 else:
                     source = "未匹配"
-                    note = "自費商品表查無（含別名/模糊）"
+                    note = "自費商品表查無（含別名/剝註記/模糊）"
 
         out.append(PricedItem(
             transfer_month=row["transfer_month"],
